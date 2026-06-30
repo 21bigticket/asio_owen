@@ -1,0 +1,20 @@
+# Build directories
+build/
+cmake-build-debug/
+
+# IDE
+.idea/
+
+# Dependencies (third-party libraries, fetched externally)
+asio/
+spdlog/
+
+# Runtime files
+server.log
+*.log
+
+# Config (may contain secrets)
+config.ini
+
+# OS files
+.DS_Store
