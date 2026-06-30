@@ -141,13 +141,13 @@ ssh root@192.168.139.230 "curl -s --max-time 3 http://127.0.0.1:7080/api/health"
 
 ```bash
 # 查看最近日志
-tail -50 /root/asio_full_stack/build/server.log
+tail -50 /root/asio_owen/build/server.log
 
 # 只看错误和警告（排除 MySQL WARNING 噪音）
-grep -E '\[error\]|\[warning\]' /root/asio_full_stack/build/server.log | head -20
+grep -E '\[error\]|\[warning\]' /root/asio_owen/build/server.log | head -20
 
 # 只看崩溃日志
-grep -i 'free\|abort\|SIG\|crash\|Aborted' /root/asio_full_stack/build/server.log
+grep -i 'free\|abort\|SIG\|crash\|Aborted' /root/asio_owen/build/server.log
 ```
 
 ### 3. 检查 Core Dump
@@ -157,7 +157,7 @@ grep -i 'free\|abort\|SIG\|crash\|Aborted' /root/asio_full_stack/build/server.lo
 ls -la /tmp/core.*
 
 # 如果存在，用 gdb 分析
-gdb /root/asio_full_stack/build/server /tmp/core.<pid>
+gdb /root/asio_owen/build/server /tmp/core.<pid>
 
 # 常用调试命令（gdb 内执行）：
 # bt             — 查看崩溃堆栈
