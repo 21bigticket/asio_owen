@@ -2,7 +2,7 @@
 
 ## 目标
 
-在现有 standalone ASIO HTTP 服务器上增加 HTTP 反向代理能力。网关接收客户端 HTTP/1.x 请求，将 `/proxy/{service}/...` 路由到配置的上游 HTTP 服务，并通过有界连接池复用上游 keep-alive 连接。
+在现有 standalone ASIO HTTP 服务器上增加 HTTP 反向代理能力。网关接收客户端 HTTP/1.x 请求，将 `/{service}/...`（例如 `/zebra-config/...`）路由到配置的上游 HTTP 服务，并通过有界连接池复用上游 keep-alive 连接。
 
 本地路由例如 `/api/health`、`/api/redis`、`/api/mysql`、`/api/combo` 仍然拥有精确匹配优先级，优先于代理路由。
 
@@ -20,7 +20,7 @@
 |---|---|
 | `src/http/http_server.hpp` | accept 循环、HTTP 解析、body framing、请求转发、客户端 keep-alive |
 | `src/http/http_pool.hpp` | 上游连接池，懒创建、空闲回收、硬上限 |
-| `src/http/upstream_manager.hpp` | `/proxy/{svc}` 路由与每个 service 对应的连接池 |
+| `src/http/upstream_manager.hpp` | `/{svc}` 路由与每个 service 对应的连接池 |
 | `src/http/http_context.hpp` | `HttpContext` 请求/响应数据载体 |
 
 ```text
@@ -41,7 +41,7 @@ HttpServer
    - `Transfer-Encoding` 最后一个编码不是 `chunked` 返回 400。
    - 同时存在 `Transfer-Encoding` 和 `Content-Length` 时，转发前移除 `Content-Length`。
 4. 无论本地路由还是代理路由，都先按 framing 规则消费完整请求 body。这样才能保证 keep-alive 和 pipeline 的后续字节不串位。
-5. 分发顺序是精确本地路由、`/proxy/{service}/...`、404。
+5. 分发顺序是精确本地路由、`/{service}/...`、404。
 
 ## Keep-Alive 支持确认
 

@@ -437,11 +437,14 @@ private:
         auto sp1 = status_line.find(' ');
         auto sp2 = status_line.find(' ', sp1 + 1);
         if (sp1 == std::string::npos || sp2 == std::string::npos) {
+            LOG_INFO("Proxy response invalid status line: ", sanitize_body_preview(status_line));
             conn.connection_close = true;
             co_return resp;
         }
         auto status_code = parse_decimal_size(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
         if (!status_code || *status_code > 999) {
+            LOG_INFO("Proxy response invalid status code: status_line=",
+                sanitize_body_preview(status_line));
             conn.connection_close = true;
             co_return resp;
         }
@@ -452,8 +455,20 @@ private:
         HeaderParseState header_state;
         auto hdr = header_part.substr(first_line_end + 2, header_end - first_line_end - 2);
         parse_header_fields(std::move(hdr), resp.headers, header_state);
+        LOG_INFO("Proxy response header parsed: status_line=", status_line,
+            ", status=", resp.status_code,
+            ", headers=[", describe_headers(resp.headers), "]",
+            ", invalid_cl=", header_state.invalid_content_length,
+            ", duplicate_cl=", header_state.duplicate_content_length,
+            ", has_te=", header_state.has_transfer_encoding,
+            ", is_chunked=", header_state.is_chunked,
+            ", content_length=",
+            (header_state.content_length ? std::to_string(*header_state.content_length) : "none"),
+            ", body_rest=", body_rest.size());
         if (header_state.invalid_content_length || header_state.duplicate_content_length ||
             (header_state.has_transfer_encoding && !header_state.is_chunked)) {
+            LOG_INFO("Proxy response framing invalid: status=", resp.status_code,
+                ", upstream body preview=", sanitize_body_preview(body_rest));
             conn.connection_close = true;
             co_return resp;
         }
@@ -466,6 +481,8 @@ private:
         if (response_has_no_body) {
             resp.body.clear();
             if (!body_rest.empty()) {
+                LOG_INFO("Proxy response expected no body but received preread bytes: status=",
+                    resp.status_code, ", bytes=", body_rest.size());
                 conn.connection_close = true;
             }
             co_return resp;
@@ -475,6 +492,8 @@ private:
         if (header_state.is_chunked) {
             if (!co_await read_chunked_stream(conn.socket, body_rest, resp.body,
                     pool_cfg.max_body_size, std::chrono::milliseconds(pool_cfg.read_timeout_ms))) {
+                LOG_INFO("Proxy response chunked read failed: status=", resp.status_code,
+                    ", body_rest=", body_rest.size());
                 conn.connection_close = true;
                 co_return resp;
             }
@@ -495,6 +514,9 @@ private:
                     auto nr = co_await read_with_timeout(conn.socket, tmp, sizeof(tmp),
                         std::chrono::milliseconds(pool_cfg.read_timeout_ms));
                     if (!nr) {
+                        LOG_INFO("Proxy response content-length read failed: status=", resp.status_code,
+                            ", already_read=", resp.body.size(),
+                            ", remaining=", remaining);
                         conn.connection_close = true;
                         break;
                     }
@@ -507,12 +529,18 @@ private:
                         remaining -= nr;
                     }
                     if (resp.body.size() > pool_cfg.max_body_size) {
+                        LOG_INFO("Proxy response body too large while reading: status=", resp.status_code,
+                            ", size=", resp.body.size(),
+                            ", max=", pool_cfg.max_body_size);
                         conn.connection_close = true;
                         break;
                     }
                 }
             }
             if (resp.body.size() > pool_cfg.max_body_size) {
+                LOG_INFO("Proxy response body too large after read: status=", resp.status_code,
+                    ", size=", resp.body.size(),
+                    ", max=", pool_cfg.max_body_size);
                 conn.connection_close = true;
                 resp.body.resize(pool_cfg.max_body_size);
             }
@@ -535,6 +563,9 @@ private:
                     if (!nr) break;
                     resp.body.append(tmp, nr);
                     if (resp.body.size() > pool_cfg.max_body_size) {
+                        LOG_INFO("Proxy response eof-framed body too large: status=", resp.status_code,
+                            ", size=", resp.body.size(),
+                            ", max=", pool_cfg.max_body_size);
                         conn.connection_close = true;
                         resp.body.resize(pool_cfg.max_body_size);
                         break;
@@ -543,6 +574,11 @@ private:
             }
         }
 
+        LOG_INFO("Proxy response body ready: status=", resp.status_code,
+            ", body_size=", resp.body.size(),
+            ", connection_close=", conn.connection_close,
+            ", read_buffer=", conn.read_buffer.size(),
+            ", body_preview=", sanitize_body_preview(resp.body));
         co_return resp;
     }
 
@@ -581,6 +617,54 @@ private:
             header_iequals(k, "upgrade");
     }
 
+    static std::string describe_headers(
+        const std::vector<std::pair<std::string, std::string>>& headers) {
+        std::string out;
+        for (auto& [k, v] : headers) {
+            if (!out.empty()) out += ", ";
+            out += k;
+            out += "(len=";
+            out += std::to_string(v.size());
+            if (header_iequals(k, "authorization") || header_iequals(k, "cookie") ||
+                header_iequals(k, "set-cookie")) {
+                out += ",redacted";
+            }
+            out += ")";
+        }
+        return out;
+    }
+
+    static std::string sanitize_header_value(std::string_view key, std::string_view value) {
+        if (header_iequals(key, "authorization") || header_iequals(key, "cookie") ||
+            header_iequals(key, "set-cookie")) {
+            return "<redacted len=" + std::to_string(value.size()) + ">";
+        }
+        constexpr size_t kMaxLogValue = 160;
+        if (value.size() <= kMaxLogValue) {
+            return std::string(value);
+        }
+        return std::string(value.substr(0, kMaxLogValue)) +
+            "...<truncated len=" + std::to_string(value.size()) + ">";
+    }
+
+    static std::string sanitize_body_preview(std::string_view body) {
+        constexpr size_t kMaxPreview = 512;
+        std::string out;
+        size_t n = std::min(body.size(), kMaxPreview);
+        out.reserve(n + 32);
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char c = static_cast<unsigned char>(body[i]);
+            if (c == '\r') out += "\\r";
+            else if (c == '\n') out += "\\n";
+            else if (std::isprint(c)) out += static_cast<char>(c);
+            else out += '.';
+        }
+        if (body.size() > kMaxPreview) {
+            out += "...<truncated len=" + std::to_string(body.size()) + ">";
+        }
+        return out;
+    }
+
     asio::awaitable<void> handle_connection(asio::ip::tcp::socket socket) {
         try {
             char buf[8192];
@@ -609,7 +693,6 @@ private:
 
                 if (pret < 0) break;
                 std::string body_buffer = client_preread.substr(pret);
-                client_preread.clear();
 
                 std::string path_str(path, path_len);
                 std::string method_str(method, method_len);
@@ -628,6 +711,14 @@ private:
                         std::string(name),
                         std::string(value));
                 }
+                client_preread.clear();
+
+                LOG_INFO("Client request parsed: method=", method_str,
+                    ", path=", path_str,
+                    ", http_minor=", minor_version,
+                    ", header_count=", ctx.headers.size(),
+                    ", initial_body_buffer=", body_buffer.size(),
+                    ", headers=[", describe_headers(ctx.headers), "]");
 
                 bool handled = false;
                 bool proxy_response = false;
@@ -636,12 +727,22 @@ private:
                 if (request_header_state.invalid_content_length ||
                     request_header_state.duplicate_content_length ||
                     (request_header_state.has_transfer_encoding && !request_header_state.is_chunked)) {
+                    LOG_INFO("Reject request framing: method=", method_str,
+                        ", path=", path_str,
+                        ", invalid_cl=", request_header_state.invalid_content_length,
+                        ", duplicate_cl=", request_header_state.duplicate_content_length,
+                        ", has_te=", request_header_state.has_transfer_encoding,
+                        ", is_chunked=", request_header_state.is_chunked,
+                        ", headers=[", describe_headers(ctx.headers), "]");
                     ctx.status_code = 400;
                     ctx.response_body = "{\"code\":400,\"msg\":\"invalid request framing\"}";
                     handled = true;
                 } else if (request_header_state.is_chunked) {
                     if (!co_await read_chunked_stream(socket, preread, ctx.body,
                             kMaxBodySize, client_timeout)) {
+                        LOG_INFO("Reject invalid chunked body: method=", method_str,
+                            ", path=", path_str,
+                            ", headers=[", describe_headers(ctx.headers), "]");
                         ctx.status_code = 400;
                         ctx.response_body = "{\"code\":400,\"msg\":\"invalid chunked body\"}";
                         handled = true;
@@ -650,6 +751,9 @@ private:
                 } else if (request_header_state.content_length) {
                     size_t content_length = *request_header_state.content_length;
                     if (content_length > kMaxBodySize) {
+                        LOG_INFO("Reject body too large: method=", method_str,
+                            ", path=", path_str,
+                            ", content_length=", content_length);
                         ctx.status_code = 413;
                         ctx.response_body = "{\"code\":413,\"msg\":\"body too large\"}";
                         handled = true;
@@ -662,6 +766,10 @@ private:
                         while (remaining > 0) {
                             auto nr = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
                             if (!nr) {
+                                LOG_INFO("Reject request timeout while reading body: method=", method_str,
+                                    ", path=", path_str,
+                                    ", already_read=", ctx.body.size(),
+                                    ", remaining=", remaining);
                                 ctx.status_code = 408;
                                 ctx.response_body = "{\"code\":408,\"msg\":\"request timeout\"}";
                                 handled = true;
@@ -682,6 +790,12 @@ private:
                     client_preread = std::move(preread);
                 }
 
+                LOG_INFO("Client request body ready: method=", method_str,
+                    ", path=", path_str,
+                    ", body_size=", ctx.body.size(),
+                    ", next_preread=", client_preread.size(),
+                    ", body_preview=", sanitize_body_preview(ctx.body));
+
                 // 先试本地路由。body 已按 framing 消费，keep-alive/pipeline 不会错位。
                 auto it = routes_.find(path_str);
                 if (!handled && it != routes_.end()) {
@@ -693,19 +807,33 @@ private:
                 if (!handled) {
                     auto upstream = upman_.route(path_str);
                     if (upstream) {
-                        auto& [cfg, pool] = *upstream;
+                        const auto& cfg = upstream->config;
+                        auto* pool = upstream->pool;
+                        LOG_INFO("Proxy route matched: method=", method_str,
+                            ", path=", path_str,
+                            ", upstream_path=", upstream->upstream_path,
+                            ", upstream=", cfg.host, ":", cfg.port,
+                            ", body_size=", ctx.body.size(),
+                            ", headers=[", describe_headers(ctx.headers), "]");
                         try {
                             auto conn_opt = co_await pool->acquire(cfg.host, cfg.port);
                             if (conn_opt) {
                                 ConnGuard guard(pool, std::move(conn_opt));
                                 auto& conn = guard.conn();
 
-                                // 构造转发请求
-                                std::string forward_req = method_str + " " + path_str + " HTTP/1.1\r\n";
+                                // 转发给上游时去掉服务名前缀。
+                                // 例如 /zebra-config/config.ConfigService/xxx → /config.ConfigService/xxx
+                                std::string forward_req = method_str + " " + upstream->upstream_path + " HTTP/1.1\r\n";
                                 forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
+                                LOG_INFO("Proxy request: method=", method_str,
+                                    ", path=", path_str,
+                                    ", upstream_path=", upstream->upstream_path,
+                                    ", upstream=", cfg.host, ":", cfg.port,
+                                    ", body_size=", ctx.body.size());
 
                                 std::unordered_set<std::string> filtered = hop_by_hop_headers();
                                 filtered.insert("host");
+                                filtered.insert("accept-encoding");
                                 add_connection_tokens(ctx.headers, filtered);
                                 bool forwarding_transfer_encoding = false;
                                 for (auto& [k, v] : ctx.headers) {
@@ -714,33 +842,42 @@ private:
                                         break;
                                     }
                                 }
+                                LOG_INFO("Proxy header policy: upstream_path=", upstream->upstream_path,
+                                    ", forwarding_transfer_encoding=", forwarding_transfer_encoding,
+                                    ", original_headers=[", describe_headers(ctx.headers), "]");
 
                                 for (auto& [k, v] : ctx.headers) {
                                     auto lk = to_lower(k);
                                     // transfer-encoding: chunked 需要保留，让下游正确解析 raw chunked body
                                     if (lk == "transfer-encoding") {
+                                        LOG_INFO("Proxy forward header keep: ", k,
+                                            "=", sanitize_header_value(k, v));
                                         forward_req += k + ": " + v + "\r\n";
                                         continue;
                                     }
-                                    if (forwarding_transfer_encoding && lk == "content-length") continue;
-                                    if (filtered.find(lk) != filtered.end()) continue;
+                                    if (forwarding_transfer_encoding && lk == "content-length") {
+                                        LOG_INFO("Proxy forward header skip: ", k,
+                                            ", reason=content-length-with-transfer-encoding");
+                                        continue;
+                                    }
+                                    if (filtered.find(lk) != filtered.end()) {
+                                        LOG_INFO("Proxy forward header skip: ", k,
+                                            ", reason=hop-by-hop-or-overridden");
+                                        continue;
+                                    }
+                                    LOG_INFO("Proxy forward header keep: ", k,
+                                        "=", sanitize_header_value(k, v));
                                     forward_req += k + ": " + v + "\r\n";
                                 }
-                                asio::error_code remote_ec;
-                                auto remote_ep = socket.remote_endpoint(remote_ec);
-                                std::string client_ip = remote_ec ? "" : remote_ep.address().to_string();
-                                if (!client_ip.empty()) {
-                                    auto existing_xff = ctx.get_header("X-Forwarded-For");
-                                    forward_req += "X-Forwarded-For: ";
-                                    if (!existing_xff.empty()) {
-                                        forward_req += existing_xff + ", ";
-                                    }
-                                    forward_req += client_ip + "\r\n";
-                                }
-                                forward_req += "X-Forwarded-Proto: http\r\n";
-                                forward_req += "Via: 1.1 asio_owen\r\n";
 
+                                LOG_INFO("Proxy upstream request line: ", method_str, " ",
+                                    upstream->upstream_path, " HTTP/1.1");
                                 forward_req += "\r\n" + ctx.body;
+                                LOG_INFO("Proxy upstream request built: upstream_path=",
+                                    upstream->upstream_path,
+                                    ", bytes=", forward_req.size(),
+                                    ", body_size=", ctx.body.size(),
+                                    ", body_preview=", sanitize_body_preview(ctx.body));
 
                                 // 发送请求（带超时）
                                 auto write_ok = co_await write_with_timeout(
@@ -752,6 +889,9 @@ private:
                                     asio::error_code ec;
                                     conn.socket.cancel(ec);
                                     guard.set_bad();
+                                    LOG_INFO("Proxy upstream write timeout: method=", method_str,
+                                        ", upstream_path=", upstream->upstream_path,
+                                        ", upstream=", cfg.host, ":", cfg.port);
                                     ctx.status_code = 504;
                                     ctx.response_body = "{\"code\":504,\"msg\":\"upstream write timeout\"}";
                                     handled = true;
@@ -763,6 +903,12 @@ private:
                                     ctx.response_body = std::move(proxy_resp.body);
                                     ctx.response_headers = std::move(proxy_resp.headers);
                                     proxy_response = true;
+
+                                    LOG_INFO("Proxy response: method=", method_str,
+                                        ", upstream_path=", upstream->upstream_path,
+                                        ", status=", ctx.status_code,
+                                        ", body_size=", ctx.response_body.size(),
+                                        ", response_headers=[", describe_headers(ctx.response_headers), "]");
 
                                     if (conn.connection_close) guard.set_bad();
                                     handled = true;
@@ -833,6 +979,14 @@ private:
                 resp += response_has_no_body ? "0" : std::to_string(ctx.response_body.size());
                 resp += "\r\n\r\n";
                 if (!response_has_no_body) resp += ctx.response_body;
+
+                LOG_INFO("Client response built: method=", method_str,
+                    ", path=", path_str,
+                    ", status=", ctx.status_code,
+                    ", proxy_response=", proxy_response,
+                    ", body_size=", response_has_no_body ? 0 : ctx.response_body.size(),
+                    ", body_preview=",
+                    response_has_no_body ? "" : sanitize_body_preview(ctx.response_body));
 
                 // 客户端响应写不使用 write_with_timeout：timer 开销在热路径上会被放大
                 // （改用裸 async_write + redirect_error，简单可靠）
