@@ -1,63 +1,75 @@
-# HTTP Gateway Design
+# HTTP 网关设计
 
-## Goal
+## 目标
 
-Add HTTP reverse-proxy support to the existing standalone ASIO HTTP server.
-The gateway accepts client HTTP/1.x requests, routes `/proxy/{service}/...`
-to configured upstream HTTP services, and reuses upstream keep-alive
-connections through a bounded pool.
+在现有 standalone ASIO HTTP 服务器上增加 HTTP 反向代理能力。网关接收客户端 HTTP/1.x 请求，将 `/proxy/{service}/...` 路由到配置的上游 HTTP 服务，并通过有界连接池复用上游 keep-alive 连接。
 
-Local routes such as `/api/health`, `/api/redis`, `/api/mysql`, and
-`/api/combo` keep exact-match priority over proxy routing.
+本地路由例如 `/api/health`、`/api/redis`、`/api/mysql`、`/api/combo` 仍然拥有精确匹配优先级，优先于代理路由。
 
-Design priorities, in order:
+设计优先级如下：
 
-1. **Protocol compliance** — RFC 7230 body framing, hop-by-hop stripping,
-   HTTP/1.0 vs 1.1 semantics.
-2. **Anti-smuggling** — reject framing the gateway cannot reason about
-   rather than guessing what downstream might do.
-3. **Resource safety** — bounded pool, idle eviction, RAII connection
-   return on every path.
-4. **Slowloris resistance** — every client/upstream read and write has
-   a timeout.
-5. **Clean shutdown** — acceptor stops, in-flight drains, sockets close,
-   no fd leak.
+1. **协议正确性**：遵守 RFC 7230 的 body framing、hop-by-hop 头处理、HTTP/1.0 与 HTTP/1.1 语义。
+2. **防请求走私**：无法确定语义的 framing 直接拒绝，不猜测下游会如何解析。
+3. **资源安全**：连接池有硬上限，空闲连接会回收，所有路径都通过 RAII 归还连接。
+4. **抗慢连接攻击**：客户端和上游的读写都有超时控制。
+5. **干净关闭**：停止 acceptor，等待 in-flight 请求退出，关闭 socket，不泄漏 fd。
 
-## Module Layout
+## 模块结构
 
-| File | Responsibility |
+| 文件 | 职责 |
 |---|---|
-| `src/http/http_server.hpp` | Accept loop, HTTP parsing, body framing, forwarding, client keep-alive |
-| `src/http/http_pool.hpp` | Lazy-create pool with idle eviction and hard cap |
-| `src/http/upstream_manager.hpp` | `/proxy/{svc}` routing, per-service pool |
-| `src/http/http_context.hpp` | `HttpContext`: request/response data carrier |
+| `src/http/http_server.hpp` | accept 循环、HTTP 解析、body framing、请求转发、客户端 keep-alive |
+| `src/http/http_pool.hpp` | 上游连接池，懒创建、空闲回收、硬上限 |
+| `src/http/upstream_manager.hpp` | `/proxy/{svc}` 路由与每个 service 对应的连接池 |
+| `src/http/http_context.hpp` | `HttpContext` 请求/响应数据载体 |
 
-```
+```text
 HttpServer
 ├── UpstreamManager
-│   └── HttpPool (per service)
-├── ConnGuard (RAII)
-└── routes_ (local /api/...)
+│   └── HttpPool（每个 service 一个）
+├── ConnGuard（RAII）
+└── routes_（本地 /api/...）
 ```
 
-## Request Flow
+## 请求流程
 
-1. Read client headers with a 30s timeout and a 64KB header cap.
-2. Parse the request with picohttpparser.
-3. Parse framing headers via `parse_header_line_into` into `HeaderParseState`:
-   - invalid `Content-Length` -> 400
-   - conflicting duplicate `Content-Length` -> 400
-   - `Transfer-Encoding` without final `chunked` -> 400
-   - `Transfer-Encoding` plus `Content-Length` strips `Content-Length` before forwarding
-4. Always consume the request body according to framing before dispatching,
-   including local routes. This preserves keep-alive and pipelined bytes.
-5. Dispatch exact local route first, then `/proxy/{service}/...`, then 404.
+1. 以 30s 超时和 64KB header 上限读取客户端请求头。
+2. 使用 picohttpparser 解析请求行和 header。
+3. 通过 `parse_header_line_into` 将 framing header 解析进 `HeaderParseState`：
+   - 非法 `Content-Length` 返回 400。
+   - 冲突的重复 `Content-Length` 返回 400。
+   - `Transfer-Encoding` 最后一个编码不是 `chunked` 返回 400。
+   - 同时存在 `Transfer-Encoding` 和 `Content-Length` 时，转发前移除 `Content-Length`。
+4. 无论本地路由还是代理路由，都先按 framing 规则消费完整请求 body。这样才能保证 keep-alive 和 pipeline 的后续字节不串位。
+5. 分发顺序是精确本地路由、`/proxy/{service}/...`、404。
 
-## Header Parsing State Machine
+## Keep-Alive 支持确认
+
+当前实现支持客户端和上游两侧 keep-alive。
+
+客户端侧：
+
+- `handle_connection` 在同一个客户端 socket 上循环读取请求，HTTP/1.1 默认保持连接。
+- 如果客户端显式发送 `Connection: close`，当前响应写完后断开。
+- HTTP/1.0 默认关闭，只有显式 `Connection: keep-alive` 才继续复用客户端连接。
+- 读请求头和 body 时维护 `client_preread`，单次 `async_read_some` 多读到的 pipeline 字节会留给下一轮解析。
+- framing 错误、请求超时、body 过大等场景会强制关闭客户端连接，避免把残留 body 当成下一次请求头解析。
+
+上游侧：
+
+- 每个 service 有独立 `HttpPool`，空闲连接会回池并被后续请求复用。
+- 上游响应为 HTTP/1.1 且没有 `Connection: close` 时，连接可回到 idle 队列。
+- 上游响应为 HTTP/1.0 时默认不复用，除非显式 `Connection: keep-alive`。
+- 响应没有 `Content-Length` 或 `Transfer-Encoding` 时，按读到 EOF 处理，并标记该上游连接不可复用。
+- `conn->read_buffer` 保存上游响应多读出的 pipeline 字节，连接回池时若该 buffer 超过 64KB 会丢弃该连接。
+
+因此，网关支持 keep-alive，但不是无条件复用：只在 framing 明确、连接未关闭、读写未超时、buffer 未异常膨胀时复用。
+
+## 请求头解析状态机
 
 ```cpp
 struct HeaderParseState {
-    std::optional<size_t> content_length;        // distinguishes "CL=0" from "no CL"
+    std::optional<size_t> content_length;        // 区分 "CL=0" 和 "没有 CL"
     bool duplicate_content_length = false;
     bool invalid_content_length = false;
     bool is_chunked = false;
@@ -67,39 +79,26 @@ struct HeaderParseState {
 };
 ```
 
-`optional<size_t>` is critical: `Content-Length: 0` must be treated as "body
-present, zero bytes" and trigger the read path with `remaining = 0`, not the
-"no length framing" branch that reads to EOF. Using a plain `size_t` here is
-a known bug pattern that breaks keep-alive for every CL=0 response.
+`optional<size_t>` 很关键：`Content-Length: 0` 必须表示“有 body framing，但长度为 0”，而不是走“没有长度 framing，需要读到 EOF”的分支。用普通 `size_t` 容易把 CL=0 响应误判成无 framing，从而破坏 keep-alive。
 
-`Connection` tokens are parsed with `split_connection_tokens`, which splits
-on commas, trims each token, and compares case-insensitively against
-`"close"` and `"keep-alive"`. Substring matching (`find("close")`) is
-forbidden — it would misclassify `Connection: closed` as `close`.
+`Connection` 使用 `split_connection_tokens` 解析：按逗号拆分、trim 每个 token、大小写不敏感地精确比较 `"close"` 和 `"keep-alive"`。禁止使用 `find("close")` 这种子串匹配，否则会把 `Connection: closed` 误判为 `close`。
 
-## Chunked Handling
+## 分块传输处理
 
-Chunked bodies are kept as raw chunked bytes when forwarding to the upstream
-(the upstream expects the same chunk framing the client sent). Parsing is
-protocol-aware via `read_chunked_stream`:
+请求侧 chunked body 会按原始 chunked 字节转发给上游，因为上游期望看到客户端发来的同样 chunk framing。解析使用协议感知的 `read_chunked_stream`：
 
-1. `consume_line` reads up to `\r\n`.
-2. `parse_hex_size_line` parses the hex size, allowing chunk extensions
-   after `;`.
-3. `consume_exact` reads exactly `size` bytes plus the required CRLF,
-   verifying the trailing `\r\n`.
-4. For size 0, read trailers until the empty line terminator.
+1. `consume_line` 读取到 `\r\n`。
+2. `parse_hex_size_line` 解析十六进制 chunk size，允许 `;` 后的 chunk extension。
+3. `consume_exact` 精确读取 `size` 字节数据和后续 CRLF，并校验末尾 `\r\n`。
+4. size 为 0 时继续读取 trailers，直到空行结束。
 
-The implementation must not search for string markers such as `\r\n0\r\n`
-inside the raw body, because binary chunk data can contain those bytes.
-A line-oriented state machine is the only safe terminator strategy.
+实现不能在原始 body 里搜索 `\r\n0\r\n` 之类字符串作为终止条件，因为二进制 chunk 数据里可能包含相同字节。必须使用按行解析的状态机。
 
-Body size is bounded by `max_body_size` across the full `out` buffer
-(headers + chunk data + trailers), checked at each append.
+`max_body_size` 限制作用在完整输出 buffer 上，包括 chunk 数据和 trailers，并且每次 append 后都检查。
 
-## Hop-By-Hop Headers
+## 逐跳 Header
 
-Both request and response forwarding remove hop-by-hop headers:
+请求和响应转发都会移除 hop-by-hop header：
 
 - `Connection`
 - `Keep-Alive`
@@ -110,50 +109,30 @@ Both request and response forwarding remove hop-by-hop headers:
 - `Transfer-Encoding`
 - `Upgrade`
 
-Headers named by `Connection` tokens are removed as well. Client `Host` is
-replaced with the upstream host and port. `X-Forwarded-For`,
-`X-Forwarded-Proto: http`, and `Via: 1.1 asio_owen` are added when
-forwarding. Existing `X-Forwarded-For` is preserved by chaining, not
-overwritten.
+`Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`。转发时会追加 `X-Forwarded-For`、`X-Forwarded-Proto: http`、`Via: 1.1 asio_owen`。如果客户端已有 `X-Forwarded-For`，会在原值后追加客户端 IP，而不是覆盖。
 
-Chunked requests keep `Transfer-Encoding: chunked` and `Content-Length` is
-stripped when any transfer encoding is present. The raw chunked body bytes
-are forwarded as-is to the upstream verbatim, since the upstream expects the
-same chunk framing the client sent. This is a request-side concern only — the
-response-side framing is always re-owned by the gateway after de-chunking.
+请求侧如果是 `Transfer-Encoding: chunked`，会保留 `Transfer-Encoding` 并移除 `Content-Length`，原始 chunked body 字节原样转发给上游。响应侧不同：网关会接管响应 framing，必要时 de-chunk，并重新计算 `Content-Length`。
 
-## Response Framing
+## 响应分帧
 
-Upstream response parsing follows RFC 7230 body length precedence:
+上游响应 body 长度按 RFC 7230 优先级判断：
 
-1. Responses to `HEAD`, and status `1xx`, `204`, `304`, have no body.
-2. `Transfer-Encoding: chunked` is parsed with the chunk state machine.
-3. `Content-Length` reads exactly N bytes, preserving extra bytes in the
-   connection's read buffer for the next response.
-4. No length framing means read until upstream closes and do not reuse the
-   connection.
+1. `HEAD` 请求的响应、`1xx`、`204`、`304` 没有 body。
+2. `Transfer-Encoding: chunked` 使用 chunk 状态机解析。
+3. `Content-Length` 精确读取 N 字节，多读出的字节保存到连接的 `read_buffer`，供下一次响应使用。
+4. 没有长度 framing 时读到上游关闭，并且该连接不复用。
 
-Bad upstream status lines, invalid framing, timeouts, oversized bodies,
-oversized headers (>64KB), and incomplete bodies mark the upstream connection
-bad so it is not returned to the idle pool.
+上游状态行非法、framing 非法、超时、body 超限、header 超过 64KB、body 不完整时，都会把上游连接标记为 bad，不归还 idle 池。
 
-`Content-Length` and `Transfer-Encoding` are never forwarded as-is: the
-gateway owns response framing after de-chunking and size limits, and
-recomputes `Content-Length` from the body it actually has.
+`Content-Length` 和 `Transfer-Encoding` 不会原样透传给客户端。网关在解析、大小限制和可能的 de-chunk 后重新拥有响应 framing，并按实际 body 重新计算 `Content-Length`。
 
-`status_text` (`201 Created`, `418 I'm a teapot`) is preserved end-to-end
-through `HttpContext::response_status_text`. Hardcoding `OK` for any
-non-200 code is forbidden.
+`status_text` 会通过 `HttpContext::response_status_text` 端到端保留，例如 `201 Created`、`418 I'm a teapot`。不能把非 200 状态都硬编码成 `OK`。
 
-The gateway writes responses to clients with a timeout. It controls
-`Content-Length` and filters upstream hop-by-hop headers.
+客户端响应写当前使用裸 `async_write + redirect_error`，不额外套 `write_with_timeout`。这是为了避免热路径上每次响应写都创建 timer。写失败则直接结束当前客户端连接。
 
-On timeout or read failure (client side or upstream side), the coroutine
-`co_return`s from `handle_connection`, which closes the client socket and
-aborts the current dispatch loop iteration. The upstream connection (if any
-was acquired) is returned or released via `ConnGuard` RAII.
+## HTTP/1.0 与 HTTP/1.1 默认行为
 
-## HTTP/1.0 vs 1.1 Defaults
+上游侧：
 
 ```cpp
 int upstream_minor_version = status_line.rfind("HTTP/1.0", 0) == 0 ? 0 : 1;
@@ -161,104 +140,74 @@ conn.connection_close = header_state.connection_close ||
     (upstream_minor_version == 0 && !header_state.connection_keep_alive);
 ```
 
-On the client side, the dispatch loop closes the connection when:
+客户端侧：
 
 ```cpp
 HeaderTokens tokens = split_connection_tokens(ctx.get_header("Connection"));
-if (minor_version == 0 && !tokens.keep_alive) break;   // HTTP/1.0 default close
-if (tokens.close) break;                                // explicit close
+if (minor_version == 0 && !tokens.keep_alive) break;   // HTTP/1.0 默认关闭
+if (tokens.close) break;                                // 显式关闭
 ```
 
-Failing to detect HTTP/1.0 default-close caused repeated reuse of sockets
-the upstream had already closed, surfacing as 502 storms after the first
-idle timeout.
+如果没有正确处理 HTTP/1.0 默认关闭，就会复用上游已经关闭的 socket，表现为第一次 idle timeout 后出现连续 502。
 
 ## HttpPool
 
-`HttpPool` is lazy-created and bounded:
+`HttpPool` 是懒创建、有边界的连接池：
 
-- `max_size`: total idle + active upstream sockets.
-- `max_concurrent`: active request cap; `0` disables this extra limit.
-- `max_body_size`: response/request body limit.
-- `connect_timeout_ms`, `read_timeout_ms`, `request_timeout_ms`.
-- `idle_timeout_sec`: lazy idle eviction age.
+- `max_size`：idle + active 上游 socket 总数上限。
+- `max_concurrent`：active 请求数上限；`0` 表示不加这个额外限制。
+- `max_body_size`：请求和响应 body 上限。
+- `connect_timeout_ms`、`read_timeout_ms`、`request_timeout_ms`。
+- `idle_timeout_sec`：懒回收空闲连接的时间阈值。
 
-Each acquired connection is represented by a `unique_ptr<HttpConn>` and is
-tracked in `State::active` **before** `acquire` returns. Tracking is done
-inside the pool lock — both for the idle-reuse path and the freshly-created
-path — to eliminate the window between `acquire` returning and `ConnGuard`
-registering the connection. Without this, a shutdown during that window
-orphaned a freshly connected socket and leaked a fd.
+每次 acquire 返回的是 `unique_ptr<HttpConn>`，并且在 `acquire` 返回前已经在 `State::active` 中登记。idle 复用路径和新建连接路径都在 pool lock 内完成 active 跟踪，避免 shutdown 发生在 `acquire` 返回与 `ConnGuard` 构造之间时泄漏 fd。
 
-`ConnGuard` is non-copyable and non-movable. This guarantees that the
-`HttpConn*` stored in `State::active` remains valid for the lifetime of
-the guard — the address inside the `unique_ptr` does not change. The
-destructor calls `untrack_active`, then `release` (good) or `release_bad`
-(on `set_bad()`, exception, or `connection_close`).
+`ConnGuard` 不可拷贝、不可移动。这样 `State::active` 中保存的 `HttpConn*` 在 guard 生命周期内始终有效，因为 `unique_ptr` 内对象地址不会变化。析构时先 `untrack_active`，再根据连接状态调用 `release` 或 `release_bad`。
 
-Pool state is held through `shared_ptr<State>` so shutdown and in-flight
-guards cannot access a destroyed mutex. The `HttpPool` destructor only
-flips `running=false` and closes sockets; actual counter cleanup happens
-when each in-flight `ConnGuard` is destroyed.
+pool state 通过 `shared_ptr<State>` 持有，因此 shutdown 和 in-flight guard 不会访问已析构的 mutex。`HttpPool` 析构只负责设置 `running=false` 并关闭 socket；计数清理由 in-flight `ConnGuard` 退出时完成。
 
-`release` refuses to return a connection to the idle queue when:
+`release` 在以下情况不会把连接放回 idle 队列：
 
-- `socket.is_open()` is false, or `connection_close` is set.
-- `read_buffer.size() > 64KB`, to prevent pipeline pre-read bytes from
-  unbounded accumulation across requests.
+- `socket.is_open()` 为 false，或 `connection_close` 已设置。
+- `read_buffer.size() > 64KB`，避免同一个上游连接上的预读字节无限累积。
 
-Either case closes the socket and decrements `total` and `in_flight`.
+这些情况下会关闭 socket，并减少 `total` 和 `in_flight`。
 
-### Shutdown
+### 关闭流程
 
-1. `running.exchange(false)` — `acquire` returns nullptr from now on.
-2. Lock the pool; close every idle socket; cancel+close every active
-   socket. Cancelling active sockets causes their in-flight
-   `async_read_some` to fail; the handling coroutine's `ConnGuard` then
-   runs `release_bad` along the exception path.
-3. The shared `State` is kept alive by every `ConnGuard` until its
-   coroutine unwinds.
+1. `running.exchange(false)`，后续 `acquire` 返回 `nullptr`。
+2. 加锁关闭所有 idle socket，并 cancel+close 所有 active socket。active socket 被 cancel 后，正在等待的 `async_read_some` 会失败，对应协程沿异常/错误路径退出，`ConnGuard` 执行 `release_bad`。
+3. 每个 `ConnGuard` 持有 shared `State`，直到自己的协程完全 unwind。
 
-## Timeouts And Body Limits
+## 超时与 Body 限制
 
-| Direction | Operation | Timeout |
+| 方向 | 操作 | 超时或限制 |
 |---|---|---|
-| Client | header read, body read | 30s |
-| Client | header size | 64KB hard cap |
-| Upstream | resolve | `connect_timeout_ms` |
-| Upstream | connect | `connect_timeout_ms` |
-| Upstream | write request | `request_timeout_ms` |
-| Upstream | read response header + body | `read_timeout_ms` |
-| Both | body size | `max_body_size` (10MB default) |
+| 客户端 | header 读取、body 读取 | 30s |
+| 客户端 | header 大小 | 64KB 硬上限 |
+| 客户端 | 写响应 | 当前无独立 timer；写失败即关闭连接 |
+| 上游 | resolve | `connect_timeout_ms` |
+| 上游 | connect | `connect_timeout_ms` |
+| 上游 | 写请求 | `request_timeout_ms` |
+| 上游 | 读响应 header + body | `read_timeout_ms` |
+| 两侧 | body 大小 | `max_body_size`，默认 10MB |
 
-Every `async_read_some` and `async_write` is paired with a `steady_timer`.
-On timeout, the timer callback calls `socket.cancel()` which causes the
-pending async operation to complete with `operation_aborted`; the
-coroutine then treats that as failure. Each operation gets a fresh timer
-— no shared timer state across reads.
+客户端和上游读操作、上游写操作都通过 `steady_timer` 控制超时。超时时 timer callback 调用 `socket.cancel()`，让 pending async operation 以 `operation_aborted` 完成，协程随后按失败处理。每次操作使用独立 timer，不共享 timer 状态。
 
-Body size is checked inside read loops, not only at the end. A malicious
-upstream advertising a small `Content-Length` then streaming more bytes
-must not exhaust memory.
+body 大小必须在读取循环内检查，而不是只在最后检查。恶意上游即使声明较小 `Content-Length` 后继续发送更多字节，也不能耗尽内存。
 
-## Pipeline Support
+## Pipeline 支持
 
-A single `async_read_some` on a keep-alive connection can return bytes
-belonging to multiple pipelined requests. Two pre-read buffers preserve
-extra bytes:
+keep-alive 连接上的一次 `async_read_some` 可能读到多个 pipeline 请求/响应的字节。实现中有两个预读 buffer：
 
-- `client_preread` (per `handle_connection`): persists across iterations
-  of the dispatch loop, holds bytes after the current request's body.
-- `conn->read_buffer` (per pooled `HttpConn`): persists across requests
-  on the same upstream socket, holds bytes after the current response's
-  body.
+- `client_preread`：属于单个 `handle_connection`，跨客户端请求循环保存当前请求 body 之后的字节。
+- `conn->read_buffer`：属于上游池化连接，跨上游请求保存当前响应 body 之后的字节。
 
-Both must be moved (not copied) when handing off to the next iteration to
-avoid O(N²) buffer growth.
+交给下一轮解析时应 move，避免反复 copy 导致 O(N²) buffer 增长。
 
-## Configuration
+## 配置
 
-Gateway configuration lives in `config.ini`:
+网关配置位于 `config.ini`：
 
 ```ini
 [http_pool]
@@ -277,24 +226,21 @@ goods = 127.0.0.1:30006
 order = 127.0.0.1:30009
 ```
 
-`[http_pool]` settings are shared by all upstream pools. Per-service pool
-overrides are not implemented. Upstreams load at startup; hot reload and
-stricter service-name validation (`[a-z][a-z0-9-]*`) are design
-follow-ups.
+`[http_pool]` 配置被所有上游连接池共享。目前没有实现按 service 覆盖 pool 配置。上游列表在启动时加载；热更新和更严格的 service 名校验（例如 `[a-z][a-z0-9-]*`）是后续设计项。
 
-## Known Limitations
+## 已知限制
 
-| Item | Note |
+| 项目 | 说明 |
 |---|---|
-| HTTPS / TLS termination | Plaintext only; downstream TLS needs OpenSSL integration |
-| Load balancing | One service = one host:port; no multi-instance rotation or circuit breaker |
-| Retries | 502/503/504 returned to client as-is |
-| Streaming bodies | Body fully buffered before forwarding; bounded by `max_body_size` |
-| Connection prewarming | First request pays connect latency |
-| Observability | `LOG_INFO`/`LOG_WARN` only; no QPS/p99/pool gauges |
-| Hot reload | `[upstream]` changes require restart |
+| HTTPS / TLS termination | 当前只支持明文 HTTP；下游 TLS 需要额外 OpenSSL 集成 |
+| 负载均衡 | 一个 service 对应一个 host:port；没有多实例轮询或熔断 |
+| 重试 | 502/503/504 直接返回客户端，不做自动重试 |
+| 流式 body | body 会完整缓冲后再转发，受 `max_body_size` 限制 |
+| 连接预热 | 第一次请求需要承担 connect 延迟 |
+| 可观测性 | 目前只有 `LOG_INFO`/`LOG_WARN`；没有 QPS、p99、连接池 gauge |
+| 热更新 | `[upstream]` 变化需要重启 |
 
-## Build And Test
+## 构建与测试
 
 ```bash
 cmake -B build -S .
@@ -302,30 +248,26 @@ cmake --build build --target server
 ctest --test-dir build --output-on-failure
 ```
 
-Third-party directories such as `asio/` and `spdlog/` are ignored by Git and
-must be present locally. If they are restored from IDE Local History, verify
-they are not zero-byte placeholder files before building.
+`third_party/asio` 和 `third_party/spdlog` 已随仓库提交，clone 后不需要联网下载这两个头文件库。MySQL、hiredis、OpenSSL 仍使用系统开发包，CMake 会在 `pkg-config` 可用时优先使用它；不可用时通过 `find_path`/`find_library` 查找常见系统路径和 Homebrew 路径。
 
-## Risk History
+## 风险历史
 
-Issues found during design and implementation review, kept as a regression
-reference. Each row represents a concrete bug that existed in code or
-design before being caught.
+以下问题来自设计和实现 review，保留为回归参考。
 
-| Category | Problem | Fix |
+| 分类 | 问题 | 修复 |
 |---|---|---|
-| Smuggling | CL + TE both present; downstream used CL, gateway used TE | Strip CL when any TE present (request side); close connection (upstream side) |
-| Smuggling | Multiple CL headers with different values | Detect `duplicate_content_length`, reject |
-| Framing | `Content-Length: 0` triggered "read until EOF" | Use `optional<size_t>` to distinguish "no CL" from "CL=0" |
-| Framing | Chunked terminated via `find("0\r\n\r\n")` string match — fails on trailer-less or binary chunk data | Line-oriented state machine |
-| Header parsing | `substr(colon + 2)` assumed a space after colon | `trim_copy` on both sides |
-| Header parsing | Invalid CL value caused `stoul` to throw uncaught | `parse_decimal_size` returns `optional` |
-| Pool | Shutdown between `acquire` return and `ConnGuard` construction orphaned a socket | Track inside `acquire` while holding the pool lock |
-| Pool | `ConnGuard` movable; `active` set held dangling pointers after move | Non-movable guard; `unique_ptr` keeps `HttpConn*` stable |
-| Resource | Upstream response body had no size limit | In-loop + post-loop `max_body_size` checks |
-| Slowloris | Client reads had no timeout | `read_with_timeout` with 30s budget |
-| Protocol | HTTP/1.0 defaults treated as keep-alive | Detect `HTTP/1.0` prefix, default to close |
-| Header parsing | `Connection: closed` substring-matched `close` | `split_connection_tokens` with exact comparison |
-| Status line | `201 Created` rendered as `201 OK` | Preserve `status_text` end-to-end |
-| Forwarding | `X-Forwarded-For` overwritten when client already sent one | Chain existing value with client IP appended |
-| Pool | Pre-read bytes accumulated unbounded across requests on the same pooled connection | Drop connection if `read_buffer > 64KB` on release |
+| 请求走私 | 同时存在 CL + TE；下游按 CL，网关按 TE | 请求侧存在 TE 时移除 CL；上游响应侧遇到歧义时关闭连接 |
+| 请求走私 | 多个 `Content-Length` 值不一致 | 检测 `duplicate_content_length` 并拒绝 |
+| 分帧 | `Content-Length: 0` 触发“读到 EOF” | 用 `optional<size_t>` 区分“没有 CL”和“CL=0” |
+| 分帧 | 用 `find("0\r\n\r\n")` 判断 chunked 结束，遇到 trailer-less 或二进制 chunk 会失败 | 改成按行解析的状态机 |
+| Header 解析 | `substr(colon + 2)` 假设冒号后一定有空格 | key/value 两边都 `trim_copy` |
+| Header 解析 | 非法 CL 导致 `stoul` 异常未捕获 | `parse_decimal_size` 返回 `optional` |
+| 连接池 | shutdown 发生在 `acquire` 返回与 `ConnGuard` 构造之间导致 socket 泄漏 | 在 `acquire` 内持锁登记 active |
+| 连接池 | `ConnGuard` 可移动，`active` 集合里留下悬空指针 | guard 不可移动，`unique_ptr` 保证 `HttpConn*` 稳定 |
+| 资源 | 上游响应 body 没有大小限制 | 读取循环内和循环后都检查 `max_body_size` |
+| 慢连接 | 客户端读取没有超时 | `read_with_timeout` 使用 30s 预算 |
+| 协议 | HTTP/1.0 默认被当成 keep-alive | 检测 `HTTP/1.0` 前缀，默认关闭 |
+| Header 解析 | `Connection: closed` 被子串匹配成 `close` | `split_connection_tokens` 精确比较 |
+| 状态行 | `201 Created` 被渲染成 `201 OK` | 端到端保留 `status_text` |
+| 转发 | 客户端已有 `X-Forwarded-For` 时被覆盖 | 原值后追加客户端 IP |
+| 连接池 | 同一池化连接上的预读字节无限累积 | release 时 `read_buffer > 64KB` 则丢弃连接 |
