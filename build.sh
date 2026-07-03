@@ -4,7 +4,14 @@ set -e
 cd "$(dirname "$0")"
 
 echo "=== Configuring CMake ==="
-cmake -B build -S . -Wno-dev -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ 2>&1 | tail -3
+cmake_args=(-B build -S . -Wno-dev -DCMAKE_BUILD_TYPE=Release)
+if [[ -n "${CC:-}" ]]; then
+    cmake_args+=("-DCMAKE_C_COMPILER=${CC}")
+fi
+if [[ -n "${CXX:-}" ]]; then
+    cmake_args+=("-DCMAKE_CXX_COMPILER=${CXX}")
+fi
+cmake "${cmake_args[@]}" 2>&1 | tail -3
 
 echo "=== Building ==="
 cmake --build build --target server -j4 2>&1 | tail -3

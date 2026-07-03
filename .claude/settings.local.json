@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(md5 /Users/mac/code/croot/asio_owen/GATEWAY_DESIGN.md)",
+      "Bash(read d *)",
+      "Bash(cmake --build /Users/mac/code/croot/asio_owen/build --target server)",
+      "Bash(git clone *)"
+    ]
+  }
+}

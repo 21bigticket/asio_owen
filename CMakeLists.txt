@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(asio_owen)
+project(asio_owen LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,14 +7,21 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# 零 Boost
-add_definitions(-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT)
+# ==================== 通用编译选项 ====================
+add_library(asio_owen_options INTERFACE)
+target_compile_features(asio_owen_options INTERFACE cxx_std_20)
+target_compile_definitions(asio_owen_options INTERFACE ASIO_STANDALONE ASIO_HAS_CO_AWAIT)
+target_include_directories(asio_owen_options INTERFACE ${PROJECT_SOURCE_DIR}/src)
 
 # ==================== ASIO + spdlog（优先本地，否则 FetchContent 自动拉取）====================
 include(FetchContent)
 
-if(EXISTS ${PROJECT_SOURCE_DIR}/asio/include/asio.hpp)
-    include_directories(${PROJECT_SOURCE_DIR}/asio/include)
+add_library(asio_owen_asio INTERFACE)
+if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/asio/include/asio.hpp)
+    target_include_directories(asio_owen_asio INTERFACE ${PROJECT_SOURCE_DIR}/third_party/asio/include)
+    message(STATUS "ASIO: using vendored ${PROJECT_SOURCE_DIR}/third_party/asio")
+elseif(EXISTS ${PROJECT_SOURCE_DIR}/asio/include/asio.hpp)
+    target_include_directories(asio_owen_asio INTERFACE ${PROJECT_SOURCE_DIR}/asio/include)
     message(STATUS "ASIO: using local ${PROJECT_SOURCE_DIR}/asio")
 else()
     FetchContent_Declare(
@@ -22,13 +29,25 @@ else()
         URL      https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-38-0.tar.gz
         URL_HASH SHA256=c24922183dd91632140e65e7ef4c48c4f6f219ec4d9e16c9ec4536ee442669f4
     )
-    FetchContent_MakeAvailable(asio)
-    include_directories(${asio_SOURCE_DIR}/include)
+    FetchContent_GetProperties(asio)
+    if(NOT asio_POPULATED)
+        FetchContent_Populate(asio)
+    endif()
+    if(EXISTS ${asio_SOURCE_DIR}/asio/include/asio.hpp)
+        target_include_directories(asio_owen_asio INTERFACE ${asio_SOURCE_DIR}/asio/include)
+    else()
+        target_include_directories(asio_owen_asio INTERFACE ${asio_SOURCE_DIR}/include)
+    endif()
     message(STATUS "ASIO: fetched from remote")
 endif()
 
-if(EXISTS ${PROJECT_SOURCE_DIR}/spdlog/include/spdlog/spdlog.h)
-    include_directories(${PROJECT_SOURCE_DIR}/spdlog/include)
+if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/spdlog/include/spdlog/spdlog.h)
+    add_library(asio_owen_spdlog INTERFACE)
+    target_include_directories(asio_owen_spdlog INTERFACE ${PROJECT_SOURCE_DIR}/third_party/spdlog/include)
+    message(STATUS "spdlog: using vendored ${PROJECT_SOURCE_DIR}/third_party/spdlog")
+elseif(EXISTS ${PROJECT_SOURCE_DIR}/spdlog/include/spdlog/spdlog.h)
+    add_library(asio_owen_spdlog INTERFACE)
+    target_include_directories(asio_owen_spdlog INTERFACE ${PROJECT_SOURCE_DIR}/spdlog/include)
     message(STATUS "spdlog: using local ${PROJECT_SOURCE_DIR}/spdlog")
 else()
     FetchContent_Declare(
@@ -37,66 +56,113 @@ else()
         URL_HASH SHA256=68fea002cd716e62e9e6ee8d5066c9a0eee13f15c8026bd4e4b2d2a87e1d6473
     )
     FetchContent_MakeAvailable(spdlog)
-    include_directories(${spdlog_SOURCE_DIR}/include)
+    add_library(asio_owen_spdlog INTERFACE)
+    target_link_libraries(asio_owen_spdlog INTERFACE spdlog::spdlog_header_only)
     message(STATUS "spdlog: fetched from remote")
 endif()
 
-include_directories(
-        ${PROJECT_SOURCE_DIR}/src
-)
+# ==================== 系统依赖：pkg-config 可选，macOS/Linux 通用 fallback ====================
+find_package(Threads REQUIRED)
+find_package(PkgConfig QUIET)
+find_package(OpenSSL REQUIRED)
 
-# ==================== 系统依赖路径 ====================
-if(APPLE)
-    # macOS Homebrew 路径
-    foreach(prefix /usr/local /opt/homebrew)
-        if(EXISTS ${prefix}/opt/mysql-client)
-            include_directories(${prefix}/opt/mysql-client/include)
-            link_directories(${prefix}/opt/mysql-client/lib)
-        endif()
-        if(EXISTS ${prefix}/opt/hiredis)
-            include_directories(${prefix}/opt/hiredis/include)
-            link_directories(${prefix}/opt/hiredis/lib)
-        endif()
-        if(EXISTS ${prefix}/opt/openssl@3)
-            include_directories(${prefix}/opt/openssl@3/include)
-            link_directories(${prefix}/opt/openssl@3/lib)
-        endif()
-        if(EXISTS ${prefix}/include/boost)
-            include_directories(${prefix}/include)
-        endif()
-    endforeach()
-elseif(UNIX)
-    # Linux: 使用 pkg-config 查找系统安装的库
-    find_package(PkgConfig QUIET)
+function(find_optional_pkg_or_library target optional_pkg_name header library_name)
+    string(REPLACE "::" "_" target_var "${target}")
     if(PkgConfig_FOUND)
-        pkg_check_modules(MYSQL mysqlclient IMPORTED_TARGET)
-        if(MYSQL_FOUND)
-            include_directories(${MYSQL_INCLUDE_DIRS})
-            link_directories(${MYSQL_LIBRARY_DIRS})
-        endif()
-        pkg_check_modules(HIREDIS hiredis IMPORTED_TARGET)
-        if(HIREDIS_FOUND)
-            include_directories(${HIREDIS_INCLUDE_DIRS})
-            link_directories(${HIREDIS_LIBRARY_DIRS})
-        endif()
-        pkg_check_modules(OPENSSL openssl IMPORTED_TARGET)
-        if(OPENSSL_FOUND)
-            include_directories(${OPENSSL_INCLUDE_DIRS})
-            link_directories(${OPENSSL_LIBRARY_DIRS})
+        pkg_check_modules(${target_var}_PKG QUIET ${optional_pkg_name} IMPORTED_TARGET)
+    endif()
+
+    if(${target_var}_PKG_FOUND)
+        add_library(${target} INTERFACE IMPORTED)
+        target_link_libraries(${target} INTERFACE PkgConfig::${target_var}_PKG)
+        message(STATUS "${target}: using optional pkg-config package ${optional_pkg_name}")
+        return()
+    endif()
+
+    set(search_prefixes)
+    if(APPLE)
+        list(APPEND search_prefixes
+            /opt/homebrew/opt/${optional_pkg_name}
+            /usr/local/opt/${optional_pkg_name}
+            /opt/homebrew
+            /usr/local
+        )
+        if(optional_pkg_name STREQUAL "mysqlclient")
+            list(APPEND search_prefixes
+                /opt/homebrew/opt/mysql-client
+                /usr/local/opt/mysql-client
+            )
         endif()
     endif()
-    # fallback: 标准系统路径
-    include_directories(/usr/include /usr/local/include)
-endif()
 
-# 链接库
-link_libraries(pthread mysqlclient hiredis ssl crypto)
+    find_path(${target_var}_INCLUDE_DIR
+        NAMES ${header}
+        HINTS ${search_prefixes}
+        PATH_SUFFIXES include
+    )
+    find_library(${target_var}_LIBRARY
+        NAMES ${library_name}
+        HINTS ${search_prefixes}
+        PATH_SUFFIXES lib
+    )
+
+    if(NOT ${target_var}_INCLUDE_DIR OR NOT ${target_var}_LIBRARY)
+        message(FATAL_ERROR
+            "Could not find ${target}. Install ${optional_pkg_name} development files "
+            "or set ${target_var}_INCLUDE_DIR and ${target_var}_LIBRARY.")
+    endif()
+
+    add_library(${target} UNKNOWN IMPORTED)
+    set_target_properties(${target} PROPERTIES
+        IMPORTED_LOCATION "${${target_var}_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${${target_var}_INCLUDE_DIR}"
+    )
+    message(STATUS "${target}: using ${${target_var}_LIBRARY}")
+endfunction()
+
+function(find_mysql_client)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(MySQL_Client_PKG QUIET mysqlclient IMPORTED_TARGET)
+        if(MySQL_Client_PKG_FOUND)
+            add_library(MySQL::Client INTERFACE IMPORTED)
+            target_link_libraries(MySQL::Client INTERFACE PkgConfig::MySQL_Client_PKG)
+            message(STATUS "MySQL::Client: using pkg-config package mysqlclient")
+            return()
+        endif()
+
+        pkg_check_modules(MySQL_MariaDB_PKG QUIET mariadb IMPORTED_TARGET)
+        if(MySQL_MariaDB_PKG_FOUND)
+            add_library(MySQL::Client INTERFACE IMPORTED)
+            target_link_libraries(MySQL::Client INTERFACE PkgConfig::MySQL_MariaDB_PKG)
+            message(STATUS "MySQL::Client: using pkg-config package mariadb")
+            return()
+        endif()
+    endif()
+
+    find_optional_pkg_or_library(MySQL::Client mysqlclient mysql/mysql.h mysqlclient)
+endfunction()
+
+find_mysql_client()
+find_optional_pkg_or_library(Hiredis::Hiredis hiredis hiredis/hiredis.h hiredis)
+
+add_library(asio_owen_deps INTERFACE)
+target_link_libraries(asio_owen_deps INTERFACE
+    asio_owen_options
+    asio_owen_asio
+    asio_owen_spdlog
+    MySQL::Client
+    Hiredis::Hiredis
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
 
 # 可执行文件
 add_executable(server
         src/main.cpp
         picohttpparser.c
 )
+target_link_libraries(server PRIVATE asio_owen_deps)
 
 # 构建后自动复制 config.ini 到输出目录
 configure_file(${PROJECT_SOURCE_DIR}/config.ini ${CMAKE_CURRENT_BINARY_DIR}/config.ini COPYONLY)
@@ -105,6 +171,5 @@ configure_file(${PROJECT_SOURCE_DIR}/config.ini ${CMAKE_CURRENT_BINARY_DIR}/conf
 if(EXISTS ${PROJECT_SOURCE_DIR}/googletest/CMakeLists.txt)
     enable_testing()
     add_subdirectory(googletest)
-    include_directories(${PROJECT_SOURCE_DIR}/googletest/googletest/include)
     add_subdirectory(tests)
 endif()

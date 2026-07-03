@@ -8,9 +8,10 @@ build_*/
 # IDE
 .idea/
 
-# Dependencies (third-party libraries, fetched externally)
-asio/
-spdlog/
+# Full third-party source trees used as local caches only.
+# Minimal vendored headers live under third_party/ and are tracked.
+/asio/
+/spdlog/
 
 # Runtime files
 server.log
