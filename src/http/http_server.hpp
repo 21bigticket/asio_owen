@@ -167,12 +167,7 @@ private:
     static std::optional<size_t> parse_hex_size_line(const std::string& line) {
         auto end = line.find(';');
         std::string_view digits(line.data(), end == std::string::npos ? line.size() : end);
-        while (!digits.empty() && std::isspace(static_cast<unsigned char>(digits.front()))) {
-            digits.remove_prefix(1);
-        }
-        while (!digits.empty() && std::isspace(static_cast<unsigned char>(digits.back()))) {
-            digits.remove_suffix(1);
-        }
+        digits = trim_view(digits);
         if (digits.empty()) return std::nullopt;
 
         size_t value = 0;
@@ -190,18 +185,22 @@ private:
         return value;
     }
 
-    static std::string trim_copy(std::string_view s) {
+    static std::string_view trim_view(std::string_view s) {
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
             s.remove_prefix(1);
         }
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
             s.remove_suffix(1);
         }
-        return std::string(s);
+        return s;
+    }
+
+    static std::string trim_copy(std::string_view s) {
+        return std::string(trim_view(s));
     }
 
     static std::optional<size_t> parse_decimal_size(std::string_view s) {
-        auto trimmed = trim_copy(s);
+        auto trimmed = trim_view(s);
         if (trimmed.empty()) return std::nullopt;
         size_t value = 0;
         for (char c : trimmed) {
@@ -215,17 +214,21 @@ private:
         return value;
     }
 
+    static bool header_iequals(std::string_view a, std::string_view b) {
+        return http_header_iequals(a, b);
+    }
+
     static HeaderTokens split_connection_tokens(std::string_view value, std::unordered_set<std::string>* out = nullptr) {
         HeaderTokens tokens;
         size_t start = 0;
         while (start <= value.size()) {
             auto comma = value.find(',', start);
             auto end = comma == std::string_view::npos ? value.size() : comma;
-            auto token = to_lower(trim_copy(value.substr(start, end - start)));
+            auto token = trim_view(value.substr(start, end - start));
             if (!token.empty()) {
-                if (token == "close") tokens.close = true;
-                if (token == "keep-alive") tokens.keep_alive = true;
-                if (out) out->insert(std::move(token));
+                if (header_iequals(token, "close")) tokens.close = true;
+                if (header_iequals(token, "keep-alive")) tokens.keep_alive = true;
+                if (out) out->insert(to_lower(token));
             }
             if (comma == std::string_view::npos) break;
             start = comma + 1;
@@ -239,9 +242,9 @@ private:
         while (start <= value.size()) {
             auto comma = value.find(',', start);
             auto end = comma == std::string_view::npos ? value.size() : comma;
-            auto token = to_lower(trim_copy(value.substr(start, end - start)));
+            auto token = trim_view(value.substr(start, end - start));
             if (!token.empty()) {
-                bool matched = token == expected;
+                bool matched = header_iequals(token, expected);
                 result.has_token = result.has_token || matched;
                 result.last_is_token = matched;
             }
@@ -257,12 +260,32 @@ private:
         HeaderParseState& state) {
         auto colon = line.find(':');
         if (colon == std::string::npos) return;
-        auto k = trim_copy(std::string_view(line.data(), colon));
-        auto v = trim_copy(std::string_view(line.data() + colon + 1, line.size() - colon - 1));
-        out.emplace_back(k, v);
-        auto lk = to_lower(k);
-        auto lv = to_lower(v);
-        if (lk == "content-length") {
+        parse_header_pair_into(
+            std::string_view(line.data(), colon),
+            std::string_view(line.data() + colon + 1, line.size() - colon - 1),
+            &out, state);
+    }
+
+    static void parse_header_pair_into(
+        std::string_view key,
+        std::string_view value,
+        std::vector<std::pair<std::string, std::string>>* out,
+        HeaderParseState& state) {
+        auto k = trim_copy(key);
+        auto v = trim_copy(value);
+        if (out) {
+            out->emplace_back(k, v);
+        }
+        update_header_state(k, v, state);
+    }
+
+    static void update_header_state(
+        std::string_view k,
+        std::string_view v,
+        HeaderParseState& state) {
+        k = trim_view(k);
+        v = trim_view(v);
+        if (header_iequals(k, "content-length")) {
             auto parsed = parse_decimal_size(v);
             if (!parsed) {
                 state.invalid_content_length = true;
@@ -271,13 +294,13 @@ private:
             } else {
                 state.content_length = *parsed;
             }
-        } else if (lk == "transfer-encoding") {
+        } else if (header_iequals(k, "transfer-encoding")) {
             state.has_transfer_encoding = true;
-            auto te = parse_header_list_token(lv, "chunked");
+            auto te = parse_header_list_token(v, "chunked");
             if (te.last_is_token) {
                 state.is_chunked = true;
             }
-        } else if (lk == "connection") {
+        } else if (header_iequals(k, "connection")) {
             auto tokens = split_connection_tokens(v);
             if (tokens.close) state.connection_close = true;
             if (tokens.keep_alive) state.connection_keep_alive = true;
@@ -542,9 +565,20 @@ private:
         const std::vector<std::pair<std::string, std::string>>& headers,
         std::unordered_set<std::string>& filtered) {
         for (auto& [k, v] : headers) {
-            if (to_lower(k) != "connection") continue;
+            if (!header_iequals(k, "connection")) continue;
             split_connection_tokens(v, &filtered);
         }
+    }
+
+    static bool is_hop_by_hop_header(std::string_view k) {
+        return header_iequals(k, "connection") ||
+            header_iequals(k, "keep-alive") ||
+            header_iequals(k, "proxy-authenticate") ||
+            header_iequals(k, "proxy-authorization") ||
+            header_iequals(k, "te") ||
+            header_iequals(k, "trailer") ||
+            header_iequals(k, "transfer-encoding") ||
+            header_iequals(k, "upgrade");
     }
 
     asio::awaitable<void> handle_connection(asio::ip::tcp::socket socket) {
@@ -585,22 +619,18 @@ private:
                 ctx.method = method_str;
                 ctx.path = path_str;
 
-                for (size_t i = 0; i < num_headers; ++i) {
-                    ctx.headers.emplace_back(
-                        std::string(headers[i].name, headers[i].name_len),
-                        std::string(headers[i].value, headers[i].value_len));
-                }
-
                 HeaderParseState request_header_state;
-                for (auto& [k, v] : ctx.headers) {
-                    std::vector<std::pair<std::string, std::string>> ignored_headers;
-                    std::string line;
-                    line.reserve(k.size() + v.size() + 2);
-                    line.append(k).append(": ").append(v);
-                    parse_header_line_into(line, ignored_headers, request_header_state);
+                for (size_t i = 0; i < num_headers; ++i) {
+                    std::string_view name(headers[i].name, headers[i].name_len);
+                    std::string_view value(headers[i].value, headers[i].value_len);
+                    update_header_state(name, value, request_header_state);
+                    ctx.headers.emplace_back(
+                        std::string(name),
+                        std::string(value));
                 }
 
                 bool handled = false;
+                bool proxy_response = false;
 
                 std::string& preread = body_buffer;
                 if (request_header_state.invalid_content_length ||
@@ -732,6 +762,7 @@ private:
                                     ctx.response_status_text = std::move(proxy_resp.status_text);
                                     ctx.response_body = std::move(proxy_resp.body);
                                     ctx.response_headers = std::move(proxy_resp.headers);
+                                    proxy_response = true;
 
                                     if (conn.connection_close) guard.set_bad();
                                     handled = true;
@@ -774,14 +805,22 @@ private:
                 // 透传 headers（过滤 hop-by-hop；Content-Length 和 Transfer-Encoding 由我们控制）
                 bool has_content_type = false;
                 if (!ctx.response_headers.empty()) {
-                    std::unordered_set<std::string> filtered = hop_by_hop_headers();
-                    add_connection_tokens(ctx.response_headers, filtered);
-                    filtered.insert("content-length");
-                    for (auto& [k, v] : ctx.response_headers) {
-                        auto lk = to_lower(k);
-                        if (filtered.find(lk) != filtered.end()) continue;
-                        resp += k + ": " + v + "\r\n";
-                        if (lk == "content-type") has_content_type = true;
+                    if (proxy_response) {
+                        std::unordered_set<std::string> filtered = hop_by_hop_headers();
+                        add_connection_tokens(ctx.response_headers, filtered);
+                        filtered.insert("content-length");
+                        for (auto& [k, v] : ctx.response_headers) {
+                            auto lk = to_lower(k);
+                            if (filtered.find(lk) != filtered.end()) continue;
+                            resp += k + ": " + v + "\r\n";
+                            if (header_iequals(k, "content-type")) has_content_type = true;
+                        }
+                    } else {
+                        for (auto& [k, v] : ctx.response_headers) {
+                            if (header_iequals(k, "content-length") || is_hop_by_hop_header(k)) continue;
+                            resp += k + ": " + v + "\r\n";
+                            if (header_iequals(k, "content-type")) has_content_type = true;
+                        }
                     }
                 }
                 bool response_has_no_body = method_str == "HEAD" || ctx.status_code == 204 ||
@@ -795,7 +834,12 @@ private:
                 resp += "\r\n\r\n";
                 if (!response_has_no_body) resp += ctx.response_body;
 
-                if (!co_await write_with_timeout(socket, resp, client_timeout)) {
+                // 客户端响应写不使用 write_with_timeout：timer 开销在热路径上会被放大
+                // （改用裸 async_write + redirect_error，简单可靠）
+                asio::error_code write_ec;
+                co_await asio::async_write(socket, asio::buffer(resp),
+                    asio::redirect_error(asio::use_awaitable, write_ec));
+                if (write_ec) {
                     co_return;
                 }
 

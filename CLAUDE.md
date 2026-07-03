@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool. Performance characteristics and past incidents are documented in `PERF_REPORT.md` — read it before touching the DB or logging layers.
+`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool, plus an HTTP reverse-proxy gateway (`/proxy/{service}/...`). Performance characteristics and past incidents are documented in `PERF_REPORT.md` — read it before touching the DB or logging layers.
 
 ## Build & Run
 
-CMake 3.20+, C++20, forced `Debug` build. Out-of-source build directory convention is `build/` (CLion uses `cmake-build-debug/`).
+CMake 3.20+, C++20. Single-config generators default to `Release` unless `-DCMAKE_BUILD_TYPE=...` is provided. Out-of-source build directory convention is `build/` (CLion uses `cmake-build-debug/`).
 
 ```bash
 # Configure + build
@@ -19,9 +19,9 @@ cmake --build build
 ./build/server
 ```
 
-External dependencies are **vendored as siblings of `src/`**: `asio/`, `spdlog/`. CMake `include_directories()` references them by relative path, so the tree is self-contained and not fetched via CMake. The macOS section of `CMakeLists.txt` adds Homebrew paths for `mysql-client`, `hiredis`, and `openssl@3` (both `/usr/local` and `/opt/homebrew` prefixes are probed).
+External dependencies are **fetched via CMake FetchContent** (`asio/` 1.38.0, `spdlog/` v1.17.0, `googletest/` v1.14.0), or used from local vendored directories when present (gitignored). macOS Homebrew paths for `mysql-client`, `hiredis`, and `openssl@3` are probed; Linux uses `pkg-config`.
 
-**No test target exists.** `CMakeLists.txt` only declares the `server` executable; do not assume `ctest` works.
+**Test targets exist** in `tests/` (placeholder, mysql, redis) but require local googletest/ directory — disabled automatically when absent.
 
 ## Architecture
 

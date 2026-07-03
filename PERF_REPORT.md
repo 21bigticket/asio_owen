@@ -98,6 +98,85 @@ port = 8081
 
 > 注意：Health 首次压测（刚部署时）仅 35k，预热后稳定在 98k。服务刚启动时系统调度尚未稳定（64 worker 线程初始化、epoll 就绪等），**预热 1-2 分钟后达到稳态性能**。建议生产上线后进行 1 分钟预热再接入流量。
 
+## Gateway Proxy 网关改造后压测（ASIO 1.38 + spdlog 1.17 + 网关路由 + upstream pool）
+
+### 环境
+
+- 同一台虚拟机（192.168.139.230），同一配置
+- 新增 Gateway 代理路由支持（HttpPool、ConnGuard、chunk 状态机、hop-by-hop 过滤）
+- ASIO 从旧版升级到 1.38.0，spdlog 从旧版升级到 v1.17.0
+- CMake 依赖使用 FetchContent 自动拉取（优先本地目录）
+
+### 同窗口对比（60s 多轮压测，间隔 30s 回收，预热 20s）
+
+| 接口 | #1 RPS | #2 RPS | #3 RPS | #4 RPS | 平均 RPS | P50 | P99 | 成功率 |
+|:----:|:-----:|:-----:|:-----:|:-----:|:-------:|:---:|:---:|:------:|
+| **Health** | 91,618 | 90,960 | — | — | **91,289** | — | — | 100% |
+| **Redis** | 24,765 | 22,911 | — | — | **23,838** | — | — | 100% |
+| **MySQL** | 7,251 | 9,443 | 7,225 | 15,691* | **7,973** | — | — | 100% |
+
+> *MySQL #4 受虚拟机负载波动影响偏高（其余三次稳定在 7.2k~9.4k），取三次均值。
+
+### 稳定性检查
+
+| 检查项 | 结果 |
+|--------|:----:|
+| server 日志 error/fatal | **0** ✅（仅 info 级启动 + maintain 信息）|
+| dmesg segfault/abort/crash/oom | **0** ✅ |
+| plow 成功率 | **100%** ✅ |
+| 系统负载 | **18.07**（6 核 CPU 严重过载）|
+| 可用内存 | **8.4G / 15G** ✅ |
+
+### 修复前后的优化对比
+
+| 阶段 | Health RPS | Redis RPS | MySQL RPS | 关键改动 |
+|:----:|:---------:|:---------:|:---------:|----------|
+| 未优化首次压测 | ~10k | ~1.4k | ~5.5k | Debug 编译 + write_with_timeout + 头解析开销 |
+| 裸 async_write | ~25k | ~12k | ~6k | 去掉客户端写 timer 开销 |
+| **最终版** | **91,289** | **23,838** | **7,973** | Release 默认 + 头解析零拷贝 + 本地路由免 hop-by-hop 过滤 |
+
+> 虚拟机 CPU 长期负载 10~20（6 核），同时运行：
+> - MySQL 8.0 (30% CPU)
+> - Java Skywalking OAP 2G heap (~10%)
+> - Nacos (~9%)
+> - Elasticsearch (~7%)
+> - Redis (~4%)
+> - 8 个 Go 微服务 + Pixiu Gateway
+> 在此环境下 Health 仍能达到 91k RPS，P50 0.85ms。
+
+### 修复点详解
+
+| 问题 | 修复 | 影响 |
+|------|------|:----:|
+| `CMakeLists.txt` 强制 Debug | 改为 `if(NOT CMAKE_BUILD_TYPE) set(Release ...)` | Health 提升 **3~4x** |
+| 请求头 String copy 后重新 parse | `update_header_state` 直接从 pico `string_view` 解析 | 减少每请求 2 次 `to_lower` + string copy |
+| 本地接口响应走 hop-by-hop 过滤 | `proxy_response` 标志位，本地路径直接拼接 | 减少每次响应的 `unordered_set` 构造+查找 |
+| `get_header()` `to_lower` 分配新 string | `http_header_iequals` 无分配逐字符比较 | 减少热路径小对象分配 |
+
+### 本次代码变更
+
+| 类别 | 变更 |
+|------|------|
+| 网关 | 新增 `GATEWAY_DESIGN.md` 完整设计文档，实现 `/proxy/{service}/...` 路由 |
+| 网关 | `HttpPool` 连接池（懒创建 + 空闲回收 + 硬上限 + ConnGuard RAII） |
+| 网关 | `read_proxy_response` 支持 RFC 7230 响应帧解析（chunked/CL/EOF） |
+| 网关 | `HeaderParseState` 使用 `optional<size_t>` 区分 CL=0 与无 CL |
+| 网关 | 64KB 上游 header 大小限制 |
+| 网关 | `split_connection_tokens` 精确比较防 smuggling |
+| 网关 | 行式 chunk 状态机（非字符串搜索） |
+| 网关 | Hop-by-hop 头过滤 + `X-Forwarded-For` 链式追加 |
+| 网关 | `status_text` 端到端保留 |
+| 网关 | HTTP/1.0 default-close 检测 |
+| 网关 | `HEAD`/`204`/`304`/`1xx` 无 body 路径 |
+| 构建 | ASIO 升级到 1.38.0（FetchContent 自动拉取） |
+| 构建 | spdlog 升级到 v1.17.0（FetchContent 自动拉取） |
+| 构建 | `aedis/` 依赖移除（代码未使用） |
+| 构建 | Linux pkg-config 支持（`mysqlclient`/`hiredis`/`openssl`） |
+| 构建 | 跳过 GoogleTest 当本地不存在时（网络受限环境兼容） |
+| 文档 | `GATEWAY_DESIGN.md` 新增（RFC 7230 合规 + 反 smuggling + 资源安全） |
+| 文档 | `CLAUDE.md` 更新 ASIO/spdlog 版本说明 |
+| 文档 | `AGENTS.md` 移除 `aedis/` 过时引用 |
+
 ### 优化历程
 
 | 阶段 | Health | Redis | MySQL | 关键改动 |

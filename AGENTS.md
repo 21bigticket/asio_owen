@@ -2,17 +2,17 @@
 
 ## Project Structure & Module Organization
 
-`asio_owen` is a C++20 standalone ASIO HTTP server. Core source lives in `src/`: `src/main.cpp` wires config, routes, pools, logging, and shutdown; `src/http/` handles parsing/responses; `src/db/` contains MySQL and Redis pools; `src/common/` holds utilities. Tests live in `tests/`. Local dependencies are referenced from `asio/`, `spdlog/`, `aedis/`, and `picohttpparser.c/.h`. Read `DB_POOL_DESIGN.md` and `PERF_REPORT.md` before DB, Redis, logging, or threading changes.
+`asio_owen` is a C++20 standalone ASIO HTTP server with HTTP reverse-proxy gateway. Core source lives in `src/`: `src/main.cpp` wires config, routes, pools, logging, and shutdown; `src/http/` handles parsing/responses, gateway proxy (`http_server.hpp`, `http_pool.hpp`, `upstream_manager.hpp`); `src/db/` contains MySQL and Redis pools; `src/common/` holds utilities. Tests live in `tests/`. Dependencies: `asio/` 1.38.0, `spdlog/` v1.17.0, `picohttpparser.c/.h`, and system packages (`mysqlclient`, `hiredis`, `openssl`). Read `DB_POOL_DESIGN.md`, `GATEWAY_DESIGN.md`, and `PERF_REPORT.md` before DB, Redis, logging, gateway, or threading changes.
 
 ## Build, Test, and Development Commands
 
 - `cmake -B build -S .`: configure CMake and copy `config.ini` into `build/`.
-- `cmake --build build`: build the `server` target and test binaries.
+- `cmake --build build`: build the `server` target.
 - `./build/server`: run the local server using `build/config.ini`.
-- `ctest --test-dir build --output-on-failure`: run GoogleTest.
+- `CXX=g++ CC=gcc cmake -B build -S .`: configure on Linux with GCC.
 - `./build.sh`: build, restart, and smoke-test `/api/health`, `/api/redis`, and `/api/mysql`.
 
-First configure may download GoogleTest. MySQL, hiredis, and OpenSSL use Homebrew paths on macOS.
+Dependencies: `asio/` and `spdlog/` are fetched via CMake FetchContent (or use local copy when present, gitignored). MySQL, hiredis, and OpenSSL use Homebrew paths on macOS, `pkg-config` on Linux. First configure may download GoogleTest (skipped if `googletest/` absent).
 
 ## Architecture & Performance Constraints
 
@@ -28,7 +28,7 @@ Tests use GoogleTest and should be named `test_<component>.cpp`. Add executables
 
 ## Runtime & Configuration Notes
 
-`config.ini` has `[server]`, `[mysql]`, and `[redis]` sections and is copied beside the binary during configure; re-run CMake after edits. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, and `/api/combo`. Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
+`config.ini` has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections and is copied beside the binary during configure; re-run CMake after edits. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/proxy/{service}/...` (gateway reverse proxy). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
 
 ## Commit & Pull Request Guidelines
 

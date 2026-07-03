@@ -3,6 +3,7 @@ build/
 build_asan/
 build_vg/
 cmake-build-debug/
+build_*/
 
 # IDE
 .idea/

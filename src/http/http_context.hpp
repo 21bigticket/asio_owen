@@ -1,7 +1,18 @@
 #pragma once
+#include <cctype>
 #include <string>
 #include <vector>
 #include <asio.hpp>
+
+inline bool http_header_iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = static_cast<unsigned char>(a[i]);
+        unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (std::tolower(ca) != std::tolower(cb)) return false;
+    }
+    return true;
+}
 
 // HTTP 请求/响应上下文，支持代理转发和本地 handler
 struct HttpContext {
@@ -15,14 +26,8 @@ struct HttpContext {
     std::vector<std::pair<std::string, std::string>> response_headers;
 
     std::string get_header(const std::string& key) const {
-        auto to_lower = [](std::string_view s) {
-            std::string out; out.reserve(s.size());
-            for (char c : s) out += std::tolower(c);
-            return out;
-        };
-        auto lk = to_lower(key);
         for (auto& [k, v] : headers) {
-            if (to_lower(k) == lk) return v;
+            if (http_header_iequals(k, key)) return v;
         }
         return {};
     }
