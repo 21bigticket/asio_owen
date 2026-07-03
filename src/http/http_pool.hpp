@@ -28,6 +28,7 @@ public:
         asio::ip::tcp::socket socket;
         std::chrono::steady_clock::time_point last_used_at;
         bool connection_close = false;
+        bool reused_from_idle = false;
         std::string read_buffer;
 
         HttpConn() = delete;
@@ -125,6 +126,7 @@ public:
                     --state->total;
                     continue;
                 }
+                conn->reused_from_idle = true;
                 ++state->in_flight;
                 state->active.insert(conn.get());
                 co_return std::move(conn);
@@ -153,6 +155,7 @@ public:
                 throw std::runtime_error("connect timeout");
             }
             conn->last_used_at = std::chrono::steady_clock::now();
+            conn->reused_from_idle = false;
             {
                 std::lock_guard lock(state->mtx);
                 state->active.insert(conn.get());

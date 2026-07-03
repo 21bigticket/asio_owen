@@ -829,10 +829,18 @@ private:
                             ", body_size=", ctx.body.size(),
                             ", headers=[", describe_headers(ctx.headers), "]");
                         try {
-                            auto conn_opt = co_await pool->acquire(cfg.host, cfg.port);
-                            if (conn_opt) {
+                            for (int attempt = 0; attempt < 2 && !handled; ++attempt) {
+                                auto conn_opt = co_await pool->acquire(cfg.host, cfg.port);
+                                if (!conn_opt) {
+                                    ctx.status_code = 503;
+                                    ctx.response_body = "{\"code\":503,\"msg\":\"no available connection\"}";
+                                    handled = true;
+                                    break;
+                                }
+
                                 ConnGuard guard(pool, std::move(conn_opt));
                                 auto& conn = guard.conn();
+                                bool can_retry_stale_idle = conn.reused_from_idle && attempt == 0;
 
                                 // 转发给上游时去掉服务名前缀。
                                 // 例如 /zebra-config/config.ConfigService/xxx → /config.ConfigService/xxx
@@ -906,13 +914,27 @@ private:
                                     guard.set_bad();
                                     LOG_INFO("Proxy upstream write timeout: method=", method_str,
                                         ", upstream_path=", upstream->upstream_path,
-                                        ", upstream=", cfg.host, ":", cfg.port);
+                                        ", upstream=", cfg.host, ":", cfg.port,
+                                        ", reused=", conn.reused_from_idle,
+                                        ", attempt=", attempt + 1);
+                                    if (can_retry_stale_idle) {
+                                        LOG_INFO("Proxy retry after stale idle write failure: method=", method_str,
+                                            ", upstream_path=", upstream->upstream_path);
+                                        continue;
+                                    }
                                     ctx.status_code = 504;
                                     ctx.response_body = "{\"code\":504,\"msg\":\"upstream write timeout\"}";
                                     handled = true;
                                 } else {
                                     auto proxy_resp = co_await read_proxy_response(
                                         conn, pool->cfg(), method_str == "HEAD");
+                                    bool response_failed = proxy_resp.status_code == 502 && conn.connection_close;
+                                    if (response_failed && can_retry_stale_idle) {
+                                        guard.set_bad();
+                                        LOG_INFO("Proxy retry after stale idle read failure: method=", method_str,
+                                            ", upstream_path=", upstream->upstream_path);
+                                        continue;
+                                    }
                                     ctx.status_code = proxy_resp.status_code;
                                     ctx.response_status_text = std::move(proxy_resp.status_text);
                                     ctx.response_body = std::move(proxy_resp.body);
@@ -930,10 +952,6 @@ private:
                                     if (conn.connection_close) guard.set_bad();
                                     handled = true;
                                 }
-                            } else {
-                                ctx.status_code = 503;
-                                ctx.response_body = "{\"code\":503,\"msg\":\"no available connection\"}";
-                                handled = true;
                             }
                         } catch (const std::exception& e) {
                             LOG_WARN("Proxy forward error: ", e.what());
