@@ -22,6 +22,7 @@ using namespace std::chrono_literals;
 std::unique_ptr<MysqlPool> g_mysql;
 std::unique_ptr<RedisPool> g_redis;
 std::unique_ptr<HttpServer> g_server;
+std::unique_ptr<asio::steady_timer> g_drain_timer;
 
 void cleanup_runtime_objects() {
     if (g_server) {
@@ -37,6 +38,7 @@ void cleanup_runtime_objects() {
     g_server.reset();
     g_redis.reset();
     g_mysql.reset();
+    g_drain_timer.reset();
 }
 
 // 查询 MySQL — worker 线程直接拼好 JSON 返回
@@ -190,9 +192,10 @@ int main(int argc, char* argv[]) {
                 LOG_INFO("Graceful shutdown requested...");
                 if (g_server) g_server->stop();
                 // 5 秒后强制退出（给 in-flight 请求 drain 时间）
-                asio::steady_timer timer(ioc);
-                timer.expires_after(std::chrono::seconds(5));
-                timer.async_wait([&](std::error_code) {
+                g_drain_timer = std::make_unique<asio::steady_timer>(ioc);
+                g_drain_timer->expires_after(std::chrono::seconds(5));
+                g_drain_timer->async_wait([&](std::error_code ec) {
+                    if (ec) return;
                     LOG_INFO("Drain timeout, stopping io_context...");
                     ioc.stop();
                 });
