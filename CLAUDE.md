@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool, plus an HTTP reverse-proxy gateway (`/proxy/{service}/...`). Performance characteristics and past incidents are documented in `PERF_REPORT.md` — read it before touching the DB or logging layers.
+`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool, plus an HTTP reverse-proxy gateway (`/{service}/...`, for example `/zebra-config/...`). Performance characteristics and past incidents are documented in `PERF_REPORT.md` — read it before touching the DB or logging layers.
 
 ## Build & Run
 
@@ -56,8 +56,8 @@ The two pools use **deliberately different async strategies** — this is the co
 
 ## Configuration
 
-`config.ini` (INI format, parsed by `src/common/config.hpp`) has three sections: `[server]`, `[mysql]`, `[redis]`. The config file is **gitignored** because it carries DB credentials, but a reference copy is checked in at `config.ini`. It is copied next to the binary at configure time via `configure_file(... COPYONLY)`, so edit the source-tree copy and re-run CMake to update the runtime copy.
+`config.ini` (INI format, parsed by `src/common/config.hpp`) has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections. The config file is **gitignored** because it carries DB credentials, but a reference copy is checked in at `config.ini`. It is copied next to the binary at configure time via `configure_file(... COPYONLY)`, so edit the source-tree copy and re-run CMake to update the runtime copy.
 
 ## Known runtime endpoints
 
-`/api/health`, `/api/redis`, `/api/mysql`, `/api/combo` (Redis cache → MySQL fallback with 500ms timeout and detached cache-fill write-back).
+`/api/health`, `/api/redis`, `/api/mysql`, `/api/combo` (Redis cache → MySQL fallback with 500ms timeout and detached cache-fill write-back), plus gateway routes `/{service}/...` configured by `[upstream]`.

@@ -109,7 +109,7 @@ struct HeaderParseState {
 - `Transfer-Encoding`
 - `Upgrade`
 
-`Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`。转发时会追加 `X-Forwarded-For`、`X-Forwarded-Proto: http`、`Via: 1.1 asio_owen`。如果客户端已有 `X-Forwarded-For`，会在原值后追加客户端 IP，而不是覆盖。
+`Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`，并显式发送 `Connection: keep-alive`。当前实现还会过滤 `Accept-Encoding`，避免上游返回 gzip/br 压缩 body 后影响网关日志和排查。
 
 请求侧如果是 `Transfer-Encoding: chunked`，会保留 `Transfer-Encoding` 并移除 `Content-Length`，原始 chunked body 字节原样转发给上游。响应侧不同：网关会接管响应 framing，必要时 de-chunk，并重新计算 `Content-Length`。
 
@@ -234,7 +234,7 @@ order = 127.0.0.1:30009
 |---|---|
 | HTTPS / TLS termination | 当前只支持明文 HTTP；下游 TLS 需要额外 OpenSSL 集成 |
 | 负载均衡 | 一个 service 对应一个 host:port；没有多实例轮询或熔断 |
-| 重试 | 502/503/504 直接返回客户端，不做自动重试 |
+| 重试 | 只对复用 idle 上游连接时的写/读失败做一次重试，避免 TCP idle 关闭的 TOCTOU；新建连接失败不重试 |
 | 流式 body | body 会完整缓冲后再转发，受 `max_body_size` 限制 |
 | 连接预热 | 第一次请求需要承担 connect 延迟 |
 | 可观测性 | 目前只有 `LOG_INFO`/`LOG_WARN`；没有 QPS、p99、连接池 gauge |
@@ -269,7 +269,7 @@ ctest --test-dir build --output-on-failure
 | 协议 | HTTP/1.0 默认被当成 keep-alive | 检测 `HTTP/1.0` 前缀，默认关闭 |
 | Header 解析 | `Connection: closed` 被子串匹配成 `close` | `split_connection_tokens` 精确比较 |
 | 状态行 | `201 Created` 被渲染成 `201 OK` | 端到端保留 `status_text` |
-| 转发 | 客户端已有 `X-Forwarded-For` 时被覆盖 | 原值后追加客户端 IP |
+| 转发 | 上游返回压缩 body，日志中只能看到二进制预览 | 转发时过滤 `Accept-Encoding`，让上游默认返回明文 body |
 | 连接池 | 同一池化连接上的预读字节无限累积 | release 时 `read_buffer > 64KB` 则丢弃连接 |
 | 连接池 | idle 复用连接探活通过后、真正写/读前对端关闭（TOCTOU） | 复用 idle 连接失败时做一次重试；新建连接失败不重试 |
 | 连接池 | keep-alive 连接 `Connection` 头被 hop-by-hop 过滤，上游误用 `Connection: close` | 转发时显式添加 `Connection: keep-alive` |

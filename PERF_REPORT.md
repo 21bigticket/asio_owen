@@ -127,6 +127,17 @@ port = 8081
 | 系统负载 | **18.07**（6 核 CPU 严重过载）|
 | 可用内存 | **8.4G / 15G** ✅ |
 
+### Gateway 转发最终压测（zebra-config POST）
+
+本轮用于验证真实上游转发链路：客户端请求 `:8081/zebra-config/config.ConfigService/GetByAppAndKey`，网关剥离 service 前缀后转发到 `:30001/config.ConfigService/GetByAppAndKey`。
+
+| 路径 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
+|:---|:---:|:---:|:---:|:---:|
+| **直连** `:30001` | 4,963 | 4,077 | **4,520** | 100% |
+| **通过网关** `:8081/zebra-config/...` | 4,486 | 4,027 | **4,257** | 100% |
+
+最终结论：网关转发相比直连损耗约 **6%**，压测期间 **0 error / 0 crash / 服务持续返回 200**。前序 4xx 来自 plow POST 参数误用，文件 body 必须写成 `--body=@/path/to/body.json`，否则发送的是文件名字符串本身。
+
 ### 修复前后的优化对比
 
 | 阶段 | Health RPS | Redis RPS | MySQL RPS | 关键改动 |
@@ -157,17 +168,19 @@ port = 8081
 
 | 类别 | 变更 |
 |------|------|
-| 网关 | 新增 `GATEWAY_DESIGN.md` 完整设计文档，实现 `/proxy/{service}/...` 路由 |
+| 网关 | 新增 `GATEWAY_DESIGN.md` 完整设计文档，实现 `/{service}/...` 路由，例如 `/zebra-config/config.ConfigService/GetByAppAndKey` |
 | 网关 | `HttpPool` 连接池（懒创建 + 空闲回收 + 硬上限 + ConnGuard RAII） |
 | 网关 | `read_proxy_response` 支持 RFC 7230 响应帧解析（chunked/CL/EOF） |
 | 网关 | `HeaderParseState` 使用 `optional<size_t>` 区分 CL=0 与无 CL |
 | 网关 | 64KB 上游 header 大小限制 |
 | 网关 | `split_connection_tokens` 精确比较防 smuggling |
 | 网关 | 行式 chunk 状态机（非字符串搜索） |
-| 网关 | Hop-by-hop 头过滤 + `X-Forwarded-For` 链式追加 |
+| 网关 | Hop-by-hop 头过滤；转发时显式设置上游 `Host` 和 `Connection: keep-alive`，并过滤 `Accept-Encoding` 避免压缩响应影响调试 |
 | 网关 | `status_text` 端到端保留 |
 | 网关 | HTTP/1.0 default-close 检测 |
 | 网关 | `HEAD`/`204`/`304`/`1xx` 无 body 路径 |
+| 网关 | 复用 idle 上游连接失败时做一次新连接重试，规避对端空闲关闭后的 TCP TOCTOU |
+| 网关 | 4xx/5xx 响应增加 `X-Asio-Owen-Status-Source`，方便区分本地网关错误和上游透传错误 |
 | 构建 | ASIO 升级到 1.38.0（FetchContent 自动拉取） |
 | 构建 | spdlog 升级到 v1.17.0（FetchContent 自动拉取） |
 | 构建 | `aedis/` 依赖移除（代码未使用） |

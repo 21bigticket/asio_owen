@@ -303,6 +303,12 @@ timeout -s TERM 8 valgrind --tool=memcheck --leak-check=full --show-leak-kinds=a
 
 **当前判断：ASAN/LSAN 无报告、非 ASAN RSS 长压稳定、Valgrind 无 definitely/indirectly lost；暂无发现业务代码内存泄漏。**
 
+### Gateway 最终转发压测补充
+
+最终网关转发压测使用 `zebra-config` POST 链路，路径为 `:8081/zebra-config/config.ConfigService/GetByAppAndKey` 转发到 `:30001/config.ConfigService/GetByAppAndKey`。修正 plow 文件 body 参数为 `--body=@/path/to/body.json` 后，直连平均 **4,520 RPS**，通过网关平均 **4,257 RPS**，成功率 **100%**，压测期间 **0 error / 0 crash / 服务持续返回 200**。
+
+该轮压测未新增 ASAN/Valgrind 报告；内存结论仍以本节已有 ASAN 短周期、非 ASAN RSS 长压和 Valgrind 短周期为准。非 ASAN 的 proxy 转发 3 分钟 RSS 稳定在约 **56 MB**，未观察到随请求数增长的泄漏趋势。
+
 ## 后续建议
 
 - 代码变更后建议重新跑 ASAN 短周期检测（编译 + 启动退出 + 检查报告，约 5 分钟）

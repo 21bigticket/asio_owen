@@ -28,7 +28,7 @@ Tests use GoogleTest and should be named `test_<component>.cpp`. Add executables
 
 ## Runtime & Configuration Notes
 
-`config.ini` has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections and is copied beside the binary during configure; re-run CMake after edits. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/proxy/{service}/...` (gateway reverse proxy). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
+`config.ini` has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections and is copied beside the binary during configure; re-run CMake after edits. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/{service}/...` (gateway reverse proxy, for example `/zebra-config/...`). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
 
 ## Commit & Pull Request Guidelines
 
