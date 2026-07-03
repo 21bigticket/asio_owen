@@ -8,6 +8,7 @@
 #include <optional>
 #include <unordered_set>
 #include <memory>
+#include <sstream>
 #include "../common/logger.hpp"
 
 // HTTP 连接池：懒创建 + 空闲回收 + 硬上限
@@ -45,6 +46,12 @@ public:
         std::unordered_set<HttpConn*> active;
         size_t total = 0;
         size_t in_flight = 0;
+        std::atomic<size_t> acquire_reused{0};
+        std::atomic<size_t> acquire_created{0};
+        std::atomic<size_t> idle_probe_dropped{0};
+        std::atomic<size_t> released_idle{0};
+        std::atomic<size_t> released_closed{0};
+        std::atomic<size_t> released_bad{0};
         std::mutex mtx;
 
         State(asio::io_context& io, Config c) : ioc(io), cfg(std::move(c)) {}
@@ -124,11 +131,13 @@ public:
                     asio::error_code ec;
                     conn->socket.close(ec);
                     --state->total;
+                    state->idle_probe_dropped.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 conn->reused_from_idle = true;
                 ++state->in_flight;
                 state->active.insert(conn.get());
+                state->acquire_reused.fetch_add(1, std::memory_order_relaxed);
                 co_return std::move(conn);
             }
             if (state->total >= state->cfg.max_size) {
@@ -156,6 +165,7 @@ public:
             }
             conn->last_used_at = std::chrono::steady_clock::now();
             conn->reused_from_idle = false;
+            state->acquire_created.fetch_add(1, std::memory_order_relaxed);
             {
                 std::lock_guard lock(state->mtx);
                 state->active.insert(conn.get());
@@ -180,6 +190,7 @@ public:
             std::lock_guard lock(state->mtx);
             --state->total;
             --state->in_flight;
+            state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (conn->read_buffer.size() > 64 * 1024) {
@@ -188,12 +199,14 @@ public:
             std::lock_guard lock(state->mtx);
             --state->total;
             --state->in_flight;
+            state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         conn->last_used_at = std::chrono::steady_clock::now();
         std::lock_guard lock(state->mtx);
         state->idle.push_back(std::move(*conn));
         --state->in_flight;
+        state->released_idle.fetch_add(1, std::memory_order_relaxed);
     }
 
     // 标记为 bad 的连接：直接关闭，不归还池
@@ -208,9 +221,27 @@ public:
         std::lock_guard lock(state->mtx);
         --state->total;
         --state->in_flight;
+        state->released_bad.fetch_add(1, std::memory_order_relaxed);
     }
 
     const Config& cfg() const { return state_->cfg; }
+
+    std::string stats() const {
+        auto state = state_;
+        std::lock_guard lock(state->mtx);
+        std::ostringstream oss;
+        oss << "total=" << state->total
+            << ", idle=" << state->idle.size()
+            << ", active=" << state->active.size()
+            << ", in_flight=" << state->in_flight
+            << ", reused=" << state->acquire_reused.load(std::memory_order_relaxed)
+            << ", created=" << state->acquire_created.load(std::memory_order_relaxed)
+            << ", probe_dropped=" << state->idle_probe_dropped.load(std::memory_order_relaxed)
+            << ", released_idle=" << state->released_idle.load(std::memory_order_relaxed)
+            << ", released_closed=" << state->released_closed.load(std::memory_order_relaxed)
+            << ", released_bad=" << state->released_bad.load(std::memory_order_relaxed);
+        return oss.str();
+    }
 
 private:
     asio::awaitable<std::optional<asio::ip::tcp::resolver::results_type>> resolve_with_timeout(

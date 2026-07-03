@@ -29,6 +29,7 @@ struct ProxyResponse {
     std::string status_text;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    std::string error;
 };
 
 struct HeaderParseState {
@@ -424,6 +425,7 @@ private:
         // 读头部直到 \r\n\r\n
         while (buf.find("\r\n\r\n") == std::string::npos) {
             if (buf.size() > 64 * 1024) {
+                resp.error = "upstream_response_header_too_large";
                 conn.connection_close = true;
                 co_return resp;
             }
@@ -431,6 +433,7 @@ private:
             auto nr = co_await read_with_timeout(conn.socket, tmp, sizeof(tmp),
                 std::chrono::milliseconds(pool_cfg.read_timeout_ms));
             if (!nr) {
+                resp.error = "upstream_response_header_read_failed";
                 conn.connection_close = true;
                 co_return resp;
             }
@@ -444,6 +447,7 @@ private:
         // 解析状态行
         auto first_line_end = header_part.find("\r\n");
         if (first_line_end == std::string::npos) {
+            resp.error = "upstream_response_missing_status_line";
             conn.connection_close = true;
             co_return resp;
         }
@@ -452,6 +456,7 @@ private:
         auto sp2 = status_line.find(' ', sp1 + 1);
         if (sp1 == std::string::npos || sp2 == std::string::npos) {
             LOG_INFO("Proxy response invalid status line: ", sanitize_body_preview(status_line));
+            resp.error = "upstream_response_invalid_status_line";
             conn.connection_close = true;
             co_return resp;
         }
@@ -459,6 +464,7 @@ private:
         if (!status_code || *status_code > 999) {
             LOG_INFO("Proxy response invalid status code: status_line=",
                 sanitize_body_preview(status_line));
+            resp.error = "upstream_response_invalid_status_code";
             conn.connection_close = true;
             co_return resp;
         }
@@ -483,6 +489,7 @@ private:
             (header_state.has_transfer_encoding && !header_state.is_chunked)) {
             LOG_INFO("Proxy response framing invalid: status=", resp.status_code,
                 ", upstream body preview=", sanitize_body_preview(body_rest));
+            resp.error = "upstream_response_invalid_framing";
             conn.connection_close = true;
             co_return resp;
         }
@@ -508,6 +515,7 @@ private:
                     pool_cfg.max_body_size, std::chrono::milliseconds(pool_cfg.read_timeout_ms))) {
                 LOG_INFO("Proxy response chunked read failed: status=", resp.status_code,
                     ", body_rest=", body_rest.size());
+                resp.error = "upstream_response_chunked_read_failed";
                 conn.connection_close = true;
                 co_return resp;
             }
@@ -531,6 +539,7 @@ private:
                         LOG_INFO("Proxy response content-length read failed: status=", resp.status_code,
                             ", already_read=", resp.body.size(),
                             ", remaining=", remaining);
+                        resp.error = "upstream_response_body_read_failed";
                         conn.connection_close = true;
                         break;
                     }
@@ -678,6 +687,23 @@ private:
         return out;
     }
 
+    asio::awaitable<void> write_simple_error(
+        asio::ip::tcp::socket& socket, int status, std::string_view reason,
+        std::string_view body) {
+        std::string resp = "HTTP/1.1 ";
+        resp += std::to_string(status);
+        resp += " ";
+        resp += reason;
+        resp += "\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ";
+        resp += std::to_string(body.size());
+        resp += "\r\n\r\n";
+        resp += body;
+
+        asio::error_code ec;
+        co_await asio::async_write(
+            socket, asio::buffer(resp), asio::redirect_error(asio::use_awaitable, ec));
+    }
+
     asio::awaitable<void> handle_connection(asio::ip::tcp::socket socket) {
         try {
             char buf[8192];
@@ -687,24 +713,38 @@ private:
             while (running_) {
                 while (client_preread.find("\r\n\r\n") == std::string::npos) {
                     auto n = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
-                    if (!n) co_return;
+                    if (!n) {
+                        LOG_WARN("Client read returned 0 before request header complete, preread=",
+                            client_preread.size());
+                        co_return;
+                    }
                     client_preread.append(buf, n);
                     if (client_preread.size() > 64 * 1024) {
+                        LOG_WARN("Client request header too large");
+                        co_await write_simple_error(socket, 431, "Request Header Fields Too Large",
+                            "{\"code\":431,\"msg\":\"request header too large\"}");
                         co_return;
                     }
                 }
 
                 const char* method, *path;
                 int minor_version;
-                struct phr_header headers[32];
-                size_t num_headers = 32;
+                struct phr_header headers[128];
+                size_t num_headers = 128;
 
                 size_t method_len, path_len;
                 int pret = phr_parse_request(client_preread.data(), client_preread.size(),
                     &method, &method_len, &path, &path_len,
                     &minor_version, headers, &num_headers, 0);
 
-                if (pret < 0) break;
+                if (pret < 0) {
+                    LOG_WARN("Client request parse failed: pret=", pret,
+                        ", bytes=", client_preread.size(),
+                        ", preview=", sanitize_body_preview(client_preread));
+                    co_await write_simple_error(socket, 400, "Bad Request",
+                        "{\"code\":400,\"msg\":\"bad request\"}");
+                    co_return;
+                }
                 std::string body_buffer = client_preread.substr(pret);
 
                 std::string path_str(path, path_len);
@@ -846,6 +886,7 @@ private:
                                 // 例如 /zebra-config/config.ConfigService/xxx → /config.ConfigService/xxx
                                 std::string forward_req = method_str + " " + upstream->upstream_path + " HTTP/1.1\r\n";
                                 forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
+                                forward_req += "Connection: keep-alive\r\n";
                                 LOG_DEBUG("Proxy request: method=", method_str,
                                     ", path=", path_str,
                                     ", upstream_path=", upstream->upstream_path,
@@ -912,27 +953,38 @@ private:
                                     asio::error_code ec;
                                     conn.socket.cancel(ec);
                                     guard.set_bad();
-                                    LOG_INFO("Proxy upstream write timeout: method=", method_str,
+                                    LOG_WARN("Proxy upstream write failed: method=", method_str,
                                         ", upstream_path=", upstream->upstream_path,
                                         ", upstream=", cfg.host, ":", cfg.port,
                                         ", reused=", conn.reused_from_idle,
-                                        ", attempt=", attempt + 1);
+                                        ", attempt=", attempt + 1,
+                                        ", pool_stats={", pool->stats(), "}");
                                     if (can_retry_stale_idle) {
                                         LOG_INFO("Proxy retry after stale idle write failure: method=", method_str,
-                                            ", upstream_path=", upstream->upstream_path);
+                                            ", upstream_path=", upstream->upstream_path,
+                                            ", pool_stats={", pool->stats(), "}");
                                         continue;
                                     }
                                     ctx.status_code = 504;
-                                    ctx.response_body = "{\"code\":504,\"msg\":\"upstream write timeout\"}";
+                                    ctx.response_body = "{\"code\":504,\"msg\":\"upstream write failed\"}";
                                     handled = true;
                                 } else {
                                     auto proxy_resp = co_await read_proxy_response(
                                         conn, pool->cfg(), method_str == "HEAD");
-                                    bool response_failed = proxy_resp.status_code == 502 && conn.connection_close;
+                                    bool response_failed = !proxy_resp.error.empty();
+                                    if (response_failed) {
+                                        LOG_INFO("Proxy upstream response failed: reason=", proxy_resp.error,
+                                            ", method=", method_str,
+                                            ", upstream_path=", upstream->upstream_path,
+                                            ", reused=", conn.reused_from_idle,
+                                            ", attempt=", attempt + 1,
+                                            ", pool_stats={", pool->stats(), "}");
+                                    }
                                     if (response_failed && can_retry_stale_idle) {
                                         guard.set_bad();
                                         LOG_INFO("Proxy retry after stale idle read failure: method=", method_str,
-                                            ", upstream_path=", upstream->upstream_path);
+                                            ", upstream_path=", upstream->upstream_path,
+                                            ", pool_stats={", pool->stats(), "}");
                                         continue;
                                     }
                                     ctx.status_code = proxy_resp.status_code;
@@ -954,7 +1006,8 @@ private:
                                 }
                             }
                         } catch (const std::exception& e) {
-                            LOG_WARN("Proxy forward error: ", e.what());
+                            LOG_WARN("Proxy forward error: ", e.what(),
+                                ", pool_stats={", pool->stats(), "}");
                             ctx.status_code = 502;
                             ctx.response_body = "{\"code\":502,\"msg\":\"Bad Gateway\"}";
                             handled = true;
@@ -1013,6 +1066,17 @@ private:
                 if (!has_content_type && !response_has_no_body) {
                     resp += "Content-Type: application/json\r\n";
                 }
+                if (ctx.status_code >= 400) {
+                    resp += "Connection: close\r\n";
+                    resp += "X-Asio-Owen-Status-Source: ";
+                    resp += proxy_response ? "proxy\r\n" : "local\r\n";
+                    LOG_WARN("Client error response: method=", method_str,
+                        ", path=", path_str,
+                        ", status=", ctx.status_code,
+                        ", proxy_response=", proxy_response,
+                        ", response_body_size=", ctx.response_body.size(),
+                        ", body_preview=", sanitize_body_preview(ctx.response_body));
+                }
 
                 resp += "Content-Length: ";
                 resp += response_has_no_body ? "0" : std::to_string(ctx.response_body.size());
@@ -1025,6 +1089,11 @@ private:
                 co_await asio::async_write(socket, asio::buffer(resp),
                     asio::redirect_error(asio::use_awaitable, write_ec));
                 if (write_ec) {
+                    LOG_WARN("Client response write failed: method=", method_str,
+                        ", path=", path_str,
+                        ", status=", ctx.status_code,
+                        ", error=", write_ec.message(),
+                        ", response_bytes=", resp.size());
                     co_return;
                 }
 
@@ -1043,9 +1112,25 @@ private:
                 if (client_conn_tokens.close) break;
             }
         } catch (const std::system_error& e) {
-            LOG_DEBUG("Connection closed: ", e.what());
+            LOG_WARN("Connection system_error: ", e.what());
+            std::string body = "{\"code\":500,\"msg\":\"connection error\"}";
+            std::string resp = "HTTP/1.1 500 Internal Server Error\r\n"
+                "Connection: close\r\nContent-Type: application/json\r\nContent-Length: ";
+            resp += std::to_string(body.size());
+            resp += "\r\n\r\n";
+            resp += body;
+            asio::error_code ec;
+            asio::write(socket, asio::buffer(resp), ec);
         } catch (const std::exception& e) {
             LOG_WARN("Connection error: ", e.what());
+            std::string body = "{\"code\":500,\"msg\":\"internal server error\"}";
+            std::string resp = "HTTP/1.1 500 Internal Server Error\r\n"
+                "Connection: close\r\nContent-Type: application/json\r\nContent-Length: ";
+            resp += std::to_string(body.size());
+            resp += "\r\n\r\n";
+            resp += body;
+            asio::error_code ec;
+            asio::write(socket, asio::buffer(resp), ec);
         }
     }
 

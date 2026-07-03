@@ -111,6 +111,13 @@ asio::awaitable<void> api_health(HttpContext& ctx) {
     co_return;
 }
 
+asio::awaitable<void> api_build(HttpContext& ctx) {
+    ctx.response_headers.emplace_back("Content-Type", "application/json");
+    ctx.status_code = 200;
+    ctx.response_body = "{\"code\":0,\"build\":\"gateway-debug-20260703-client-close-trace\"}";
+    co_return;
+}
+
 int main(int argc, char* argv[]) {
     try {
         Config cfg;
@@ -127,6 +134,7 @@ int main(int argc, char* argv[]) {
         Logger::instance().init(cfg.get("server", "log_file", "server.log"), lvl);
 
         LOG_INFO("Server starting...");
+        LOG_INFO("Build marker: gateway-debug-20260703-client-close-trace");
 
         asio::io_context ioc;
         try {
@@ -157,6 +165,7 @@ int main(int argc, char* argv[]) {
 
             // 注册本地路由
             g_server->route("/api/health", api_health);
+            g_server->route("/api/build", api_build);
             g_server->route("/api/redis", api_redis);
             g_server->route("/api/mysql", api_mysql);
             g_server->route("/api/combo", api_combo);
