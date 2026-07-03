@@ -7,6 +7,7 @@ build_*/
 
 # IDE
 .idea/
+.claude/
 
 # Full third-party source trees used as local caches only.
 # Minimal vendored headers live under third_party/ and are tracked.
