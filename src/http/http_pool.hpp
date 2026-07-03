@@ -116,9 +116,15 @@ public:
         {
             std::lock_guard lock(state->mtx);
             evict_stale_idle(state);
-            if (!state->idle.empty()) {
+            while (!state->idle.empty()) {
                 auto conn = std::make_unique<HttpConn>(std::move(state->idle.front()));
                 state->idle.pop_front();
+                if (!is_reusable_idle(*conn)) {
+                    asio::error_code ec;
+                    conn->socket.close(ec);
+                    --state->total;
+                    continue;
+                }
                 ++state->in_flight;
                 state->active.insert(conn.get());
                 co_return std::move(conn);
@@ -262,6 +268,33 @@ private:
             state->idle.pop_front();
             --state->total;
         }
+    }
+
+    static bool is_reusable_idle(HttpConn& conn) {
+        if (!conn.socket.is_open() || conn.connection_close) return false;
+        if (conn.read_buffer.size() > 64 * 1024) return false;
+        if (!conn.read_buffer.empty()) return true;
+
+        asio::error_code ec;
+        bool was_non_blocking = conn.socket.non_blocking();
+
+        conn.socket.non_blocking(true, ec);
+        if (ec) return false;
+
+        char byte = 0;
+        size_t n = conn.socket.receive(
+            asio::buffer(&byte, 1), asio::socket_base::message_peek, ec);
+
+        asio::error_code restore_ec;
+        conn.socket.non_blocking(was_non_blocking, restore_ec);
+
+        if (!ec) {
+            return n > 0;
+        }
+        if (ec == asio::error::would_block || ec == asio::error::try_again) {
+            return true;
+        }
+        return false;
     }
 
     std::shared_ptr<State> state_;

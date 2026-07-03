@@ -121,6 +121,13 @@ private:
     asio::awaitable<std::size_t> read_with_timeout(
         asio::ip::tcp::socket& sock,
         char* buf, std::size_t size, std::chrono::milliseconds timeout) {
+        if (timeout.count() <= 0) {
+            asio::error_code ec;
+            auto n = co_await sock.async_read_some(
+                asio::buffer(buf, size), asio::redirect_error(asio::use_awaitable, ec));
+            co_return ec ? 0 : n;
+        }
+
         auto ex = co_await asio::this_coro::executor;
         auto timed_out = std::make_shared<bool>(false);
         asio::steady_timer timer(ex);
@@ -145,6 +152,13 @@ private:
 
     asio::awaitable<bool> write_with_timeout(
         asio::ip::tcp::socket& sock, const std::string& data, std::chrono::milliseconds timeout) {
+        if (timeout.count() <= 0) {
+            asio::error_code ec;
+            co_await asio::async_write(
+                sock, asio::buffer(data), asio::redirect_error(asio::use_awaitable, ec));
+            co_return !ec;
+        }
+
         auto ex = co_await asio::this_coro::executor;
         auto timed_out = std::make_shared<bool>(false);
         asio::steady_timer timer(ex);
@@ -218,7 +232,7 @@ private:
         return http_header_iequals(a, b);
     }
 
-    static HeaderTokens split_connection_tokens(std::string_view value, std::unordered_set<std::string>* out = nullptr) {
+    static HeaderTokens split_connection_tokens(std::string_view value, std::vector<std::string>* out = nullptr) {
         HeaderTokens tokens;
         size_t start = 0;
         while (start <= value.size()) {
@@ -228,7 +242,7 @@ private:
             if (!token.empty()) {
                 if (header_iequals(token, "close")) tokens.close = true;
                 if (header_iequals(token, "keep-alive")) tokens.keep_alive = true;
-                if (out) out->insert(to_lower(token));
+                if (out) out->push_back(to_lower(token));
             }
             if (comma == std::string_view::npos) break;
             start = comma + 1;
@@ -588,22 +602,21 @@ private:
         return out;
     }
 
-    static const std::unordered_set<std::string>& hop_by_hop_headers() {
-        static const std::unordered_set<std::string> headers = {
-            "connection", "keep-alive", "proxy-authenticate",
-            "proxy-authorization", "te", "trailer",
-            "transfer-encoding", "upgrade"
-        };
-        return headers;
-    }
-
     static void add_connection_tokens(
         const std::vector<std::pair<std::string, std::string>>& headers,
-        std::unordered_set<std::string>& filtered) {
+        std::vector<std::string>& filtered) {
         for (auto& [k, v] : headers) {
             if (!header_iequals(k, "connection")) continue;
             split_connection_tokens(v, &filtered);
         }
+    }
+
+    static bool contains_header_name(
+        const std::vector<std::string>& names, const std::string& name) {
+        for (auto& candidate : names) {
+            if (candidate == name) return true;
+        }
+        return false;
     }
 
     static bool is_hop_by_hop_header(std::string_view k) {
@@ -831,9 +844,12 @@ private:
                                     ", upstream=", cfg.host, ":", cfg.port,
                                     ", body_size=", ctx.body.size());
 
-                                std::unordered_set<std::string> filtered = hop_by_hop_headers();
-                                filtered.insert("host");
-                                filtered.insert("accept-encoding");
+                                std::vector<std::string> filtered = {
+                                    "connection", "keep-alive", "proxy-authenticate",
+                                    "proxy-authorization", "te", "trailer",
+                                    "transfer-encoding", "upgrade",
+                                    "host", "accept-encoding"
+                                };
                                 add_connection_tokens(ctx.headers, filtered);
                                 bool forwarding_transfer_encoding = false;
                                 for (auto& [k, v] : ctx.headers) {
@@ -859,7 +875,7 @@ private:
                                             ", reason=content-length-with-transfer-encoding");
                                         continue;
                                     }
-                                    if (filtered.find(lk) != filtered.end()) {
+                                    if (contains_header_name(filtered, lk)) {
                                         LOG_DEBUG("Proxy forward header skip: ", k,
                                             ", reason=hop-by-hop-or-overridden");
                                         continue;
@@ -903,7 +919,7 @@ private:
                                     ctx.response_headers = std::move(proxy_resp.headers);
                                     proxy_response = true;
 
-                                    LOG_INFO("Proxy forwarded: method=", method_str,
+                                    LOG_DEBUG("Proxy forwarded: method=", method_str,
                                         ", path=", path_str,
                                         ", upstream_path=", upstream->upstream_path,
                                         ", upstream=", cfg.host, ":", cfg.port,
@@ -953,12 +969,16 @@ private:
                 bool has_content_type = false;
                 if (!ctx.response_headers.empty()) {
                     if (proxy_response) {
-                        std::unordered_set<std::string> filtered = hop_by_hop_headers();
+                        std::vector<std::string> filtered = {
+                            "connection", "keep-alive", "proxy-authenticate",
+                            "proxy-authorization", "te", "trailer",
+                            "transfer-encoding", "upgrade"
+                        };
                         add_connection_tokens(ctx.response_headers, filtered);
-                        filtered.insert("content-length");
+                        filtered.push_back("content-length");
                         for (auto& [k, v] : ctx.response_headers) {
                             auto lk = to_lower(k);
-                            if (filtered.find(lk) != filtered.end()) continue;
+                            if (contains_header_name(filtered, lk)) continue;
                             resp += k + ": " + v + "\r\n";
                             if (header_iequals(k, "content-type")) has_content_type = true;
                         }
