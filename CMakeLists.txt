@@ -70,3 +70,16 @@ add_executable(server
 
 # 构建后自动复制 config.ini 到输出目录
 configure_file(${PROJECT_SOURCE_DIR}/config.ini ${CMAKE_CURRENT_BINARY_DIR}/config.ini COPYONLY)
+
+# ==================== GoogleTest ====================
+enable_testing()
+include(FetchContent)
+FetchContent_Declare(
+        googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
+)
+# Windows compat, harmless elsewhere
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+add_subdirectory(tests)

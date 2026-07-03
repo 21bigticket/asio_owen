@@ -1,9 +1,8 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <fstream>
-#include <sstream>
-#include <stdexcept>
 #include "logger.hpp"
 
 class Config {
@@ -51,6 +50,18 @@ public:
             LOG_WARN("Invalid int config ", section, ".", key, "=", s, ", using default=", def);
             return def;
         }
+    }
+
+    // 获取某个 section 下所有 key-value
+    std::vector<std::pair<std::string, std::string>> get_section(const std::string& section) const {
+        std::vector<std::pair<std::string, std::string>> result;
+        auto prefix = section + ".";
+        for (auto& [k, v] : data_) {
+            if (k.find(prefix) == 0) {
+                result.emplace_back(k.substr(prefix.size()), v);
+            }
+        }
+        return result;
     }
 
 private:

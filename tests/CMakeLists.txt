@@ -1,0 +1,17 @@
+# GoogleTest test targets
+include(GoogleTest)
+
+# Placeholder — 验证 GoogleTest harness 正常
+add_executable(test_placeholder test_placeholder.cpp)
+target_link_libraries(test_placeholder gtest_main)
+gtest_discover_tests(test_placeholder)
+
+# MySQL 连接池集成测试（需要真实 MySQL 实例）
+add_executable(test_mysql_pool test_mysql_pool.cpp)
+target_link_libraries(test_mysql_pool gtest_main)
+gtest_discover_tests(test_mysql_pool)
+
+# Redis 连接池集成测试（需要真实 Redis 实例）
+add_executable(test_redis_pool test_redis_pool.cpp)
+target_link_libraries(test_redis_pool gtest_main)
+gtest_discover_tests(test_redis_pool)

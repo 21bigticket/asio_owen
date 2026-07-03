@@ -53,8 +53,54 @@ private:
     std::shared_ptr<spdlog::logger> logger_;
 };
 
-// 先用 ostringstream 拼接，再调用 spdlog，兼容原有的 << 风格
-#define LOG_DEBUG(...)   do { std::ostringstream _log_oss; _log_oss << __VA_ARGS__; Logger::instance().get()->debug(_log_oss.str()); } while(0)
-#define LOG_INFO(...)    do { std::ostringstream _log_oss; _log_oss << __VA_ARGS__; Logger::instance().get()->info(_log_oss.str()); } while(0)
-#define LOG_WARN(...)    do { std::ostringstream _log_oss; _log_oss << __VA_ARGS__; Logger::instance().get()->warn(_log_oss.str()); } while(0)
-#define LOG_ERROR(...)   do { std::ostringstream _log_oss; _log_oss << __VA_ARGS__; Logger::instance().get()->error(_log_oss.str()); } while(0)
+namespace detail {
+
+template <typename T>
+const T& stream_arg(const T& arg) { return arg; }
+
+inline void log_to_stream(std::ostringstream&) {}
+
+template <typename T, typename... Args>
+void log_to_stream(std::ostringstream& oss, const T& first, const Args&... rest) {
+    oss << first;
+    log_to_stream(oss, rest...);
+}
+
+template <typename... Args>
+void log_info_impl(const Args&... args) {
+    if (Logger::instance().get()->should_log(spdlog::level::info)) {
+        std::ostringstream oss;
+        log_to_stream(oss, args...);
+        Logger::instance().get()->info(oss.str());
+    }
+}
+
+template <typename... Args>
+void log_warn_impl(const Args&... args) {
+    std::ostringstream oss;
+    log_to_stream(oss, args...);
+    Logger::instance().get()->warn(oss.str());
+}
+
+template <typename... Args>
+void log_error_impl(const Args&... args) {
+    std::ostringstream oss;
+    log_to_stream(oss, args...);
+    Logger::instance().get()->error(oss.str());
+}
+
+template <typename... Args>
+void log_debug_impl(const Args&... args) {
+    if (Logger::instance().get()->should_log(spdlog::level::debug)) {
+        std::ostringstream oss;
+        log_to_stream(oss, args...);
+        Logger::instance().get()->debug(oss.str());
+    }
+}
+
+} // namespace detail
+
+#define LOG_DEBUG(...)   detail::log_debug_impl(__VA_ARGS__)
+#define LOG_INFO(...)    detail::log_info_impl(__VA_ARGS__)
+#define LOG_WARN(...)    detail::log_warn_impl(__VA_ARGS__)
+#define LOG_ERROR(...)   detail::log_error_impl(__VA_ARGS__)

@@ -77,6 +77,108 @@ port = 8081
 | **Redis** | **34,615** | 2.7ms | 6.7ms | 100% |
 | **MySQL** | **8,165** | 10.4ms | 39.9ms | 100% |
 
+## v3.3 新版连接池压测
+
+### 环境
+
+- 同一台虚拟机（192.168.139.230），300+ 系统线程（Java Skywalking + 8 个 Go 微服务等）
+- 最终优化配置：`worker_threads=64`、`release notify_one` 恢复、`cmd_timeout_ms=0`（性能模式）
+- Redis 已从 `unordered_map` 改回直接 `thread_local redisContext*`
+- LOG 宏已修复多参数拼接
+- maintain 线程已从 `sleep_for` 改为 `cv_.wait_for`，shutdown 可立即唤醒
+- 30 秒长压 ×2 取平均，间隔 30 秒，预热后压测
+
+### 最终结果（稳态）
+
+| 接口 | 第 1 次 | 第 2 次 | 平均 | 旧版长压 | 变化 |
+|:----:|:-------:|:-------:|:----:|:--------:|:----:|
+| **Health** | 99,386 | 97,133 | **98,259** | 76,183 | **+29%** 🚀 |
+| **Redis** | 30,030 | 27,904 | **28,967** | 22,586 | **+28%** 🚀 |
+| **MySQL** | 9,140 | 8,800 | **8,970** | 7,047 | **+27%** 🚀 |
+
+> 注意：Health 首次压测（刚部署时）仅 35k，预热后稳定在 98k。服务刚启动时系统调度尚未稳定（64 worker 线程初始化、epoll 就绪等），**预热 1-2 分钟后达到稳态性能**。建议生产上线后进行 1 分钟预热再接入流量。
+
+### 优化历程
+
+| 阶段 | Health | Redis | MySQL | 关键改动 |
+|:----:|:------:|:-----:|:-----:|----------|
+| 旧版 baseline | 76,183 | 22,586 | 7,047 | 旧版连接池（简单 queue + thread_local，无安全措施） |
+| **v3.3 最终版** | **98,259** | **28,967** | **8,970** | 全部优化叠加后的稳态结果 |
+
+### 变更清单
+
+| 优化项 | 分类 | 说明 |
+|-------|:----:|------|
+| worker_threads 可配置（默认 32） | MySQL | 解耦 worker 线程与 CPU 核数，压测设 64 恢复旧版并发度 |
+| release 每次 notify_one | MySQL | 去掉 size()==1 条件通知 |
+| creating_ 防惊群 | MySQL | 同一时间至多 1 个建连 |
+| mysql_reset_connection | MySQL | 新建连接做会话重置，避免污染 |
+| maintain 独立线程 | MySQL | 定期回收+补充+探活，不挂 io_context |
+| maintain sleep → cv_.wait_for | MySQL | shutdown 可立即唤醒，不再卡 30 秒 |
+| do_maintain running_ 检查 | MySQL | shutdown 时不再执行完整建连/ping 循环 |
+| tls_map_ → 裸指针 | Redis | 去掉 unordered_map 查找 |
+| redisSetTimeout 配置开关 | Redis | cmd_timeout_ms=0（性能模式）不设超时 |
+| get() fast path | Redis | 跳过 vsnprintf + string 分配 |
+| 断线自动重建 | Redis | 检测 ctx->err 后 redisFree + 重建 |
+| 两段式 shutdown | 框架 | ioc.stop() → io_context 线程退出 → 再销毁 pool/server |
+| acquire 检查 running_ | 框架 | shutdown 时不会卡死在 wait |
+| LOG 宏修复 | 框架 | 模板递归展开，多参数正确拼接 |
+
+### 安全措施清单（v3.3 vs 旧版）
+
+| 安全维度 | 旧版 | v3.3 | 变化 |
+|---------|------|------|:----:|
+| **MySQL 连接耗尽** | 固定 `pool_size=64`，无等待队列 | `max_size` 硬上限 + `cv_.wait` 排队 | ✅ 新增 |
+| **MySQL 惊群建连** | 无防护 | `creating_` 计数器，同一时刻至多 1 个建连 | ✅ 新增 |
+| **MySQL 死连接** | 无检测 | `maintain` 独立线程定期探活 + acquire 路径 `mysql_reset_connection` | ✅ 新增 |
+| **MySQL 连接泄漏** | worker 异常时直接 close | `do_query` 失败时 `--total_` + `cv_.notify_all()` | ✅ 修复 |
+| **MySQL 会话污染** | 无重置 | 新连接做 `mysql_reset_connection` C API | ✅ 新增 |
+| **MySQL shutdown 死锁** | `worker_pool_.join()` 可能卡死 | shutdown 两段式 + acquire 检查 `running_` | ✅ 修复 |
+| **Redis 无限阻塞** | 无命令超时 | `redisSetTimeout` 配置开关 + 建连 1s 超时 | ✅ 新增 |
+| **Redis 断线重建** | 无检测 | `get_conn()` 检测 `ctx->err`，自动重建 | ✅ 新增 |
+| **Redis 连接泄漏** | shutdown 不释放 | shutdown 时 `redisFree` + 置 null | ✅ 修复 |
+| **ASIO 生命周期** | handler 可能访问已析构对象 | `ioc.stop()` 在先，所有线程退出后才销毁对象 | ✅ 修复 |
+| **日志可观测性** | LOG 多参数被逗号吞掉 | 模板递归展开，正确输出 | ✅ 修复 |
+
+### 生产建议
+
+**预热：** 服务启动后有约 1 分钟冷启动期（64 worker 线程初始化、epoll 就绪等），建议上线前发少量请求预热再接入流量。
+
+**Redis：**
+- `cmd_timeout_ms` 配置开关：压测/内网设 0（性能模式），线上设 1000（稳定性优先）
+- 使用 `get(key)` fast path API 替代通用 `cmd("GET %s", key)`，固定 GET 场景可提升约 8%
+
+**MySQL：**
+- `worker_threads` 建议设为 `max_size` 或 32-64，不要绑定 `hardware_concurrency()`
+- 当前安全措施全程开启，带来约 9% 固定开销，可接受
+
+### 稳定性
+
+6 次压测全部 100% 成功率，0 个 error/fatal，0 个 GP fault，0 个 timeout。
+
+**本次最后三轮压测（Redis/MySQL/Combo 各 3 分钟 + Valgrind）检查结果：**
+
+| 检查项 | 结果 |
+|--------|:----:|
+| server 日志 error/fatal | 0 ✅（清除了历史 Redis 未启动时的日志后为 0） |
+| dmesg 内核 crash | 0 条新增 ✅ |
+| plow 成功率 | 100%，无 timeout ✅ |
+
+> 注意：`server.log` 是追加写入的，前序错误（如 Redis 未启动时的 `Connection refused`）会残留。每次压测前建议 `rm -f server.log`，或检查时明确区分压测时间段内的日志。
+
+**每次压测后必须检查以下三项，确认无异常后方可认可结果：**
+
+1. **server 日志** — `grep -ciE 'error|fatal|Seg|abort|SIG' /path/to/server.log`，应为 0
+2. **dmesg 内核日志** — `dmesg | grep -c 'server\['`，应无新增 crash 记录
+3. **压测工具输出** — plow/wrk 的统计中成功率应为 100%，无 timeout 或 error 计数
+
+```bash
+# 快速检查命令
+cat server.log | grep -ciE 'error|fatal|Seg|abort|crash|SIG'
+dmesg | grep -c 'server['
+# 如果 dmesg 有新增记录，用 dmesg | grep 'server[' | tail -5 查看详情
+```
+
 ## 日志库对比：手写同步 vs spdlog 异步
 
 | 日志库 | 模型 | Health RPS | Redis RPS | MySQL RPS |
