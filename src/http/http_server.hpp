@@ -455,7 +455,7 @@ private:
         HeaderParseState header_state;
         auto hdr = header_part.substr(first_line_end + 2, header_end - first_line_end - 2);
         parse_header_fields(std::move(hdr), resp.headers, header_state);
-        LOG_INFO("Proxy response header parsed: status_line=", status_line,
+        LOG_DEBUG("Proxy response header parsed: status_line=", status_line,
             ", status=", resp.status_code,
             ", headers=[", describe_headers(resp.headers), "]",
             ", invalid_cl=", header_state.invalid_content_length,
@@ -574,7 +574,7 @@ private:
             }
         }
 
-        LOG_INFO("Proxy response body ready: status=", resp.status_code,
+        LOG_DEBUG("Proxy response body ready: status=", resp.status_code,
             ", body_size=", resp.body.size(),
             ", connection_close=", conn.connection_close,
             ", read_buffer=", conn.read_buffer.size(),
@@ -713,7 +713,7 @@ private:
                 }
                 client_preread.clear();
 
-                LOG_INFO("Client request parsed: method=", method_str,
+                LOG_DEBUG("Client request parsed: method=", method_str,
                     ", path=", path_str,
                     ", http_minor=", minor_version,
                     ", header_count=", ctx.headers.size(),
@@ -790,7 +790,7 @@ private:
                     client_preread = std::move(preread);
                 }
 
-                LOG_INFO("Client request body ready: method=", method_str,
+                LOG_DEBUG("Client request body ready: method=", method_str,
                     ", path=", path_str,
                     ", body_size=", ctx.body.size(),
                     ", next_preread=", client_preread.size(),
@@ -809,7 +809,7 @@ private:
                     if (upstream) {
                         const auto& cfg = upstream->config;
                         auto* pool = upstream->pool;
-                        LOG_INFO("Proxy route matched: method=", method_str,
+                        LOG_DEBUG("Proxy route matched: method=", method_str,
                             ", path=", path_str,
                             ", upstream_path=", upstream->upstream_path,
                             ", upstream=", cfg.host, ":", cfg.port,
@@ -825,7 +825,7 @@ private:
                                 // 例如 /zebra-config/config.ConfigService/xxx → /config.ConfigService/xxx
                                 std::string forward_req = method_str + " " + upstream->upstream_path + " HTTP/1.1\r\n";
                                 forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
-                                LOG_INFO("Proxy request: method=", method_str,
+                                LOG_DEBUG("Proxy request: method=", method_str,
                                     ", path=", path_str,
                                     ", upstream_path=", upstream->upstream_path,
                                     ", upstream=", cfg.host, ":", cfg.port,
@@ -842,38 +842,37 @@ private:
                                         break;
                                     }
                                 }
-                                LOG_INFO("Proxy header policy: upstream_path=", upstream->upstream_path,
+                                LOG_DEBUG("Proxy header policy: upstream_path=", upstream->upstream_path,
                                     ", forwarding_transfer_encoding=", forwarding_transfer_encoding,
                                     ", original_headers=[", describe_headers(ctx.headers), "]");
-
                                 for (auto& [k, v] : ctx.headers) {
                                     auto lk = to_lower(k);
                                     // transfer-encoding: chunked 需要保留，让下游正确解析 raw chunked body
                                     if (lk == "transfer-encoding") {
-                                        LOG_INFO("Proxy forward header keep: ", k,
+                                        LOG_DEBUG("Proxy forward header keep: ", k,
                                             "=", sanitize_header_value(k, v));
                                         forward_req += k + ": " + v + "\r\n";
                                         continue;
                                     }
                                     if (forwarding_transfer_encoding && lk == "content-length") {
-                                        LOG_INFO("Proxy forward header skip: ", k,
+                                        LOG_DEBUG("Proxy forward header skip: ", k,
                                             ", reason=content-length-with-transfer-encoding");
                                         continue;
                                     }
                                     if (filtered.find(lk) != filtered.end()) {
-                                        LOG_INFO("Proxy forward header skip: ", k,
+                                        LOG_DEBUG("Proxy forward header skip: ", k,
                                             ", reason=hop-by-hop-or-overridden");
                                         continue;
                                     }
-                                    LOG_INFO("Proxy forward header keep: ", k,
+                                    LOG_DEBUG("Proxy forward header keep: ", k,
                                         "=", sanitize_header_value(k, v));
                                     forward_req += k + ": " + v + "\r\n";
                                 }
 
-                                LOG_INFO("Proxy upstream request line: ", method_str, " ",
+                                LOG_DEBUG("Proxy upstream request line: ", method_str, " ",
                                     upstream->upstream_path, " HTTP/1.1");
                                 forward_req += "\r\n" + ctx.body;
-                                LOG_INFO("Proxy upstream request built: upstream_path=",
+                                LOG_DEBUG("Proxy upstream request built: upstream_path=",
                                     upstream->upstream_path,
                                     ", bytes=", forward_req.size(),
                                     ", body_size=", ctx.body.size(),
@@ -904,11 +903,13 @@ private:
                                     ctx.response_headers = std::move(proxy_resp.headers);
                                     proxy_response = true;
 
-                                    LOG_INFO("Proxy response: method=", method_str,
+                                    LOG_INFO("Proxy forwarded: method=", method_str,
+                                        ", path=", path_str,
                                         ", upstream_path=", upstream->upstream_path,
+                                        ", upstream=", cfg.host, ":", cfg.port,
                                         ", status=", ctx.status_code,
-                                        ", body_size=", ctx.response_body.size(),
-                                        ", response_headers=[", describe_headers(ctx.response_headers), "]");
+                                        ", request_body_size=", ctx.body.size(),
+                                        ", response_body_size=", ctx.response_body.size());
 
                                     if (conn.connection_close) guard.set_bad();
                                     handled = true;
@@ -979,14 +980,6 @@ private:
                 resp += response_has_no_body ? "0" : std::to_string(ctx.response_body.size());
                 resp += "\r\n\r\n";
                 if (!response_has_no_body) resp += ctx.response_body;
-
-                LOG_INFO("Client response built: method=", method_str,
-                    ", path=", path_str,
-                    ", status=", ctx.status_code,
-                    ", proxy_response=", proxy_response,
-                    ", body_size=", response_has_no_body ? 0 : ctx.response_body.size(),
-                    ", body_preview=",
-                    response_has_no_body ? "" : sanitize_body_preview(ctx.response_body));
 
                 // 客户端响应写不使用 write_with_timeout：timer 开销在热路径上会被放大
                 // （改用裸 async_write + redirect_error，简单可靠）
