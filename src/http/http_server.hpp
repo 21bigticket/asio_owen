@@ -46,6 +46,11 @@ struct HeaderTokens {
     bool keep_alive = false;
 };
 
+struct HeaderListTokens {
+    bool has_token = false;
+    bool last_is_token = false;
+};
+
 // HttpServer
 // 10MB body 上限
 static constexpr size_t kMaxBodySize = 10 * 1024 * 1024;
@@ -196,10 +201,10 @@ private:
     }
 
     static std::optional<size_t> parse_decimal_size(std::string_view s) {
-        s = std::string_view(trim_copy(s));
-        if (s.empty()) return std::nullopt;
+        auto trimmed = trim_copy(s);
+        if (trimmed.empty()) return std::nullopt;
         size_t value = 0;
-        for (char c : s) {
+        for (char c : trimmed) {
             if (c < '0' || c > '9') return std::nullopt;
             size_t d = static_cast<size_t>(c - '0');
             if (value > (std::numeric_limits<size_t>::max() - d) / 10) {
@@ -228,6 +233,24 @@ private:
         return tokens;
     }
 
+    static HeaderListTokens parse_header_list_token(std::string_view value, std::string_view expected) {
+        HeaderListTokens result;
+        size_t start = 0;
+        while (start <= value.size()) {
+            auto comma = value.find(',', start);
+            auto end = comma == std::string_view::npos ? value.size() : comma;
+            auto token = to_lower(trim_copy(value.substr(start, end - start)));
+            if (!token.empty()) {
+                bool matched = token == expected;
+                result.has_token = result.has_token || matched;
+                result.last_is_token = matched;
+            }
+            if (comma == std::string_view::npos) break;
+            start = comma + 1;
+        }
+        return result;
+    }
+
     static void parse_header_line_into(
         const std::string& line,
         std::vector<std::pair<std::string, std::string>>& out,
@@ -250,7 +273,8 @@ private:
             }
         } else if (lk == "transfer-encoding") {
             state.has_transfer_encoding = true;
-            if (lv.find("chunked") != std::string::npos) {
+            auto te = parse_header_list_token(lv, "chunked");
+            if (te.last_is_token) {
                 state.is_chunked = true;
             }
         } else if (lk == "connection") {
@@ -352,7 +376,7 @@ private:
 
     // 读取下游响应：返回状态码、headers、body；多读的字节存入 conn.read_buffer
     asio::awaitable<ProxyResponse> read_proxy_response(
-        HttpPool::HttpConn& conn, const HttpPool::Config& pool_cfg) {
+        HttpPool::HttpConn& conn, const HttpPool::Config& pool_cfg, bool request_is_head) {
 
         ProxyResponse resp;
         resp.status_code = 502;  // 默认 Bad Gateway
@@ -362,11 +386,15 @@ private:
 
         // 读头部直到 \r\n\r\n
         while (buf.find("\r\n\r\n") == std::string::npos) {
+            if (buf.size() > 64 * 1024) {
+                conn.connection_close = true;
+                co_return resp;
+            }
             char tmp[4096];
             auto nr = co_await read_with_timeout(conn.socket, tmp, sizeof(tmp),
                 std::chrono::milliseconds(pool_cfg.read_timeout_ms));
             if (!nr) {
-                // 超时返回
+                conn.connection_close = true;
                 co_return resp;
             }
             buf.append(tmp, nr);
@@ -389,7 +417,12 @@ private:
             conn.connection_close = true;
             co_return resp;
         }
-        resp.status_code = std::stoi(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
+        auto status_code = parse_decimal_size(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
+        if (!status_code || *status_code > 999) {
+            conn.connection_close = true;
+            co_return resp;
+        }
+        resp.status_code = static_cast<int>(*status_code);
         resp.status_text = status_line.substr(sp2 + 1);
 
         int upstream_minor_version = status_line.rfind("HTTP/1.0", 0) == 0 ? 0 : 1;
@@ -404,6 +437,16 @@ private:
 
         conn.connection_close = header_state.connection_close ||
             (upstream_minor_version == 0 && !header_state.connection_keep_alive);
+
+        bool response_has_no_body = request_is_head || resp.status_code == 204 ||
+            resp.status_code == 304 || (resp.status_code >= 100 && resp.status_code < 200);
+        if (response_has_no_body) {
+            resp.body.clear();
+            if (!body_rest.empty()) {
+                conn.connection_close = true;
+            }
+            co_return resp;
+        }
 
         // 读 body
         if (header_state.is_chunked) {
@@ -456,12 +499,8 @@ private:
             // - 其他：连接关闭或 Connection: close 时读到 EOF
             if (resp.status_code == 204 || resp.status_code == 304 ||
                 (resp.status_code >= 100 && resp.status_code < 200)) {
-                // 无 body
-                resp.body = std::string();
-                // 如果 body_rest 有多读（实际不应有），存回 read_buffer
-                if (!body_rest.empty()) {
-                    conn.read_buffer = std::move(body_rest);
-                }
+                resp.body.clear();
+                if (!body_rest.empty()) conn.connection_close = true;
             } else {
                 // 读到连接关闭（仅 Connection: close 或 HTTP/1.0）
                 conn.connection_close = true;
@@ -561,67 +600,63 @@ private:
                     parse_header_line_into(line, ignored_headers, request_header_state);
                 }
 
-                // 路由 + 处理（先确定 handled，再解析 body 避免重复劳动）
                 bool handled = false;
 
-                // 先试本地路由
-                auto it = routes_.find(path_str);
-                if (it != routes_.end()) {
-                    co_await it->second(ctx);
+                std::string& preread = body_buffer;
+                if (request_header_state.invalid_content_length ||
+                    request_header_state.duplicate_content_length ||
+                    (request_header_state.has_transfer_encoding && !request_header_state.is_chunked)) {
+                    ctx.status_code = 400;
+                    ctx.response_body = "{\"code\":400,\"msg\":\"invalid request framing\"}";
                     handled = true;
-                }
-
-                // 再试代理路由 — 需要读取 body 转发
-                if (!handled) {
-                    // 读取 body
-                    std::string& preread = body_buffer;
-                    if (request_header_state.invalid_content_length ||
-                        request_header_state.duplicate_content_length ||
-                        (request_header_state.has_transfer_encoding && !request_header_state.is_chunked)) {
+                } else if (request_header_state.is_chunked) {
+                    if (!co_await read_chunked_stream(socket, preread, ctx.body,
+                            kMaxBodySize, client_timeout)) {
                         ctx.status_code = 400;
-                        ctx.response_body = "{\"code\":400,\"msg\":\"invalid request framing\"}";
+                        ctx.response_body = "{\"code\":400,\"msg\":\"invalid chunked body\"}";
                         handled = true;
-                    } else if (request_header_state.is_chunked) {
-                        if (!co_await read_chunked_stream(socket, preread, ctx.body,
-                                kMaxBodySize, client_timeout)) {
-                            ctx.status_code = 400;
-                            ctx.response_body = "{\"code\":400,\"msg\":\"invalid chunked body\"}";
-                            handled = true;
-                        }
-                        client_preread = std::move(preread);
-                    } else if (request_header_state.content_length) {
-                        size_t content_length = *request_header_state.content_length;
-                        if (content_length > kMaxBodySize) {
-                            ctx.status_code = 413;
-                            ctx.response_body = "{\"code\":413,\"msg\":\"body too large\"}";
-                            handled = true;
-                        } else if (preread.size() >= content_length) {
-                            ctx.body = preread.substr(0, content_length);
-                            client_preread = preread.substr(content_length);
-                        } else {
-                            ctx.body = preread;
-                            size_t remaining = content_length - ctx.body.size();
-                            while (remaining > 0) {
-                                auto nr = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
-                                if (!nr) {
-                                    ctx.status_code = 408;
-                                    ctx.response_body = "{\"code\":408,\"msg\":\"request timeout\"}";
-                                    handled = true;
-                                    break;
-                                }
-                                if (nr > remaining) {
-                                    ctx.body.append(buf, remaining);
-                                    client_preread.assign(buf + remaining, nr - remaining);
-                                    remaining = 0;
-                                } else {
-                                    ctx.body.append(buf, nr);
-                                    remaining -= nr;
-                                }
-                            }
-                        }
+                    }
+                    client_preread = std::move(preread);
+                } else if (request_header_state.content_length) {
+                    size_t content_length = *request_header_state.content_length;
+                    if (content_length > kMaxBodySize) {
+                        ctx.status_code = 413;
+                        ctx.response_body = "{\"code\":413,\"msg\":\"body too large\"}";
+                        handled = true;
+                    } else if (preread.size() >= content_length) {
+                        ctx.body = preread.substr(0, content_length);
+                        client_preread = preread.substr(content_length);
                     } else {
                         ctx.body = preread;
+                        size_t remaining = content_length - ctx.body.size();
+                        while (remaining > 0) {
+                            auto nr = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
+                            if (!nr) {
+                                ctx.status_code = 408;
+                                ctx.response_body = "{\"code\":408,\"msg\":\"request timeout\"}";
+                                handled = true;
+                                break;
+                            }
+                            if (nr > remaining) {
+                                ctx.body.append(buf, remaining);
+                                client_preread.assign(buf + remaining, nr - remaining);
+                                remaining = 0;
+                            } else {
+                                ctx.body.append(buf, nr);
+                                remaining -= nr;
+                            }
+                        }
                     }
+                } else {
+                    ctx.body.clear();
+                    client_preread = std::move(preread);
+                }
+
+                // 先试本地路由。body 已按 framing 消费，keep-alive/pipeline 不会错位。
+                auto it = routes_.find(path_str);
+                if (!handled && it != routes_.end()) {
+                    co_await it->second(ctx);
+                    handled = true;
                 }
 
                 // 代理路由（需要 body 已解析）
@@ -691,7 +726,8 @@ private:
                                     ctx.response_body = "{\"code\":504,\"msg\":\"upstream write timeout\"}";
                                     handled = true;
                                 } else {
-                                    auto proxy_resp = co_await read_proxy_response(conn, pool->cfg());
+                                    auto proxy_resp = co_await read_proxy_response(
+                                        conn, pool->cfg(), method_str == "HEAD");
                                     ctx.status_code = proxy_resp.status_code;
                                     ctx.response_status_text = std::move(proxy_resp.status_text);
                                     ctx.response_body = std::move(proxy_resp.body);
@@ -748,14 +784,26 @@ private:
                         if (lk == "content-type") has_content_type = true;
                     }
                 }
-                if (!has_content_type) {
+                bool response_has_no_body = method_str == "HEAD" || ctx.status_code == 204 ||
+                    ctx.status_code == 304 || (ctx.status_code >= 100 && ctx.status_code < 200);
+                if (!has_content_type && !response_has_no_body) {
                     resp += "Content-Type: application/json\r\n";
                 }
 
-                resp += "Content-Length: " + std::to_string(ctx.response_body.size()) + "\r\n";
-                resp += "\r\n" + ctx.response_body;
+                resp += "Content-Length: ";
+                resp += response_has_no_body ? "0" : std::to_string(ctx.response_body.size());
+                resp += "\r\n\r\n";
+                if (!response_has_no_body) resp += ctx.response_body;
 
-                co_await asio::async_write(socket, asio::buffer(resp), asio::use_awaitable);
+                if (!co_await write_with_timeout(socket, resp, client_timeout)) {
+                    co_return;
+                }
+
+                // body framing 错误：socket 中可能还有未消费的 body 字节，
+                // 继续循环会把 body 当作下一个请求头解析 → HTTP smuggling。强制关连接。
+                if (ctx.status_code == 400 || ctx.status_code == 408 || ctx.status_code == 413) {
+                    co_return;
+                }
 
                 // 客户端 Connection: close 则断开
                 auto client_conn = ctx.get_header("Connection");
