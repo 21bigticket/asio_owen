@@ -271,3 +271,94 @@ ctest --test-dir build --output-on-failure
 | 状态行 | `201 Created` 被渲染成 `201 OK` | 端到端保留 `status_text` |
 | 转发 | 客户端已有 `X-Forwarded-For` 时被覆盖 | 原值后追加客户端 IP |
 | 连接池 | 同一池化连接上的预读字节无限累积 | release 时 `read_buffer > 64KB` 则丢弃连接 |
+| 连接池 | idle 复用连接探活通过后、真正写/读前对端关闭（TOCTOU） | 复用 idle 连接失败时做一次重试；新建连接失败不重试 |
+| 连接池 | keep-alive 连接 `Connection` 头被 hop-by-hop 过滤，上游误用 `Connection: close` | 转发时显式添加 `Connection: keep-alive` |
+| 连接池 | 缺少连接池状态统计，异常时不易定位 | acquire/retry/error 路径附带 `pool_stats={...}` |
+| 客户端 | 请求解析失败直接断连 | 返回 `HTTP/1.1 400 Bad Request` + `Connection: close` |
+| 客户端 | `phr_header headers[32]` 在 header 多时解析失败 | 扩大到 `headers[128]` |
+| 客户端 | header 超过 64KB 静默断连 | 返回 `431 Request Header Fields Too Large` |
+| 客户端 | `std::system_error` catch 只打 DEBUG 后直接关闭连接 | 改为 WARN 并尝试同步写 `500` |
+| 客户端 | 非 2xx 响应来源不明 | 所有 4xx/5xx 响应带 `X-Asio-Owen-Status-Source` 头 |
+| 压测 | plow `--body=file` 缺少 `@` 前缀导致 body 内容为文件名本身 | 修正为 `--body=@/path/to/file` |
+
+## 压测结果
+
+### 环境
+
+- 虚拟机 192.168.139.230，Ubuntu 22.04，6 核 CPU
+- 上游：zebra-config（Go 服务，127.0.0.1:30001）
+- 压测工具：plow，100 并发，30s，POST JSON body
+
+### 性能对比
+
+| 路径 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
+|:---|:---:|:---:|:---:|:---:|
+| **直连** | 4,963 | 4,077 | **4,520** | 100% |
+| **通过网关** | 4,486 | 4,027 | **4,257** | 100% |
+
+网关相比直连损耗约 **6%**（在误差范围内）。
+
+### 优化历程
+
+| 阶段 | RPS | connection-error | 4xx | 关键改动 |
+|:---|:---:|:---:|:---:|------|
+| 初始版 | ~4k | ~64% | — | 无 |
+| 日志降级 + timer 旁路 + header vector | ~13k | ~50% | — | `LOG_DEBUG`，`timeout<=0` 无 timer |
+| idle 探活 + retry | ~14k | ~50% | — | `is_reusable_idle` + `message_peek` + 一次重试 |
+| `Connection: keep-alive` | ~14k | ~4% | — | 转发显式加 `Connection: keep-alive` |
+| header 解析修复 | ~13k | 0 | ~50% | `pret<0` 返回 400，`headers[128]` |
+| 4xx 来源追踪 | ~6k | 0 | ~50%（实为 plow 用法错误） | `X-Asio-Owen-Status-Source` 日志 |
+| **plow body 修复** | **4,257** | **0** | **0** | `--body=@file` 加 `@` 前缀 |
+
+> plow 的 `--body` 参数如果值是文件路径必须加 `@` 前缀（`--body=@file.json`），否则 body 会是文件名字符串本身导致上游返回 4xx。
+
+### 稳定性
+
+| 检查项 | 结果 |
+|--------|:----:|
+| server 日志 `[error]` | **0** |
+| dmesg 新 crash | **0** |
+| plow 成功率 | **100%** |
+| 压测后服务健康 | **正常** |
+| 压测后内存（非 ASAN，含 proxy 转发） | **~56 MB**（Release stripped，3min 压测 RSS 全程稳定持平） |
+
+## 压测工具用法
+
+### plow POST 请求
+
+```bash
+# 直接指定 body 字符串
+plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/example \
+  -m POST \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"key":"value"}'
+
+# 从文件读取 body（必须加 @ 前缀）
+echo '{"key":"value"}' > /tmp/body.json
+plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/example \
+  -m POST \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  --body=@/tmp/body.json
+```
+
+> **注意：** `--body` 参数如果值是文件路径，必须加 `@` 前缀（`--body=@file.json`），否则 body 内容会是文件名字符串本身，而非文件内容，导致上游解析失败返回 4xx。
+
+### plow GET 请求
+
+```bash
+plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/health
+```
+
+### 常用参数
+
+| 参数 | 说明 |
+|------|------|
+| `--concurrency=N` | 并发连接数 |
+| `--duration=DUR` | 压测时长，如 `30s`、`2m` |
+| `-m METHOD` | HTTP 方法（GET / POST / PUT 等） |
+| `-H 'Key: Value'` | 请求头，可重复 |
+| `-d 'body'` | 请求 body 字符串 |
+| `--body=@file` | 从文件读取 body（必须带 `@`） |
+| `-T 'Content-Type'` | 快捷设置 Content-Type 头 |
