@@ -121,7 +121,7 @@ RSS 记录：
 | **MySQL** | 3,664 KB | 3,244 KB | 2,840 KB |
 | **Combo** | 3,624 KB | 2,844 KB | 2,840 KB |
 
-**结果：三个接口各压 3 分钟，RSS 全部不增反降，无泄漏。** ✅
+**结果：三个接口各压 3 分钟，RSS 全部不增反降，未发现泄漏趋势。** ✅
 
 ### 第六步：Valgrind 完整三接口压测
 
@@ -146,7 +146,7 @@ pkill -15 valgrind
 
 **结果：definitely lost = 0，indirectly lost = 0，possibly lost = 0。** ✅
 
-> 注：Valgrind 下 Redis 因性能过慢（valgrind 约 5-10 倍减速）出现建连超时，但 valgrind 本身报告 0 错误，结合 ASAN 完整覆盖已足够证明无泄漏。
+> 注：Valgrind 下 Redis 因性能过慢（valgrind 约 5-10 倍减速）出现建连超时；结合 Valgrind 确定泄漏为 0、ASAN 未报错和 RSS 稳定，暂无业务代码泄漏证据。
 
 ```bash
 cd build
