@@ -15,6 +15,7 @@
 #include <limits>
 #include <cctype>
 #include <cmath>
+#include <regex>
 #include "../../picohttpparser.h"
 #include "../common/logger.hpp"
 #include "response.hpp"
@@ -22,6 +23,77 @@
 #include "http_pool.hpp"
 #include "upstream_manager.hpp"
 #include "../security/security_rules.hpp"
+
+// Convert JSON body's snake_case keys to camelCase (matching pixiu gateway behavior)
+// Single-pass state machine: O(n) time, builds new string, no memmove.
+// After '{' or ',' the first quoted string is a key (snake_case -> camelCase);
+// all other quoted strings are values (preserved verbatim).
+inline void json_keys_snake_to_camel(std::string& json) {
+    if (json.empty()) return;
+    std::string out;
+    out.reserve(json.size());
+
+    // expect_key: after '{' or ',' the next '"..."' is a key
+    bool expect_key = true;
+    bool in_string = false;
+    bool in_key = false;
+    bool next_upper = false;
+
+    for (size_t i = 0; i < json.size(); ++i) {
+        char c = json[i];
+
+        if (in_string) {
+            if (c == '\\' && i + 1 < json.size()) {
+                out += c;
+                out += json[++i];
+                continue;
+            }
+            if (c == '"') {
+                out += c;
+                in_string = false;
+                if (in_key) {
+                    in_key = false;
+                    expect_key = false;
+                }
+                continue;
+            }
+            if (in_key) {
+                if (c == '_') {
+                    next_upper = true;
+                } else if (next_upper) {
+                    out += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    next_upper = false;
+                } else {
+                    out += c;
+                }
+            } else {
+                out += c;
+            }
+            continue;
+        }
+
+        // not in string
+        if (c == '"') {
+            out += c;
+            in_string = true;
+            in_key = expect_key;
+            next_upper = false;
+            continue;
+        }
+
+        out += c;
+
+        if (c == '{' || c == '[') {
+            expect_key = (c == '{');
+        } else if (c == ':') {
+            expect_key = false;
+        } else if (c == ',') {
+            expect_key = true;
+        }
+    }
+
+    json = std::move(out);
+}
 
 using namespace std::chrono_literals;
 
@@ -384,36 +456,32 @@ private:
         while (true) {
             auto line = co_await consume_line(sock, buffer, timeout);
             if (!line) co_return false;
-            out += *line;
-            out += "\r\n";
 
             auto chunk_size = parse_hex_size_line(*line);
             if (!chunk_size) co_return false;
-            if (*chunk_size > max_body_size || out.size() + *chunk_size + 2 > max_body_size) {
-                co_return false;
-            }
 
             if (*chunk_size == 0) {
+                // Last chunk: consume trailing CRLF and optional trailers, but do NOT add to body.
+                // Trailers (if any) are consumed but discarded — HTTP/1.1 trailers are not forwarded.
                 while (true) {
                     auto trailer = co_await consume_line(sock, buffer, timeout);
                     if (!trailer) co_return false;
-                    out += *trailer;
-                    out += "\r\n";
                     if (trailer->empty()) {
-                        co_return true;
-                    }
-                    if (out.size() > max_body_size) {
-                        co_return false;
+                        co_return true;  // end of trailers
                     }
                 }
             }
 
-            if (!co_await consume_exact(sock, buffer, out, *chunk_size + 2, timeout)) {
+            if (out.size() + *chunk_size > max_body_size) {
                 co_return false;
             }
-            if (out.size() < 2 || out[out.size() - 2] != '\r' || out[out.size() - 1] != '\n') {
+
+            // Read chunk data + trailing CRLF, but only append chunk data to output
+            std::string tmp;
+            if (!co_await consume_exact(sock, buffer, tmp, *chunk_size + 2, timeout)) {
                 co_return false;
             }
+            out.append(tmp.data(), *chunk_size);  // strip trailing CRLF
         }
     }
 
@@ -1041,6 +1109,14 @@ private:
                                     ctx.response_body = std::move(proxy_resp.body);
                                     ctx.response_headers = std::move(proxy_resp.headers);
                                     proxy_response = true;
+
+                                    // Apply pixiu-compatible JSON key conversion (snake_case -> camelCase)
+                                    if (!ctx.response_body.empty()) {
+                                        auto ct = get_header_value(ctx.response_headers, "content-type");
+                                        if (!ct.empty() && ct.find("application/json") != std::string::npos) {
+                                            json_keys_snake_to_camel(ctx.response_body);
+                                        }
+                                    }
 
                                     LOG_DEBUG("Proxy forwarded: method=", method_str,
                                         ", path=", path_str,

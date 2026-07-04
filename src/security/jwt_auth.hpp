@@ -5,8 +5,15 @@
 #include <memory>
 #include <vector>
 #include <cstdint>
+#include <cstring>
+#include <chrono>
 
 #include <jwt-cpp/jwt.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/bn.h>
+#include <openssl/rsa.h>
 #include "../common/logger.hpp"
 
 // JWT verification result
@@ -19,21 +26,107 @@ struct JWTClaims {
     std::string raw_token;
 };
 
+namespace detail {
+
+// Build PEM-encoded RSA public key from JWKS base64url n (modulus) and e (exponent)
+// Returns empty string on failure.
+inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const std::string& e_b64url) {
+    // 1. Base64url decode
+    auto b64url_decode = [](const std::string& in) -> std::vector<unsigned char> {
+        std::string b64 = in;
+        // Replace URL-safe chars
+        for (auto& c : b64) {
+            if (c == '-') c = '+';
+            else if (c == '_') c = '/';
+        }
+        // Add padding
+        while (b64.size() % 4) b64 += '=';
+        
+        auto len = b64.size();
+        auto bio = BIO_new_mem_buf(b64.data(), static_cast<int>(len));
+        if (!bio) return {};
+        auto b64_bio = BIO_new(BIO_f_base64());
+        BIO_push(b64_bio, bio);
+        BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL);
+        
+        std::vector<unsigned char> out(len);
+        int dec_len = BIO_read(b64_bio, out.data(), static_cast<int>(len));
+        BIO_free_all(b64_bio);
+        if (dec_len <= 0) return {};
+        out.resize(dec_len);
+        return out;
+    };
+    
+    auto n_bytes = b64url_decode(n_b64url);
+    auto e_bytes = b64url_decode(e_b64url);
+    if (n_bytes.empty() || e_bytes.empty()) return {};
+    
+    // 2. Build RSA key from n and e
+    auto rsa = RSA_new();
+    if (!rsa) return {};
+    auto n_bn = BN_bin2bn(n_bytes.data(), static_cast<int>(n_bytes.size()), nullptr);
+    auto e_bn = BN_bin2bn(e_bytes.data(), static_cast<int>(e_bytes.size()), nullptr);
+    if (!n_bn || !e_bn) {
+        BN_free(n_bn); BN_free(e_bn); RSA_free(rsa);
+        return {};
+    }
+    if (RSA_set0_key(rsa, n_bn, e_bn, nullptr) != 1) {
+        BN_free(n_bn); BN_free(e_bn); RSA_free(rsa);
+        return {};
+    }
+    
+    // 3. Convert to EVP_PKEY then write PEM
+    auto pkey = EVP_PKEY_new();
+    if (!pkey) { RSA_free(rsa); return {}; }
+    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        EVP_PKEY_free(pkey); RSA_free(rsa);
+        return {};
+    }
+    
+    auto mem_bio = BIO_new(BIO_s_mem());
+    if (!mem_bio) { EVP_PKEY_free(pkey); return {}; }
+    
+    if (PEM_write_bio_PUBKEY(mem_bio, pkey) != 1) {
+        BIO_free(mem_bio); EVP_PKEY_free(pkey);
+        return {};
+    }
+    
+    char* pem_data = nullptr;
+    long pem_len = BIO_get_mem_data(mem_bio, &pem_data);
+    std::string pem(pem_data, static_cast<size_t>(pem_len));
+    
+    BIO_free(mem_bio);
+    EVP_PKEY_free(pkey);  // frees rsa internally
+    return pem;
+}
+
+} // namespace detail
+
 // JWT verifier (using jwt-cpp header-only library)
 // Requires: OpenSSL::SSL + OpenSSL::Crypto
+// Supports: HS256, RS256
 class JWTAuth {
 public:
-    // Currently only supports HS256, validated at construction
-    JWTAuth(std::string secret, std::string issuer, std::string algorithm)
+    JWTAuth(std::string secret, std::string issuer, std::string algorithm,
+            std::string public_key = "")
         : secret_(std::move(secret))
         , issuer_(std::move(issuer))
+        , algorithm_(std::move(algorithm))
+        , public_key_(std::move(public_key))
     {
-        if (algorithm != "HS256") {
-            throw std::runtime_error("JWT: unsupported algorithm " + algorithm
-                + ", only HS256 is supported");
-        }
-        if (secret_.size() < 32) {
-            LOG_WARN("JWT secret is less than 32 bytes, HS256 recommended minimum");
+        if (algorithm_ == "HS256") {
+            if (secret_.size() < 32) {
+                LOG_WARN("JWT secret is less than 32 bytes, HS256 recommended minimum");
+            }
+        } else if (algorithm_ == "RS256") {
+            if (public_key_.empty()) {
+                throw std::runtime_error("JWT: RS256 requires jwt_public_key");
+            }
+            // Pre-load EVP_PKEY to catch bad PEM at construction time
+            load_rsa_key();
+        } else {
+            throw std::runtime_error("JWT: unsupported algorithm " + algorithm_
+                + ", supported: HS256, RS256");
         }
     }
 
@@ -60,6 +153,24 @@ public:
 private:
     std::string secret_;
     std::string issuer_;
+    std::string algorithm_;
+    std::string public_key_;
+    struct EVP_PKEY_Deleter { void operator()(EVP_PKEY* p) const { EVP_PKEY_free(p); } };
+    std::unique_ptr<EVP_PKEY, EVP_PKEY_Deleter> pkey_;
+
+    // Load RSA public key from PEM string at construction time
+    void load_rsa_key() {
+        auto bio = BIO_new_mem_buf(public_key_.data(), static_cast<int>(public_key_.size()));
+        if (!bio) {
+            throw std::runtime_error("JWT: failed to create BIO for RSA public key");
+        }
+        EVP_PKEY* raw = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+        if (!raw) {
+            throw std::runtime_error("JWT: failed to parse RSA public key PEM");
+        }
+        pkey_.reset(raw);
+    }
 
     // Extract token from "Authorization: Bearer <token>"
     static std::optional<std::string> extract_token(const std::string& auth_header) {
@@ -93,17 +204,59 @@ private:
         return token;
     }
 
+    // Verify RS256 signature using pre-loaded pkey_ (bypasses jwt-cpp PEM parsing)
+    // This works around a macOS OpenSSL 3.x issue where BIO_write + PEM_read_bio_PUBKEY fails.
+    static bool verify_rs256(const std::string& data, const std::string& signature, EVP_PKEY* pkey) {
+        auto ctx = EVP_MD_CTX_new();
+        if (!ctx) return false;
+        bool ok = false;
+        if (EVP_VerifyInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+            EVP_VerifyUpdate(ctx, data.data(), data.size()) == 1 &&
+            EVP_VerifyFinal(ctx, reinterpret_cast<const unsigned char*>(signature.data()),
+                           static_cast<unsigned int>(signature.size()), pkey) == 1) {
+            ok = true;
+        }
+        EVP_MD_CTX_free(ctx);
+        return ok;
+    }
+
     // Actual JWT verification via jwt-cpp
     std::optional<JWTClaims> do_verify(const std::string& token) const {
         auto decoded = jwt::decode(token);
 
-        // Explicit algorithm verification (only HS256, rejecting alg: none attacks)
-        auto verifier = jwt::verify()
-            .allow_algorithm(jwt::algorithm::hs256{secret_})
-            .with_issuer(issuer_)
-            .leeway(60);  // +/-60s clock skew tolerance
-
-        verifier.verify(decoded);
+        if (algorithm_ == "HS256") {
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{secret_})
+                .with_issuer(issuer_)
+                .leeway(60);
+            verifier.verify(decoded);
+        } else if (algorithm_ == "RS256") {
+            // Manually verify RS256 signature using pre-loaded pkey_
+            // This bypasses jwt-cpp's PEM loading which fails on macOS OpenSSL 3.x.
+            auto header_b64 = decoded.get_header_base64();
+            auto payload_b64 = decoded.get_payload_base64();
+            auto sig = decoded.get_signature();
+            auto msg = header_b64 + "." + payload_b64;
+            if (!verify_rs256(msg, sig, pkey_.get())) {
+                throw std::runtime_error("failed to verify signature");
+            }
+            // Check issuer and expiration manually (bypass jwt-cpp's algorithm registry)
+            auto algo = decoded.get_algorithm();
+            if (algo != "RS256") {
+                throw std::runtime_error("wrong algorithm: expected RS256, got " + algo);
+            }
+            auto iss = decoded.get_issuer();
+            if (iss != issuer_) {
+                throw std::runtime_error("wrong issuer: expected " + issuer_ + ", got " + iss);
+            }
+            if (decoded.has_expires_at()) {
+                auto exp = decoded.get_expires_at();
+                auto now = std::chrono::system_clock::now();
+                if (now > exp + std::chrono::seconds(60)) {
+                    throw std::runtime_error("token expired");
+                }
+            }
+        }
 
         // extract claims
         JWTClaims claims;

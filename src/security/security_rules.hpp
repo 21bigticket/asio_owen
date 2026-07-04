@@ -3,6 +3,8 @@
 #include <memory>
 #include <atomic>
 #include <functional>
+#include <fstream>
+#include <sstream>
 #include <asio.hpp>
 
 #include "../common/config.hpp"
@@ -59,8 +61,38 @@ public:
             auto secret = cfg.get("security", "jwt_secret", "");
             auto issuer = cfg.get("security", "jwt_issuer", "asio_owen");
             auto algorithm = cfg.get("security", "jwt_algorithm", "HS256");
+            auto pub_key = cfg.get("security", "jwt_public_key", "");
+            // Try to load public key from file if it's not already a PEM string
+            if (!pub_key.empty() && pub_key.find("-----BEGIN") == std::string::npos) {
+                std::ifstream key_file(pub_key);
+                if (key_file.is_open()) {
+                    std::stringstream buf;
+                    buf << key_file.rdbuf();
+                    auto loaded = buf.str();
+                    if (loaded.find("-----BEGIN") != std::string::npos) {
+                        pub_key = loaded;
+                    }
+                } else {
+                    LOG_WARN("JWT public key file not found: ", pub_key);
+                    pub_key.clear();
+                }
+            }
+            if (pub_key.empty() && algorithm == "RS256") {
+                // RS256 without explicit pub_key: build from JWKS n/e params
+                auto n = cfg.get("security", "jwt_rsa_n", "");
+                auto e = cfg.get("security", "jwt_rsa_e", "");
+                if (!n.empty() && !e.empty()) {
+                    pub_key = detail::build_rsa_pubkey_from_jwks(n, e);
+                    if (pub_key.empty()) {
+                        LOG_WARN("JWT: failed to build RSA public key from jwks params");
+                    } else {
+                        LOG_INFO("JWT: built RSA public key from jwks params, len=", pub_key.size());
+                        LOG_DEBUG("JWT PEM:\n", pub_key);
+                    }
+                }
+            }
             if (!secret.empty()) {
-                jwt_auth_ = std::make_shared<JWTAuth>(secret, issuer, algorithm);
+                jwt_auth_ = std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
             } else {
                 jwt_auth_.reset();
                 LOG_WARN("JWT secret not configured, JWT verification disabled");

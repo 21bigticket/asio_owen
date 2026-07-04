@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <tuple>
 #include <fstream>
 #include "logger.hpp"
 
@@ -31,6 +32,8 @@ public:
             std::string val = line.substr(eq + 1);
             trim(key); trim(val);
             data_[section + "." + key] = val;
+            // Preserve all entries with duplicate keys for list sections
+            raw_entries_.emplace_back(section, key, val);
         }
         return true;
     }
@@ -63,26 +66,24 @@ public:
         }
     }
 
-    // Get all key-value pairs in a section
+    // Get all key-value pairs in a section (preserves insertion order, allows duplicate keys)
     std::vector<std::pair<std::string, std::string>> get_section(const std::string& section) const {
         std::vector<std::pair<std::string, std::string>> result;
-        auto prefix = section + ".";
-        for (auto& [k, v] : data_) {
-            if (k.find(prefix) == 0) {
-                result.emplace_back(k.substr(prefix.size()), v);
+        for (auto& [sec, key, val] : raw_entries_) {
+            if (sec == section) {
+                result.emplace_back(key, val);
             }
         }
         return result;
     }
 
     // Get all values in a section (ignore keys, return values only)
-    // Used for sections like [ip_blacklist] ip = 1.2.3.4
+    // Preserves insertion order and allows duplicate keys.
     std::vector<std::string> get_list(const std::string& section) const {
         std::vector<std::string> result;
-        auto prefix = section + ".";
-        for (auto& [k, v] : data_) {
-            if (k.find(prefix) == 0 && !v.empty()) {
-                result.push_back(v);
+        for (auto& [sec, key, val] : raw_entries_) {
+            if (sec == section && !val.empty()) {
+                result.push_back(val);
             }
         }
         return result;
@@ -103,6 +104,8 @@ public:
 
 private:
     std::unordered_map<std::string, std::string> data_;
+    // Ordered entries preserving duplicates and insertion order
+    std::vector<std::tuple<std::string, std::string, std::string>> raw_entries_;
 
     static void trim(std::string& s) {
         while (!s.empty() && std::isspace(s.front())) s.erase(s.begin());
