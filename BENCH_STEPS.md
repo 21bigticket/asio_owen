@@ -113,12 +113,16 @@ grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/serve
 
 ## 步骤 5：Config 网关转发
 
+> ⚠️ Config 网关需要 JWT 鉴权。如果网关启用了 JWT，`Authorization: Bearer` 头是必需的。
+
 ```bash
 BODY='{"appid":"member_03150715","config_key":"black_list"}'
+TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJleHAiOjE3NzQzNTk5MzUsImlhdCI6MTc3NDEwMDczNSwiaXNzIjoicGl4aXUtZ2F0ZXdheSIsImp0aSI6IjE3NzQxMDA3MzU0Mzc1NTk2Njc5MyIsIm5hbWUiOiJsayIsIm5iZiI6MTc3NDEwMDczNSwic3ViIjoiMSIsInR5cGUiOiJhY2Nlc3MiLCJ1c2VyX2lkIjoxLCJ1c2VyX25hbWUiOiJsayJ9.tPX71KD2fMWTYo6CAPl7gTQDzcq03VOEZZqTJ_p2uEPzRcOdZX0QeaGLtfkA7EqZtRrXSVxhfJxNTDtVjKM-yI9Sf3FXpsUcMSgE5x_3Nem0gajsqGOaHerWcJmDaefJQHJDOjEEWIkhG5dqqHtm9QRcWNqkmmEka7diOEPBnYFrrXHBw4uw3hvjg0V8_k1-fYktpKEUNvL3bFVjdgORUUnWlJsO_rq5WmgZ0eEoadhS85ReUc9XMe9DhmwNztOvmws2Jmu_NcPReJbiL77b64nEO9C8R5PnI0JNtfzw5W0IfEjY_0XbS0XObGrKQDqfG1GiL59aWH09T2N07H0ZUg'
 
 echo "=== Config Via Gateway #1 ==="
 /root/go/bin/plow -c 100 -d 30s -m POST \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -b "$BODY" \
   http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
 sleep 15
@@ -126,6 +130,7 @@ sleep 15
 echo "=== Config Via Gateway #2 ==="
 /root/go/bin/plow -c 100 -d 30s -m POST \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -b "$BODY" \
   http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
 
@@ -136,6 +141,9 @@ grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/serve
 ---
 
 ## 步骤 6：ASAN 内存检查压测
+
+> ⚠️ 以下命令需在 **Linux 测试机** 执行（macOS 无 `/proc`）。
+> Config 网关需要 JWT 鉴权头。
 
 ```bash
 # 编译
@@ -148,48 +156,52 @@ CXX=g++ CC=gcc cmake -B build_asan -S . -Wno-dev \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
 cmake --build build_asan --target server -j$(nproc)
 
-# 启动
-pgrep -x server | xargs kill -9 2>/dev/null
-sleep 2
+# 启动（保留 stderr 给 LSAN）
+# 注意：不能用 > /dev/null 2>&1，否则 LSAN 报告丢失
 cd build_asan
 rm -f server.log
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server > /tmp/asan_stdout.log 2>&1 &
-sleep 3
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server &
+ASAN_PID=$!
+sleep 4
 curl -s http://127.0.0.1:8081/api/health
 
 # 记录初始 RSS
-PID=$(pgrep -x server)
-grep VmRSS /proc/$PID/status
+grep VmRSS /proc/$ASAN_PID/status
 
 # 分阶段压测（每个 3min，间隔 15s 观察 RSS）
 echo "=== Phase 1: Health 3min ==="
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/health 2>&1 | tail -3
-grep VmRSS /proc/$PID/status
+grep VmRSS /proc/$ASAN_PID/status
 sleep 15
 
 echo "=== Phase 2: Redis 3min ==="
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/redis 2>&1 | tail -3
-grep VmRSS /proc/$PID/status
+grep VmRSS /proc/$ASAN_PID/status
 sleep 15
 
 echo "=== Phase 3: MySQL 3min ==="
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/mysql 2>&1 | tail -3
-grep VmRSS /proc/$PID/status
+grep VmRSS /proc/$ASAN_PID/status
 sleep 15
 
 echo "=== Phase 4: Config Gateway 3min ==="
+TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJleHAiOjE3NzQzNTk5MzUsImlhdCI6MTc3NDEwMDczNSwiaXNzIjoicGl4aXUtZ2F0ZXdheSIsImp0aSI6IjE3NzQxMDA3MzU0Mzc1NTk2Njc5MyIsIm5hbWUiOiJsayIsIm5iZiI6MTc3NDEwMDczNSwic3ViIjoiMSIsInR5cGUiOiJhY2Nlc3MiLCJ1c2VyX2lkIjoxLCJ1c2VyX25hbWUiOiJsayJ9.tPX71KD2fMWTYo6CAPl7gTQDzcq03VOEZZqTJ_p2uEPzRcOdZX0QeaGLtfkA7EqZtRrXSVxhfJxNTDtVjKM-yI9Sf3FXpsUcMSgE5x_3Nem0gajsqGOaHerWcJmDaefJQHJDOjEEWIkhG5dqqHtm9QRcWNqkmmEka7diOEPBnYFrrXHBw4uw3hvjg0V8_k1-fYktpKEUNvL3bFVjdgORUUnWlJsO_rq5WmgZ0eEoadhS85ReUc9XMe9DhmwNztOvmws2Jmu_NcPReJbiL77b64nEO9C8R5PnI0JNtfzw5W0IfEjY_0XbS0XObGrKQDqfG1GiL59aWH09T2N07H0ZUg'
 BODY='{"appid":"member_03150715","config_key":"black_list"}'
 /root/go/bin/plow -c 100 -d 180s -m POST \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -b "$BODY" \
   http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | tail -3
-grep VmRSS /proc/$PID/status
+grep VmRSS /proc/$ASAN_PID/status
 
 # 正常退出（SIGTERM 触发 LSAN 检测）
-kill -TERM $PID
-wait $PID 2>/dev/null
-echo "=== ASAN done. Check stderr for leak report ==="
+kill -TERM $ASAN_PID
+wait $ASAN_PID 2>/dev/null
+# LSAN 报告打印在 stderr 上（直接在当前终端输出）
+echo "=== ASAN done ==="
 ```
+
+> **v3.5 实际执行结果：** RSS 全程 3.6→2.7 KB，无增长趋势。Config Gateway 需要 JWT Token，已在脚本中硬编码。见 MEM_CHECK.md 详细记录。
 
 ---
 
@@ -218,7 +230,32 @@ echo "=== ASAN done. Check stderr for leak report ==="
 
 | 陷阱 | 说明 |
 |:----|:------|
-| ❌ `pkill -9 server` | 会误杀 `redis-server`，改用 `pgrep -x server \| xargs kill -9` |
+| ❌ `pkill -9 server` | 会误杀 `redis-server` + `zebra-config`（Go 二进制也叫 server），改用 `pgrep -x server \| xargs kill -9` |
 | ❌ `-b @/tmp/file.json` | plow 不支持 `-b @file` 语法，发的是文件名本身，上游返回 404 |
 | ❌ `-d '{"key":"val"}'` | `-d` 是 duration 不是 body，body 用 `-b` |
 | ❌ 旧 server 未完全退出就启动 | 新版 bind 失败，`sleep 2` 等端口释放 |
+| ❌ Config 网关缺少 JWT 头 | 网关启用 JWT 鉴权后，缺少 `Authorization: Bearer` 会返回 401/403 |
+| ❌ ASAN 版本 LSAN 报告被 `2>&1` 吞掉 | 不要用 `./server > /dev/null 2>&1`，LSAN 报告在 stderr；或用 `ASAN_OPTIONS=log_path=/tmp/asan_log` |
+
+## v3.5 已验证的结果记录
+
+### 常规压测（30s × 2，100 并发）
+
+| 接口 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
+|:----|:------:|:------:|:--------:|:------:|
+| Health | 75,131 | 74,829 | **74,980** | 100% |
+| Redis | 22,685 | 22,511 | **22,598** | 100% |
+| MySQL | 7,708 | 7,688 | **7,698** | 100% |
+| Config 直连 | 6,199 | 6,167 | **6,183** | 100% |
+| Config 网关 | 5,492 | 5,776 | **5,634** | 100% |
+
+### ASAN RSS 记录（每阶段 3min）
+
+| 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 |
+|:----|:------------:|:------------:|:----:|
+| Health 3min | 3,668 KB | 2,772 KB | -24% |
+| Redis 3min | 3,704 KB | 2,612 KB | -30% |
+| MySQL 3min | 3,744 KB | 2,728 KB | -27% |
+| Config 3min | 3,668 KB | 2,736 KB | -25% |
+
+> 结论：全部 2xx，无泄漏趋势，RSS 不增反降。

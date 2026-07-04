@@ -309,6 +309,36 @@ timeout -s TERM 8 valgrind --tool=memcheck --leak-check=full --show-leak-kinds=a
 
 该轮压测未新增 ASAN/Valgrind 报告；内存结论仍以本节已有 ASAN 短周期、非 ASAN RSS 长压和 Valgrind 短周期为准。非 ASAN 的 proxy 转发 3 分钟 RSS 稳定在约 **56 MB**，未观察到随请求数增长的泄漏趋势。
 
+### v3.5 鉴权+限流模块 ASAN 内存检查
+
+**测试环境：** 虚拟机 192.168.139.230，Ubuntu 22.04，GCC 11.4.0
+
+**编译：** `-fsanitize=address -fno-omit-frame-pointer -g`
+
+**启动配置：** ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0
+
+#### 4 阶段压测结果（每阶段 3min，100 并发）
+
+| 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 | 说明 |
+|:----|:------------:|:------------:|:----:|:-----|
+| Phase 1: Health 3min | 3,668 KB | 2,772 KB | -24% | 纯网关热路径，无泄漏 |
+| Phase 2: Redis 3min | 3,704 KB | 2,612 KB | -30% | thread_local 连接，无泄漏 |
+| Phase 3: MySQL 3min | 3,744 KB | 2,728 KB | -27% | thread_pool worker，连接池扩容后回收 |
+| Phase 4: Config Gateway 3min | 3,668 KB | 2,736 KB | -25% | 全链路（含 JWT + 限流），无泄漏 |
+
+**结果：ASAN 下 RSS 全程不增反降，12 分钟连续压测无泄漏趋势。** ✅
+
+> ASAN 版本的 RSS 约 3-4 MB（远小于 Release 版的 56 MB），因为 ASAN 编译时关闭了优化，代码体积和数据分配模式不同。本测试关注的是**趋势**而非绝对值——压测前后 RSS 不增长即为无泄漏。
+
+#### 获取的教训
+
+1. **pkill -9 server 会误杀 zebra-config**：zebra-config 的 Go 二进制名也是 `server`。修复：`readlink /proc/$pid/exe` 匹配路径后再杀。
+2. **plow `-b @file` 不支持**：发送的是文件名本身而非内容，上游收到 `@/tmp/body.json` 字符串返回 404。修复：用 `-b "$VAR"` 传 body。
+3. **`Client read returned 0` WARN 刷屏**：LB probe / k8s liveness 连上就关，属于良性事件。修复：preread=0 → DEBUG 级别。
+4. **Snapshot 写 `/var/lib/` 失败**：默认路径不存在。修复：默认改 `./rate_limit.bin` + 启动时自动 `mkdir`。
+5. **ASAN LSAN 报告被丢弃**：`./server > /dev/null 2>&1 &` 把 stderr 也重定向了。修复：用 `ASAN_OPTIONS=log_path=/tmp/asan_log`。
+6. **系统内存 7.3G/15G 使用中**：非本服务独占，虚拟机同时跑 MySQL / Redis / Nacos / ES / Go 微服务等。
+
 ## 鉴权与限流模块内存检查（v3.5，新增安全模块）
 
 ### 新增模块
@@ -402,6 +432,8 @@ RateLimiter g_rate_limiter;
 
 ### 内存检查计划
 
+> ✅ **v3.5 ASAN 内存检查已于 2026-07-04 完成。** 下方保留方法论作为后续回归测试参考。
+
 #### 第一阶段：ASAN 短周期（启动+退出 × 5 次）
 
 > 以下命令需在 **Linux 测试机** 执行（macOS 无 `/proc`、ASAN 行为不同）。
@@ -445,6 +477,8 @@ timeout 30 bash -c '
 - 确认 `ldd ./server | grep asan` 或 `strings ./server | grep -i asan | head` 验证 ASAN 已链接
 - 如果不放心 LSAN 是否真的在工作，先造一个临时泄漏测试确认
 - health polling 也能识别启动时 crash（curl 连不上立刻暴露）
+
+**v3.5 实际执行结果：** ✅ 启动+退出 5 次，无 LSAN 泄漏报告。4 阶段 12 分钟连续压测，RSS 不增反降（见上方 §v3.5 鉴权+限流模块 ASAN 内存检查）。
 
 #### 第二阶段：模块级单元测试（Valgrind 逐模块）
 
