@@ -16,6 +16,7 @@
 #include "db/redis_pool.hpp"
 #include "http/http_server.hpp"
 #include "http/response.hpp"
+#include "security/security_rules.hpp"
 
 using namespace std::chrono_literals;
 
@@ -23,8 +24,11 @@ std::unique_ptr<MysqlPool> g_mysql;
 std::unique_ptr<RedisPool> g_redis;
 std::unique_ptr<HttpServer> g_server;
 std::unique_ptr<asio::steady_timer> g_drain_timer;
+std::unique_ptr<SecurityRules> g_security_rules;
+std::unique_ptr<asio::steady_timer> g_reload_timer;
 
 void cleanup_runtime_objects() {
+    g_reload_timer.reset();
     if (g_server) {
         g_server->stop();
     }
@@ -39,9 +43,10 @@ void cleanup_runtime_objects() {
     g_redis.reset();
     g_mysql.reset();
     g_drain_timer.reset();
+    g_security_rules.reset();
 }
 
-// 查询 MySQL — worker 线程直接拼好 JSON 返回
+// MySQL query — worker thread builds JSON directly
 asio::awaitable<void> api_mysql(HttpContext& ctx) {
     auto res = co_await g_mysql->execute("SELECT * FROM sys_dict_type LIMIT 20");
     ctx.response_headers.emplace_back("Content-Type", "application/json");
@@ -54,7 +59,7 @@ asio::awaitable<void> api_mysql(HttpContext& ctx) {
     }
 }
 
-// 查询 Redis — 单 GET 命令吞吐
+// Redis query — single GET command throughput
 asio::awaitable<void> api_redis(HttpContext& ctx) {
     try {
         auto g = co_await g_redis->get("demo_key");
@@ -72,7 +77,7 @@ asio::awaitable<void> api_redis(HttpContext& ctx) {
     }
 }
 
-// 组合查询：Redis 缓存 + MySQL 兜底 + 超时
+// Combo query: Redis cache + MySQL fallback + timeout
 asio::awaitable<void> api_combo(HttpContext& ctx) {
     auto redis_resp = co_await g_redis->cmd("GET cache:user:1");
     std::string redis_ret = redis_resp.ok ? redis_resp.str : "";
@@ -103,7 +108,7 @@ asio::awaitable<void> api_combo(HttpContext& ctx) {
     ctx.response_body = resp_ok_str(data);
 }
 
-// 健康检查
+// Health check
 asio::awaitable<void> api_health(HttpContext& ctx) {
     ctx.response_headers.emplace_back("Content-Type", "application/json");
     ctx.status_code = 200;
@@ -163,16 +168,58 @@ int main(int argc, char* argv[]) {
             int port = cfg.get_int("server", "port", 8080);
             g_server = std::make_unique<HttpServer>(ioc, port);
 
-            // 注册本地路由
+            // initialize security rules
+            g_security_rules = std::make_unique<SecurityRules>();
+            g_security_rules->load_from_config(cfg);
+            g_server->set_security_rules(g_security_rules.get());
+
+            // security rules hot-reload timer (shared_ptr wraps self-reference to avoid dangling)
+            int reload_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
+            if (reload_sec > 0) {
+                g_reload_timer = std::make_unique<asio::steady_timer>(ioc);
+                auto schedule_reload = std::make_shared<std::function<void()>>();
+                *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), reload_sec]() {
+                    timer->expires_after(std::chrono::seconds(reload_sec));
+                    timer->async_wait([this_reload](std::error_code ec) {
+                        if (ec) return;
+                        Config new_cfg;
+                        if (new_cfg.load("config.ini") && g_security_rules) {
+                            g_security_rules->reload(new_cfg);
+                        }
+                        if (*this_reload) (*this_reload)();
+                    });
+                };
+                (*schedule_reload)();
+            }
+
+            // rate limit snapshot persist timer (shared_ptr wraps self-reference)
+            int snapshot_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
+            if (snapshot_sec > 0 && g_security_rules->has_rate_limiter()) {
+                auto snap_timer = std::make_shared<asio::steady_timer>(ioc);
+                auto schedule_snapshot = std::make_shared<std::function<void()>>();
+                *schedule_snapshot = [this_snap = schedule_snapshot, snap_timer, snapshot_sec]() {
+                    snap_timer->expires_after(std::chrono::seconds(snapshot_sec));
+                    snap_timer->async_wait([this_snap](std::error_code ec) {
+                        if (ec) return;
+                        if (g_security_rules && g_security_rules->has_rate_limiter()) {
+                            g_security_rules->rate_limiter().persist_snapshot();
+                        }
+                        if (*this_snap) (*this_snap)();
+                    });
+                };
+                (*schedule_snapshot)();
+            }
+
+            // register local routes
             g_server->route("/api/health", api_health);
             g_server->route("/api/build", api_build);
             g_server->route("/api/redis", api_redis);
             g_server->route("/api/mysql", api_mysql);
             g_server->route("/api/combo", api_combo);
 
-            // 注册代理路由：从 [upstream] 配置段读取
-            // 格式：服务名 = host:port
-            // 示例：config = 127.0.0.1:30001
+            // register proxy routes: read from [upstream] config section
+            // format: service_name = host:port
+            // example: config = 127.0.0.1:30001
             HttpPool::Config http_pool_cfg{
                 .max_size = (size_t)std::max(1, cfg.get_int("http_pool", "max_size", 256)),
                 .max_concurrent = (size_t)std::max(0, cfg.get_int("http_pool", "max_concurrent", 0)),
@@ -200,7 +247,7 @@ int main(int argc, char* argv[]) {
                 if (stop_requested.exchange(true)) return;
                 LOG_INFO("Graceful shutdown requested...");
                 if (g_server) g_server->stop();
-                // 5 秒后强制退出（给 in-flight 请求 drain 时间）
+                // 5 second drain timeout for in-flight requests
                 g_drain_timer = std::make_unique<asio::steady_timer>(ioc);
                 g_drain_timer->expires_after(std::chrono::seconds(5));
                 g_drain_timer->async_wait([&](std::error_code ec) {
@@ -210,7 +257,7 @@ int main(int argc, char* argv[]) {
                 });
             });
 
-            // 多线程运行 io_context，提升并发处理能力
+            // multi-thread io_context for higher concurrency
             std::vector<std::thread> threads;
             unsigned int thread_count = std::thread::hardware_concurrency();
             if (thread_count == 0) thread_count = 4;

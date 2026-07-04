@@ -10,15 +10,15 @@
 #include <vector>
 #include "../common/logger.hpp"
 
-// MySQL 连接池 v3.3：共享互斥池 + 独立 maintain 线程
+// MySQL connection pool v3.3: shared mutex pool + dedicated maintain thread
 //
-// 核心设计：
-//   - idle_pool_ (deque<IdleConn>) — 队首最老，队尾最新
-//   - creating_ — 同一时刻至多 1 个建连（防 thundering herd）
-//   - total_ — 当前总连接数（含 idle + 正在使用的）
-//   - max_idle_sec — 按时间回收，不按数量
-//   - maintain 独立线程 — 不阻塞 io_context
-//   - SQL 用 char[4096] 栈数组跨 asio::post 边界（防 double free）
+// Core design:
+//   - idle_pool_ (deque<IdleConn>) — front is oldest, back is newest
+//   - creating_ — at most 1 concurrent connect (prevents thundering herd)
+//   - total_ — current total connections (idle + in-use)
+//   - max_idle_sec — time-based reclamation, not count-based
+//   - maintain runs on its own thread — does not block io_context
+//   - SQL uses char[4096] stack buffer across asio::post boundary (prevents double free)
 
 class MysqlPool {
 public:
@@ -34,7 +34,7 @@ public:
         int connect_timeout_ms = 1000;
         int read_timeout_ms = 500;
         int keepalive_sec = 30;
-        size_t worker_threads = 32;  // SQL worker 线程数，mysql_query 是同步阻塞 IO，建议 > CPU 核数
+        size_t worker_threads = 32;  // SQL worker threads, mysql_query is synchronous blocking IO, recommended > CPU cores
     };
 
     struct Result {
@@ -45,12 +45,12 @@ public:
 
     MysqlPool(asio::io_context& ioc, Config cfg)
         : ioc_(ioc), cfg_(std::move(cfg)), running_(true),
-          worker_pool_(cfg_.worker_threads)  // SQL worker 线程数，独立于连接池大小
+          worker_pool_(cfg_.worker_threads)  // SQL worker threads, independent of pool size
     {
         LOG_INFO("MySQL pool initializing, host=", cfg_.host, ":", cfg_.port,
                  ", min=", cfg_.min_size, ", max=", cfg_.max_size);
 
-        // 启动时预创建 min_size 个连接（锁外建连，1s 超时）
+        // pre-create min_size connections at startup (outside lock, 1s timeout)
         size_t created = 0;
         for (size_t i = 0; i < cfg_.min_size; ++i) {
             auto conn = create_connection_with_timeout();
@@ -63,7 +63,7 @@ public:
         }
         LOG_INFO("MySQL pool pre-created ", created, " connections");
 
-        // 启动独立 maintain 线程
+        // start dedicated maintain thread
         maintain_thread_ = std::thread(&MysqlPool::maintain_loop, this);
         LOG_INFO("MySQL pool started, total=", total_, ", idle=", idle_pool_.size());
     }
@@ -74,14 +74,14 @@ public:
         if (!running_.exchange(false)) return;
         cv_.notify_all();
 
-        // 等待 SQL worker 完成
+        // wait for SQL workers to finish
         worker_pool_.join();
 
-        // 等待 maintain 线程退出
+        // wait for maintain thread to exit
         if (maintain_thread_.joinable())
             maintain_thread_.join();
 
-        // 关闭所有空闲连接
+        // close all idle connections
         {
             std::lock_guard lock(mtx_);
             while (!idle_pool_.empty()) {
@@ -94,7 +94,7 @@ public:
     }
 
     asio::awaitable<Result> execute(const std::string& sql) {
-        // 将 SQL 拷贝到栈数组，避免 std::string 跨线程
+        // copy SQL to stack buffer to avoid std::string across threads
         char sql_buf[4096];
         size_t len = sql.size();
         if (len > sizeof(sql_buf) - 1) len = sizeof(sql_buf) - 1;
@@ -123,7 +123,7 @@ private:
             std::string err = mysql_error(conn);
             LOG_WARN("MySQL query failed: ", err);
             mysql_close(conn);
-            // 连接已关闭，通知池减少计数
+            // connection closed, notify pool to decrement count
             {
                 std::lock_guard lock(mtx_);
                 --total_;
@@ -168,7 +168,7 @@ private:
         return {true, "", std::move(json)};
     }
 
-    // --- acquire: 迭代重试（最多 2 次），防递归死循环 ---
+    // --- acquire: iterative retry (max 2), prevents recursive deadlock ---
     MYSQL* acquire() {
         int retries = 2;
         for (int retry = 0; retry < retries; ++retry) {
@@ -194,7 +194,7 @@ private:
                 }
             }
 
-            // 锁外建连
+            // create connection outside lock
             MYSQL* conn = create_connection_with_timeout();
 
             {
@@ -208,7 +208,7 @@ private:
                 }
             }
 
-            // 新建连接需要会话重置（回滚可能残留的事务）
+            // new connection needs session reset (rollback any pending transactions)
             if (mysql_reset_connection(conn) != 0) {
                 LOG_WARN("acquire: mysql_reset_connection failed: ", mysql_error(conn));
                 mysql_close(conn);
@@ -227,7 +227,7 @@ private:
         return nullptr;
     }
 
-    // --- release: 标记时间戳后归还 idle 池 ---
+    // --- release: timestamp then return to idle pool ---
     void release(MYSQL* conn) {
         if (!conn) return;
         std::lock_guard lock(mtx_);
@@ -235,11 +235,11 @@ private:
         cv_.notify_one();
     }
 
-    // --- maintain 独立线程 ---
+    // --- dedicated maintain thread ---
     void maintain_loop() {
         LOG_INFO("MySQL maintain thread started");
         while (running_) {
-            // 用 cv_.wait_for 替代 sleep_for，shutdown 时通过 cv_.notify_all 立即唤醒
+            // use cv_.wait_for instead of sleep_for, shutdown triggers immediate wake via cv_.notify_all
             {
                 std::unique_lock lock(mtx_);
                 cv_.wait_for(lock, std::chrono::seconds(cfg_.keepalive_sec), [&]() { return !running_; });
@@ -253,7 +253,7 @@ private:
     void do_maintain() {
         auto now = std::chrono::steady_clock::now();
 
-        // ---- 第一阶段：回收超时空闲连接（锁外 close） ----
+        // ---- Phase 1: Reclaim stale idle connections (close outside lock) ----
         std::vector<MYSQL*> to_close;
         {
             std::lock_guard lock(mtx_);
@@ -276,14 +276,14 @@ private:
 
         if (!running_) return;
 
-        // ---- 第二阶段：补充到 min_size（锁外建连） ----
+        // ---- Phase 2: Refill to min_size (create outside lock) ----
         size_t need = 0;
         {
             std::lock_guard lock(mtx_);
             if (idle_pool_.size() < cfg_.min_size) {
                 size_t headroom = (total_ > cfg_.max_size) ? 0 : cfg_.max_size - total_;
                 need = std::min(cfg_.min_size - idle_pool_.size(), headroom);
-                total_ += need;  // 预订 slot，防止 worker 在此期间超额建连
+                total_ += need;  // reserve slots, preventing worker from over-creating concurrently
             }
         }
         std::vector<MYSQL*> new_conns;
@@ -296,7 +296,7 @@ private:
                 ++created;
             }
         }
-        // 回滚未成功创建的 slot
+        // rollback unused slots
         {
             std::lock_guard lock(mtx_);
             size_t unused = need - created;
@@ -314,7 +314,7 @@ private:
 
         if (!running_) return;
 
-        // ---- 第三阶段：空闲连接健康检查（可选，仅取最旧 max_check 个） ----
+        // ---- Phase 3: Idle connection health check (optional, check oldest max_check connections) ----
         const size_t max_check = 4;
         std::vector<IdleConn> to_check;
         {
@@ -337,7 +337,7 @@ private:
                 idle_pool_.push_back({to_check[checked].conn, std::chrono::steady_clock::now()});
             }
         }
-        // shutdown 后关闭尚未处理的残留连接
+        // after shutdown, close any remaining unchecked connections
         if (!running_) {
             for (size_t i = checked; i < to_check.size(); ++i) {
                 mysql_close(to_check[i].conn);
@@ -351,14 +351,14 @@ private:
             LOG_INFO("maintain: ping check removed ", dead_count, " dead connections");
         }
 
-        // 水位快照
+        // pool status snapshot
         {
             std::lock_guard lock(mtx_);
             LOG_INFO("maintain: pool status total=", total_, ", idle=", idle_pool_.size());
         }
     }
 
-    // --- 建连（带超时）---
+    // --- Create connection (with timeout) ---
     MYSQL* create_connection_with_timeout() {
         MYSQL* conn = mysql_init(nullptr);
         if (!conn) {
@@ -366,14 +366,14 @@ private:
             return nullptr;
         }
 
-        // 建连超时
+        // connect timeout
         unsigned int timeout_sec = cfg_.connect_timeout_ms / 1000;
         if (timeout_sec < 1) timeout_sec = 1;
         mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_sec);
 
-        // 注意：建连阶段不设 MYSQL_OPT_READ_TIMEOUT。
-        // read_timeout 只由 mysql_ping_with_timeout 在 ping 路径上临时设，
-        // 且 ping 结束后恢复，避免影响后续 mysql_query 的默认无超时行为。
+        // note: MYSQL_OPT_READ_TIMEOUT is NOT set during connect.
+        // read_timeout is only set temporarily by mysql_ping_with_timeout
+        // during ping, then restored to avoid affecting subsequent mysql_query.
 
         if (!mysql_real_connect(conn, cfg_.host.c_str(), cfg_.user.c_str(),
                 cfg_.pass.c_str(), cfg_.db.c_str(), cfg_.port, nullptr, 0)) {
@@ -384,17 +384,16 @@ private:
         return conn;
     }
 
-    // --- ping（设 read_timeout，ping 后恢复为 0 不限制）---
+    // --- Ping (set read_timeout, restore to 0 after ping) ---
     int mysql_ping_with_timeout(MYSQL* conn) {
-        // MYSQL_OPT_READ_TIMEOUT 单位是秒，向上取整保证 >= 1 秒
-        // 例如 read_timeout_ms=500 → rt=1
+        // MYSQL_OPT_READ_TIMEOUT unit is seconds, round up to ensure >= 1s
         unsigned int rt = (cfg_.read_timeout_ms + 999) / 1000;
         if (rt < 1) rt = 1;
         mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &rt);
 
         int ret = mysql_ping(conn);
 
-        // 恢复 read_timeout 为 0（不限制），避免影响后续 mysql_query 的执行
+        // restore read_timeout to 0 (unlimited), avoid affecting subsequent mysql_query
         unsigned int restore_rt = 0;
         mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &restore_rt);
 
@@ -406,8 +405,8 @@ private:
     Config cfg_;
 
     std::deque<IdleConn> idle_pool_;
-    size_t total_ = 0;             // 由 mtx_ 保护
-    size_t creating_ = 0;          // 由 mtx_ 保护
+    size_t total_ = 0;             // protected by mtx_
+    size_t creating_ = 0;          // protected by mtx_
     std::mutex mtx_;
     std::condition_variable cv_;
 

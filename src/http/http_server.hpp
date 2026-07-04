@@ -14,16 +14,18 @@
 #include <optional>
 #include <limits>
 #include <cctype>
+#include <cmath>
 #include "../../picohttpparser.h"
 #include "../common/logger.hpp"
 #include "response.hpp"
 #include "http_context.hpp"
 #include "http_pool.hpp"
 #include "upstream_manager.hpp"
+#include "../security/security_rules.hpp"
 
 using namespace std::chrono_literals;
 
-// 转发响应：保存下游返回的 headers，最终透传给客户端
+// Proxy response: holds downstream headers/body, forwarded to client
 struct ProxyResponse {
     int status_code;
     std::string status_text;
@@ -53,7 +55,7 @@ struct HeaderListTokens {
 };
 
 // HttpServer
-// 10MB body 上限
+// 10MB max body size
 static constexpr size_t kMaxBodySize = 10 * 1024 * 1024;
 
 class HttpServer {
@@ -67,6 +69,9 @@ public:
     }
 
     UpstreamManager& upstreams() { return upman_; }
+
+    // Inject security rules
+    void set_security_rules(SecurityRules* rules) { security_rules_ = rules; }
 
     void stop() {
         if (!running_.exchange(false)) return;
@@ -90,7 +95,7 @@ public:
     }
 
 private:
-    // ConnGuard：RAII 归还连接，异常路径自动标记 bad
+    // ConnGuard: RAII connection return, auto-mark bad on exception paths
     struct ConnGuard {
         std::shared_ptr<HttpPool::State> pool_state_;
         std::unique_ptr<HttpPool::HttpConn> conn_;
@@ -118,7 +123,7 @@ private:
         HttpPool::HttpConn& conn() { return *conn_; }
     };
 
-    // 带超时的 async_read_some；超时返回 0
+    // async_read_some with timeout; returns 0 on timeout
     asio::awaitable<std::size_t> read_with_timeout(
         asio::ip::tcp::socket& sock,
         char* buf, std::size_t size, std::chrono::milliseconds timeout) {
@@ -412,17 +417,17 @@ private:
         }
     }
 
-    // 读取下游响应：返回状态码、headers、body；多读的字节存入 conn.read_buffer
+    // Read upstream response: returns status code, headers, body; excess bytes stored in conn.read_buffer
     asio::awaitable<ProxyResponse> read_proxy_response(
         HttpPool::HttpConn& conn, const HttpPool::Config& pool_cfg, bool request_is_head) {
 
         ProxyResponse resp;
-        resp.status_code = 502;  // 默认 Bad Gateway
+        resp.status_code = 502;  // default Bad Gateway
 
-        // 优先消费 read_buffer（上次多读的字节）
+        // consume read_buffer first (leftover bytes from last read)
         std::string buf = std::move(conn.read_buffer);
 
-        // 读头部直到 \r\n\r\n
+        // read headers until \r\n\r\n
         while (buf.find("\r\n\r\n") == std::string::npos) {
             if (buf.size() > 64 * 1024) {
                 resp.error = "upstream_response_header_too_large";
@@ -444,7 +449,7 @@ private:
         std::string header_part = buf.substr(0, header_end);
         std::string body_rest = buf.substr(header_end + 4);
 
-        // 解析状态行
+        // parse status line
         auto first_line_end = header_part.find("\r\n");
         if (first_line_end == std::string::npos) {
             resp.error = "upstream_response_missing_status_line";
@@ -509,7 +514,7 @@ private:
             co_return resp;
         }
 
-        // 读 body
+        // read body
         if (header_state.is_chunked) {
             if (!co_await read_chunked_stream(conn.socket, body_rest, resp.body,
                     pool_cfg.max_body_size, std::chrono::milliseconds(pool_cfg.read_timeout_ms))) {
@@ -524,7 +529,7 @@ private:
             size_t content_length = *header_state.content_length;
             resp.body = std::move(body_rest);
             if (resp.body.size() >= content_length) {
-                // 多读的字节存回 read_buffer
+                // store excess bytes back into read_buffer
                 if (resp.body.size() > content_length) {
                     conn.read_buffer = resp.body.substr(content_length);
                     resp.body.resize(content_length);
@@ -568,15 +573,15 @@ private:
                 resp.body.resize(pool_cfg.max_body_size);
             }
         } else {
-            // 无 CL 无 TE：按 RFC 7230 §3.3.3 判定 body
-            // - 1xx/204/304: 必须没有 body
-            // - 其他：连接关闭或 Connection: close 时读到 EOF
+            // No CL, no TE: determine body per RFC 7230 §3.3.3
+            // - 1xx/204/304: must have no body
+            // - others: read until EOF on Connection: close
             if (resp.status_code == 204 || resp.status_code == 304 ||
                 (resp.status_code >= 100 && resp.status_code < 200)) {
                 resp.body.clear();
                 if (!body_rest.empty()) conn.connection_close = true;
             } else {
-                // 读到连接关闭（仅 Connection: close 或 HTTP/1.0）
+                // read until connection close (Connection: close or HTTP/1.0)
                 conn.connection_close = true;
                 resp.body = std::move(body_rest);
                 char tmp[4096];
@@ -750,7 +755,7 @@ private:
                 std::string path_str(path, path_len);
                 std::string method_str(method, method_len);
 
-                // 构造 HttpContext
+                // build HttpContext
                 HttpContext ctx;
                 ctx.method = method_str;
                 ctx.path = path_str;
@@ -849,14 +854,52 @@ private:
                     ", next_preread=", client_preread.size(),
                     ", body_preview=", sanitize_body_preview(ctx.body));
 
-                // 先试本地路由。body 已按 framing 消费，keep-alive/pipeline 不会错位。
+                // === Auth check (body already consumed, framing intact) ===
+                if (!handled && security_rules_) {
+                    std::string xff = ctx.get_header("X-Forwarded-For");
+                    std::string auth = ctx.get_header("Authorization");
+                    auto result = security_rules_->check(
+                        socket, method_str, path_str, xff, auth);
+                    if (result.status_code != 0) {
+                        ctx.status_code = result.status_code;
+                        ctx.response_body = "{\"code\":"
+                            + std::to_string(result.status_code)
+                            + ",\"msg\":\"" + result.reason + "\"}";
+                        // add Retry-After header on rate-limit rejection
+                        if (result.status_code == 429 && result.retry_after_ms > 0) {
+                            int retry_sec = static_cast<int>(
+                                std::ceil(result.retry_after_ms / 1000.0));
+                            ctx.response_headers.emplace_back(
+                                "Retry-After", std::to_string(retry_sec));
+                        }
+                        handled = true;
+                        // 429/403 log throttling: once per 30s globally (cross-thread)
+                        {
+                            static std::atomic<int64_t> last_log_ms{0};
+                            int64_t now = std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()
+                            ).count();
+                            int64_t last = last_log_ms.load(std::memory_order_relaxed);
+                            if (now - last > 30000 &&
+                                last_log_ms.compare_exchange_strong(last, now)) {
+                                LOG_WARN("Security check rejected: method=", method_str,
+                                    ", path=", path_str,
+                                    ", status=", result.status_code,
+                                    ", reason=", result.reason);
+                            }
+                        }
+                    }
+                }
+
+                // try local route first. body already consumed per framing rules, keep-alive/pipeline is safe.
                 auto it = routes_.find(path_str);
                 if (!handled && it != routes_.end()) {
                     co_await it->second(ctx);
                     handled = true;
                 }
 
-                // 代理路由（需要 body 已解析）
+                // proxy route (body already consumed)
                 if (!handled) {
                     auto upstream = upman_.route(path_str);
                     if (upstream) {
@@ -882,8 +925,8 @@ private:
                                 auto& conn = guard.conn();
                                 bool can_retry_stale_idle = conn.reused_from_idle && attempt == 0;
 
-                                // 转发给上游时去掉服务名前缀。
-                                // 例如 /zebra-config/config.ConfigService/xxx → /config.ConfigService/xxx
+                                // strip service prefix when forwarding upstream
+                                // e.g. /zebra-config/config.ConfigService/xxx -> /config.ConfigService/xxx
                                 std::string forward_req = method_str + " " + upstream->upstream_path + " HTTP/1.1\r\n";
                                 forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
                                 forward_req += "Connection: keep-alive\r\n";
@@ -912,7 +955,7 @@ private:
                                     ", original_headers=[", describe_headers(ctx.headers), "]");
                                 for (auto& [k, v] : ctx.headers) {
                                     auto lk = to_lower(k);
-                                    // transfer-encoding: chunked 需要保留，让下游正确解析 raw chunked body
+                                    // transfer-encoding: chunked must be preserved for downstream parsing
                                     if (lk == "transfer-encoding") {
                                         LOG_DEBUG("Proxy forward header keep: ", k,
                                             "=", sanitize_header_value(k, v));
@@ -943,13 +986,13 @@ private:
                                     ", body_size=", ctx.body.size(),
                                     ", body_preview=", sanitize_body_preview(ctx.body));
 
-                                // 发送请求（带超时）
+                                // send request (with timeout)
                                 auto write_ok = co_await write_with_timeout(
                                     conn.socket, forward_req,
                                     std::chrono::milliseconds(pool->cfg().request_timeout_ms));
 
                                 if (!write_ok) {
-                                    // 超时，取消 socket 上的 pending IO
+                                    // timeout, cancel pending IO on socket
                                     asio::error_code ec;
                                     conn.socket.cancel(ec);
                                     guard.set_bad();
@@ -1020,7 +1063,7 @@ private:
                     ctx.response_body = "{\"code\":404,\"msg\":\"not found\"}";
                 }
 
-                // 构建响应
+                // build response
                 std::string resp = "HTTP/1.1 ";
                 resp += std::to_string(ctx.status_code);
                 resp += " ";
@@ -1036,7 +1079,7 @@ private:
                 else resp += "OK";
                 resp += "\r\n";
 
-                // 透传 headers（过滤 hop-by-hop；Content-Length 和 Transfer-Encoding 由我们控制）
+                // forward response headers (filter hop-by-hop; Content-Length and Transfer-Encoding controlled by us)
                 bool has_content_type = false;
                 if (!ctx.response_headers.empty()) {
                     if (proxy_response) {
@@ -1083,8 +1126,8 @@ private:
                 resp += "\r\n\r\n";
                 if (!response_has_no_body) resp += ctx.response_body;
 
-                // 客户端响应写不使用 write_with_timeout：timer 开销在热路径上会被放大
-                // （改用裸 async_write + redirect_error，简单可靠）
+                // client response write does NOT use write_with_timeout: timer overhead is amplified on hot path
+                // use bare async_write + redirect_error instead, simple and efficient
                 asio::error_code write_ec;
                 co_await asio::async_write(socket, asio::buffer(resp),
                     asio::redirect_error(asio::use_awaitable, write_ec));
@@ -1097,13 +1140,13 @@ private:
                     co_return;
                 }
 
-                // body framing 错误：socket 中可能还有未消费的 body 字节，
-                // 继续循环会把 body 当作下一个请求头解析 → HTTP smuggling。强制关连接。
+                // body framing error: socket may have unconsumed body bytes
+                // continuing would parse body as next request headers -> HTTP smuggling. Force close.
                 if (ctx.status_code == 400 || ctx.status_code == 408 || ctx.status_code == 413) {
                     co_return;
                 }
 
-                // 客户端 Connection: close 则断开
+                // close if client sent Connection: close
                 auto client_conn = ctx.get_header("Connection");
                 auto client_conn_tokens = split_connection_tokens(client_conn);
                 if (minor_version == 0 && !client_conn_tokens.keep_alive) {
@@ -1139,4 +1182,5 @@ private:
     std::unordered_map<std::string, Handler> routes_;
     std::atomic<bool> running_;
     UpstreamManager upman_;
+    SecurityRules* security_rules_ = nullptr;
 };

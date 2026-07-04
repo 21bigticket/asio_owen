@@ -14,13 +14,13 @@ inline bool http_header_iequals(std::string_view a, std::string_view b) {
     return true;
 }
 
-// HTTP 请求/响应上下文，支持代理转发和本地 handler
+// HTTP request/response context, supports proxy forwarding and local handlers
 struct HttpContext {
     std::string method;
     std::string path;
     std::string body;
     std::vector<std::pair<std::string, std::string>> headers;
-    int status_code = 0;     // 0 表示未设置，框架检查必须 > 0
+    int status_code = 0;     // 0 means unset, must be > 0 before response
     std::string response_status_text;
     std::string response_body;
     std::vector<std::pair<std::string, std::string>> response_headers;

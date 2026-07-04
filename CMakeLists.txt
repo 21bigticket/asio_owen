@@ -61,6 +61,34 @@ else()
     message(STATUS "spdlog: fetched from remote")
 endif()
 
+# ==================== jwt-cpp（header-only，优先本地，否则 FetchContent）====================
+add_library(asio_owen_jwtcpp INTERFACE)
+if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/jwt-cpp/include/jwt-cpp/jwt.h)
+    target_include_directories(asio_owen_jwtcpp INTERFACE ${PROJECT_SOURCE_DIR}/third_party/jwt-cpp/include)
+    message(STATUS "jwt-cpp: using vendored ${PROJECT_SOURCE_DIR}/third_party/jwt-cpp")
+else()
+    FetchContent_Declare(
+        jwt-cpp
+        GIT_REPOSITORY https://github.com/Thalhammer/jwt-cpp.git
+        GIT_TAG        v0.7.0
+        OVERRIDE_FIND_PACKAGE
+    )
+    # 用 MakeAvailable 替代 Populate（避免 deprecation warning）
+    # 但 jwt-cpp 是 header-only 库，不需要 add_subdirectory
+    # 先用 GetProperties + manual populate 但抑制 warning
+    cmake_policy(SET CMP0169 OLD)
+    FetchContent_GetProperties(jwt-cpp)
+    if(NOT jwt-cpp_POPULATED)
+        FetchContent_Populate(jwt-cpp)
+    endif()
+    if(EXISTS ${jwt-cpp_SOURCE_DIR}/include/jwt-cpp/jwt.h)
+        target_include_directories(asio_owen_jwtcpp INTERFACE ${jwt-cpp_SOURCE_DIR}/include)
+    else()
+        target_include_directories(asio_owen_jwtcpp INTERFACE ${jwt-cpp_SOURCE_DIR})
+    endif()
+    message(STATUS "jwt-cpp: fetched from remote")
+endif()
+
 # ==================== 系统依赖：pkg-config 可选，macOS/Linux 通用 fallback ====================
 find_package(Threads REQUIRED)
 find_package(PkgConfig QUIET)
@@ -150,6 +178,7 @@ target_link_libraries(asio_owen_deps INTERFACE
     asio_owen_options
     asio_owen_asio
     asio_owen_spdlog
+    asio_owen_jwtcpp
     MySQL::Client
     Hiredis::Hiredis
     OpenSSL::SSL

@@ -309,25 +309,398 @@ timeout -s TERM 8 valgrind --tool=memcheck --leak-check=full --show-leak-kinds=a
 
 该轮压测未新增 ASAN/Valgrind 报告；内存结论仍以本节已有 ASAN 短周期、非 ASAN RSS 长压和 Valgrind 短周期为准。非 ASAN 的 proxy 转发 3 分钟 RSS 稳定在约 **56 MB**，未观察到随请求数增长的泄漏趋势。
 
+## 鉴权与限流模块内存检查（v3.5，新增安全模块）
+
+### 新增模块
+
+依据 `GATEWAY_AUTH_DESIGN.md`，新增以下独立模块（每个模块一个文件，方便分步构建和独立内存检查）：
+
+| 模块 | 文件 | 内存特征 |
+|:---|:---|---:|
+| 📁 **路径规范化** | `src/security/path_normalize.hpp` | 每次调用 ~3 次小堆分配（percent_decode / vector / 拼接），per-request ~1-3 KB，SSO 可能优化短串 |
+| 📁 **真实 IP 解析** | `src/security/real_ip.hpp` | 无状态，仅栈变量，零长期分配 |
+| 📁 **IP 黑名单** | `src/security/ip_blacklist.hpp` | 启动加载后全量驻留（CIDR + 精确 IP，约 1-5 KB） |
+| 📁 **免鉴权白名单** | `src/security/auth_whitelist.hpp` | 启动加载后全量驻留（路径+服务前缀，约 1-10 KB） |
+| 📁 **路由黑名单** | `src/security/path_blacklist.hpp` | 启动加载后全量驻留（路径+角色映射，约 1-10 KB） |
+| 📁 **JWT 验证** | `src/security/jwt_auth.hpp` | jwt-cpp header-only，每请求 ~10-20 KB 临时分配（decoded_jwt + nlohmann::json 解析树 + base64 解码 buffer），均析构释放 |
+| 📁 **全局限流** | `src/security/rate_limiter.hpp` | **主要新增内存消耗**：分片令牌桶 + LRU + snapshot 落盘 |
+| 📁 **规则集 + 热加载** | `src/security/security_rules.hpp` | `atomic<shared_ptr<const Rules>>`，COW 更新（仅加载瞬间新增副本）；大配置下 80-150 KB（1000 CIDR + 1000 IP + 100 路径 + 50 服务 + 200 角色路由） |
+| 📁 **配置扩展** | `src/common/config.hpp` | 扩展现有 Config 的 `get_list`/`get_multiple` 方法，新增的 list 配置项数 KB 级 |
+
+> 模块间依赖关系：`rate_limiter.hpp` 依赖 `path_normalize.hpp` 输出的规范化路径；`security_rules.hpp` 是 Hub，持有所有规则实例并暴露 `check(X)` 接口给 `http_server.hpp`。
+
+### 新增模块内存消耗估算
+
+#### 全局限流（RateLimiter）—— 主要增量
+
+```
+RateLimiter
+├── 32 个 Shard
+│   ├── Shard 0:  ~3125 entries max（100k / 32）
+│   │   ├── unordered_map: key(string avg 20B) + TokenBucket(16B) + node overhead ≈ 60-80B/entry
+│   │   ├── LRU list: forward_list node ≈ 20B/entry
+│   │   └── LRU index: unordered_map iter ≈ 20B/entry
+│   ├── Shard 1:  ~3125 entries
+│   ├── ...
+│   └── Shard 31: ~3125 entries
+│
+├── global_bucket: atomic<int64_t> × 2 ≈ 16B
+├── Config ref: 几 KB（path_limits / service_limits 配置项）
+└── Snapshot 文件 /var/lib/asio_owen/rate_limit.bin ≈ 10-20 MB（磁盘）
+```
+
+| 条目数 | 每条目预估 | 总内存 |
+|:---:|:---:|---:|
+| 5,000 （小型部署） | ~100-120B | **~0.5-0.6 MB** |
+| 50,000 （中型） | ~100-120B | **~5-6 MB** |
+| 100,000 （上限） | ~100-120B | **~10-12 MB** |
+
+> 与当前 RSS ~56MB(strip)/~118MB(debug) 相比，限流模块满负荷运行增加 **10-12 MB**，在合理范围内。
+
+#### 其他模块
+
+| 模块 | 启动时长驻内存 | per-request 临时分配 |
+|:---|:---:|:---:|
+| IP 黑名单 | ~1-5 KB（CIDR 列表+精确IP集合） | 0 |
+| 白名单 | ~1-10 KB（路径+服务前缀集合） | 0 |
+| 路由黑名单 | ~1-10 KB（路径+角色映射） | 0 |
+| JWT 验证 | ~0.1 KB（配置字符串） | ~10-20 KB/请求（jwt-cpp 创建 decoded_jwt + json 解析树 + base64 解码 buffer，析构释放） |
+| 真实 IP 解析 | 0（无状态） | 0（仅栈临时 string） |
+| 路径规范化 | 0（无状态） | ~1-3 KB/请求（percent_decode + segments vector + 拼接，作用域结束释放） |
+| 规则集（Hot reload） | ~80-150 KB（1000 CIDR + 1000 IP + 100 路径 + 50 服务 + 200 角色） | 0（load 读 shared_ptr，无锁） |
+
+**结论：新增安全模块的全部常驻内存预估在 ~12-15 MB（限流 10-12 MB + 规则配置 ~0.2 MB + 约 30% 余量），不含 spdlog async queue / MysqlPool 备用连接等运行时增量。**
+
+### 模块代码结构
+
+新增 `src/security/` 目录，每个模块独立文件：
+
+```
+src/security/
+├── path_normalize.hpp      // normalize_path() / percent_decode() — 纯函数
+├── real_ip.hpp             // get_client_ip() — XFF 解析 + 信任代理过滤
+├── ip_blacklist.hpp        // IpBlacklist — CIDR 匹配 + 精确 IP 集合
+├── auth_whitelist.hpp      // AuthWhitelist — 路径/服务免鉴权白名单
+├── path_blacklist.hpp      // PathBlacklist — 路由黑名单 + 角色映射
+├── jwt_auth.hpp            // JwtAuth — jwt-cpp 验证器封装
+├── rate_limiter.hpp        // RateLimiter — 32 分片令牌桶 + 全局限流 + snapshot
+├── security_rules.hpp      // SecurityRules — 规则集 + 原子替换 + 热加载
+```
+
+`main.cpp` 中新增：
+
+```cpp
+#include "security/security_rules.hpp"
+#include "security/rate_limiter.hpp"
+
+// 在 HttpServer 初始化后注入
+SecurityRules g_security_rules;
+RateLimiter g_rate_limiter;
+```
+
+> **分模块的好处**：每个模块可以独立编译为测试目标（`test_path_normalize.cpp`、`test_real_ip.cpp`、`test_rate_limiter.cpp`），内存检查也可以按模块逐层进行，出现泄漏时快速定位。
+
+### 内存检查计划
+
+#### 第一阶段：ASAN 短周期（启动+退出 × 5 次）
+
+> 以下命令需在 **Linux 测试机** 执行（macOS 无 `/proc`、ASAN 行为不同）。
+
+每次独立编译 + 启动退出，不漏报。
+
+**前置条件：** 先确认当前 server 的 shutdown 路径在 ASAN 下干净退出：所有 `co_spawn(detached)` 协程已完成、后台 persist_worker 线程已 join、spdlog async logger 已 flush。否则 LSAN 会误报。
+
+```bash
+# 1. ASAN 编译
+rm -rf build_asan
+CXX=g++ CC=gcc cmake -B build_asan -S . -Wno-dev \
+    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+    -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+    -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake --build build_asan --target server -j4
+
+# 2. 启动 + health check polling + 正常 SIGTERM 退出
+# ASAN 版本启动比 release 慢 2-5 倍，8s 不够，用 health check polling
+cd build_asan
+timeout 30 bash -c '
+    ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server &
+    SERVER_PID=$!
+    # 轮询 health 直到就绪
+    until curl -sf http://127.0.0.1:8081/api/health > /dev/null 2>&1; do
+        sleep 0.5
+    done
+    # 就绪后再跑 3s 收请求
+    sleep 3
+    kill -TERM $SERVER_PID
+    wait $SERVER_PID
+'
+
+# 3. 检查报告（期望：无任何 ERROR/LEAK 输出）
+# 确认 stderr 无：LeakSanitizer: detected memory leaks
+```
+
+**注意：**
+- 必须使用 `kill -TERM`（SIGTERM），不是 `-KILL`，确保走两段式 shutdown
+- 确认 `ldd ./server | grep asan` 或 `strings ./server | grep -i asan | head` 验证 ASAN 已链接
+- 如果不放心 LSAN 是否真的在工作，先造一个临时泄漏测试确认
+- health polling 也能识别启动时 crash（curl 连不上立刻暴露）
+
+#### 第二阶段：模块级单元测试（Valgrind 逐模块）
+
+> 以下命令需在 **Linux 测试机** 执行。
+
+**前置条件：** 先在 `tests/` 目录创建对应的 gtest 测试文件，注册进 `tests/CMakeLists.txt`。每个模块独立编译为测试二进制，Valgrind 下跑完整测试：
+
+```bash
+# 编译所有测试
+cmake --build build --target test_path_normalize test_real_ip test_jwt_auth test_rate_limiter -j4
+
+# path_normalize 测试（~1-3 KB/请求临时分配，作用域结束释放）
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --undef-value-errors=no ./build/test_path_normalize
+
+# real_ip / ip_blacklist（XFF 解析 + CIDR 匹配）
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --undef-value-errors=no ./build/test_real_ip
+
+# jwt_auth（jwt-cpp 签名/验签，~10-20 KB/请求临时对象分配释放）
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --undef-value-errors=no ./build/test_jwt_auth
+
+# rate_limiter（分片令牌桶 + LRU 淘汰，重点是 snapshot 加载/恢复路径）
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --undef-value-errors=no ./build/test_rate_limiter
+```
+
+**重点关注：**
+| 模块 | Valgrind 关注点 | 潜在泄漏场景 |
+|:---|:---|---:|
+| jwt_auth | jwt-cpp 每请求创建/销毁的临时 `jwt::decoded_jwt` 对象 | 异常路径未释放 |
+| rate_limiter | snapshot 加载时 LRU 链表重建；shard mutex + unordered_map 析构；持久化线程退出 | use-after-free：加载时先擦旧 LRU 再重建，中间无引用 |
+| security_rules | `atomic<shared_ptr<const Rules>>` 的 COW 更新路径 | 热加载触发时旧 `shared_ptr` 引用计数是否归零 |
+
+#### 第三阶段：ASAN 长压检测（全链路，30 分钟）
+
+> 以下命令需在 **Linux 测试机** 执行。
+
+```bash
+# 终端 1：启动 ASAN 版本
+cd build_asan
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server &
+
+# 终端 2：RSS 监控
+watch -n 2 'grep VmRSS /proc/$(pgrep -f build_asan/server)/status'
+
+# 终端 3：分阶段压测各接口
+# 每阶段结束后 pause 15s 观察 RSS 是否回落
+
+# 阶段 1：本地路由 3min（health/redis/mysql — 会过 JWT 白名单）
+for i in 1 2 3; do
+    plow -c 100 -d 60s http://127.0.0.1:8081/api/health
+    sleep 15
+done
+
+# 阶段 2：白名单路径（/api/build — JWT 跳过）
+plow -c 100 -d 60s http://127.0.0.1:8081/api/build
+
+# 阶段 3：网关代理 + JWT 全链路 5min（zebra-config 转发）
+# JWT 从文件读取，不写进 shell history
+TOKEN=$(cat /tmp/jwt.txt)
+plow -c 100 -d 300s \
+    -b "$(cat /tmp/body.json)" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey
+
+# 阶段 4：限流触发（IP 维度）
+# 用大量请求打 health，触发 ip_rps 限流，验证 token bucket 扣减 + LRU 不泄漏
+plow -c 200 -d 60s http://127.0.0.1:8081/api/health
+
+# 阶段 5：黑名单触发（IP 维度）
+# 1. 获取本机主 IP
+CLIENT_IP=$(hostname -I | awk '{print $1}')
+# 2. 编辑 config.ini，在 [ip_blacklist] 段加一行 $CLIENT_IP
+# 3. 热加载触发（如果实现了 SIGHUP）：kill -HUP $(pgrep server)
+# 4. 验证返回 403
+curl -i http://127.0.0.1:8081/api/health | head -1
+# 期望：HTTP/1.1 403 Forbidden
+
+# ASAN 整体报告检查
+# 确认 stderr 无任何 ERROR，进程正常退出后 LSAN 无 leak 报告
+```
+
+> **plow 参数说明：** `-c` 并发数、`-d` 持续时间、`-b` body 字符串。官方文档用短选项，长选项 `--concurrency`/`--duration` 部分版本不支持。生产环境 JWT 从文件读取避免进 shell history。
+
+**预期结果：**
+
+| 阶段 | 预期 RSS（Release stripped） | 说明 |
+|:---|---:|:---|
+| 启动后（无鉴权配置） | ~56 MB | 与当前基线一致 |
+| 启动后（加载 IP 黑名单 + 白名单 + JWT secret + 限流配置） | ~56-57 MB | 配置项常驻增加 < 1 MB |
+| 本地路由 3min | ~56-57 MB | 稳定，无增长 |
+| 代理转发 + JWT 5min | ~56-68 MB | 限流 LRU 逐步填充到活跃 IP/路径；稳态后持平 |
+| 压测结束后 30s 观察 | ~56-60 MB | idle 连接回收 + LRU 末尾淘汰后应回落 |
+| 正常退出后 | 0 | 所有 RAII 析构释放 |
+
+> 限流 LRU 填充阶段 RSS 会从 ~56MB 增长到 ~68MB（新增 12MB），到上限 100k 条目后应持平不再增长。这是预期行为，不是泄漏。
+
+#### 第四阶段：Snapshot 落盘/加载专项测试
+
+> 以下命令需在 **Linux 测试机** 执行。
+
+**前置条件：** 确保 `/var/lib/asio_owen/` 目录存在（代码落盘前应自动 `mkdir -p`）：
+
+```bash
+sudo mkdir -p /var/lib/asio_owen && sudo chown $USER /var/lib/asio_owen
+```
+
+```bash
+# 1. 启动服务，压测产生大量限流记录
+./server &
+SERVER_PID=$!
+plow -c 100 -d 60s http://127.0.0.1:8081/api/health
+# 等待 snapshot 落盘（默认 30s）
+sleep 35
+
+# 2. 确认 snapshot 文件生成
+ls -la /var/lib/asio_owen/rate_limit.bin
+# 期望：-rw------- (0600)
+
+# 3. 重启服务，验证加载后 RSS 稳定
+kill -TERM $SERVER_PID
+wait $SERVER_PID
+sleep 3
+./server &
+sleep 5
+grep VmRSS /proc/$(pgrep server)/status
+
+# 4. 对比重启前后的 RSS，不应出现加载后持续增长
+
+# 5. 损坏 snapshot 文件，验证启动时丢弃
+echo "garbage" > /var/lib/asio_owen/rate_limit.bin
+./server & sleep 5
+# 期望日志：rate_limit: snapshot corrupted, starting empty
+
+# 6. 旧版本 snapshot，验证 version 字段
+# 方案 A（集成测试）：用 printf + dd 在已知 offset 写坏 version
+#   假设 SnapshotHeader 布局：magic[10] + version(uint32) + checksum(uint32) + written_at_ms(int64)
+#   即 version 在 offset 10，uint32 little-endian，999 = 0x000003e7 -> e7 03 00 00
+printf '\xe7\x03\x00\x00' | dd of=/var/lib/asio_owen/rate_limit.bin bs=1 seek=10 count=4 conv=notrunc
+./server & sleep 5
+# 期望日志：rate_limit: snapshot version mismatch
+#
+# 方案 B（单元测试，推荐）：在 test_rate_limiter.cpp 直接构造坏 version 的 SnapshotHeader
+#   在内存中组装，调用 load_snapshot 后断言日志/返回值，不依赖实际文件
+
+# 7. LRU 重建正确性验证
+# 在 test_rate_limiter.cpp 中用单元测试覆盖：
+#   - 给一个 Shard 填充 max_buckets_per_shard + 1 个 key
+#   - 断言 evicted key 是最早插入的那个
+#   - 断言 LRU list 顺序与插入顺序一致
+# 集成测试阶段不重复验证 LRU 内部顺序（无外部可见接口）
+
+# 8. Snapshot 文件权限确认
+ls -la /var/lib/asio_owen/rate_limit.bin
+# 期望：-rw------- (0600)
+```
+
+**重点验证：**
+- Snapshot 文件 `magic`/`version`/`checksum` 校验失败时正确丢弃并 WARN，不崩溃
+- 加载时同步重建 LRU 链表，不会因 `lru_list` 为空导致 use-after-free
+- 不同版本 snapshot 加载时丢弃旧格式并 WARN
+- LRU 重建后 eviction 顺序正确（最旧先淘汰）
+
+#### 第五阶段：Valgrind 完整链路确认
+
+> 以下命令需在 **Linux 测试机** 执行。
+
+**注意：** Valgrind 必须让进程自然退出（或 timeout 触发 SIGTERM）后才能拿到 LSAN 报告。不能先 `kill -9` 或 `pkill`，否则报告丢失。
+
+```bash
+cd build
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --trace-children=yes --undef-value-errors=no \
+    --log-file=/tmp/vg_security.log \
+    timeout -s TERM 30 ./server &
+VALGRIND_PID=$!
+sleep 35          # 等 timeout 自然触发 SIGTERM
+wait $VALGRIND_PID   # 等 valgrind 完整退出（关键！不 wait 会丢失报告）
+grep -E 'LEAK|ERROR|lost|heap' /tmp/vg_security.log
+```
+
+**期望：**
+```
+total heap usage: ... allocs, ... frees, ... bytes allocated
+definitely lost: 0 bytes in 0 blocks
+indirectly lost: 0 bytes in 0 blocks
+possibly lost: 0/少量（仅限 libmysqlclient/hiredis 内部缓存）
+ERROR SUMMARY: 0/少量
+```
+
+### 内存检查风险 & 注意点
+
+1. **限流 LRU 预热 vs 泄漏**：压测前 30s RSS 增长应归因于 LRU 填充，不是泄漏。区分方法：
+   - 停止压测后 RSS 应回落：LRU + spdlog 队列 drain → 回落
+   - 停止压测后 RSS 持续不降：可能是泄漏 → 跑 ASAN 定位
+
+2. **Snapshot 文件年龄判断**：重启时 snapshot 文件超过 `2 * max_window` 视为过期，从空状态启动，避免限流状态异常。
+
+3. **热加载 COW 额外副本**：`security_rules.hpp` 热加载时 `parse_security_rules()` 创建新 `Rules` 对象，原子替换后旧 `Rules` 引用计数归零释放。释放量 = 旧规则对象大小（10-50 KB），不会累积。
+
+4. **jwt-cpp header-only 库**：jwt-cpp 是 header-only 库，编译时全部内联，无额外 .so 加载。每请求创建 ~10-20 KB 临时对象（decoded_jwt + nlohmann::json 解析树 + base64 解码 buffer），作用域结束时全部释放。100 并发下峰值 ~1-2 MB 临时内存，不影响常驻 RSS。如果担心异常路径泄漏，在 jwt_auth 单元测试中用 Valgrind 确认。
+
+### 已确认的内存增量总结
+
+| 模块 | 常驻内存增加 | Per-request 分配 | ASAN 关注点 |
+|:---|:---:|:---:|:---|
+| 路径规范化 | 0 | ~1-3 KB/请求（percent_decode + segments vector + 拼接，作用域结束释放） | 非 ASCII 字符 `tolower` UB；`percent_decode` 越界 |
+| 真实 IP 解析 | 0 | 0 | 无 |
+| IP 黑名单 | ~1-80 KB（1000 CIDR + 1000 精确 IP） | 0 | 配置解析，仅启动时一次分配 |
+| 免鉴权白名单 | ~1-20 KB（100 路径 + 50 服务） | 0 | 同上 |
+| 路由黑名单 | ~1-20 KB（200 路径 + 角色映射） | 0 | 同上 |
+| JWT 验证 | ~0.1 KB（配置字符串） | ~10-20 KB/请求（decoded_jwt + json 树 + base64 buffer，析构释放） | 异常路径：jwt-cpp decode 抛异常时临时对象未释放 |
+| 全局限流 | **~10-12 MB**（上限 100k 条目） | 0（bucket 常驻） | **Snapshot 加载重建 LRU（use-after-free 重灾区）；分片 LockGuard（不分配）** |
+| 规则集热加载 | ~80-150 KB（完整规则对象） | 0（load 读 shared_ptr，无锁） | COW 替换后旧 `shared_ptr` 引用计数归零释放 |
+| **合计** | **~10.2-12.4 MB** | **~11-23 KB/请求** | |
+
+> 与当前 Release stripped 的 ~56 MB 基线相比，新增安全模块全量上线后预计常驻 **~66-70 MB**。
+> Per-request 分配（路径规范化 ~1-3 KB + JWT ~10-20 KB）在请求结束时释放，不会累积，不影响常驻 RSS。
+
 ## 后续建议
 
-- 代码变更后建议重新跑 ASAN 短周期检测（编译 + 启动退出 + 检查报告，约 5 分钟）
-- 无需每次压测都跑 Valgrind，ASAN 已足够覆盖
+- 代码变更后建议优先跑**第一阶段 ASAN 短周期**（约 5 分钟），确认模块级析构无泄漏
+- 每实现 2-3 个模块后，跑一次完整**第二阶段 Valgrind 模块级测试**，避免问题堆积到最后才暴露
+- 限流模块的 snapshot 加载路径（LRU 重建）是**最容易出 use-after-free 的位置**，实现后立刻 Valgrind 验证
+- 压测发现 RSS 持续增长且不回落时，用 `grep 'VmRSS\|VmPeak' /proc/$PID/status` + `pmap -x $PID` 确认是哪个区域增长
+- 无需每次压测都跑 Valgrind，ASAN + RSS 监控已足够覆盖常规场景
 - 生产环境定期监控 RSS 趋势即可
 
 ## 附录：检查中使用的命令
 
 ```bash
-# ASAN 短周期
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 timeout 6 ./server
+# ASAN 短周期（Linux 测试机）
+timeout 30 bash -c '
+    ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server &
+    SERVER_PID=$!
+    until curl -sf http://127.0.0.1:8081/api/health > /dev/null 2>&1; do
+        sleep 0.5
+    done
+    sleep 3
+    kill -TERM $SERVER_PID
+    wait $SERVER_PID
+'
 
 # RSS 监控
 watch -n 1 'grep VmRSS /proc/$(pgrep server)/status'
 
-# Valgrind 短周期检测
-timeout -s TERM 8 valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
-  --trace-children=yes --undef-value-errors=no --log-file=/tmp/vg.log ./server
-
-# 查看 Valgrind 报告
+# Valgrind 短周期检测（Linux 测试机）
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+    --trace-children=yes --undef-value-errors=no \
+    --log-file=/tmp/vg.log \
+    timeout -s TERM 30 ./server &
+VALGRIND_PID=$!
+sleep 35
+wait $VALGRIND_PID
 grep -E 'LEAK|ERROR|lost|heap' /tmp/vg.log
 ```

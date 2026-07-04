@@ -6,7 +6,7 @@
 #include <cstdarg>
 #include "../common/logger.hpp"
 
-// 每 io_context 线程一个专属 Redis 连接，无锁、同步 hiredis
+// One dedicated Redis connection per io_context thread, lock-free, synchronous hiredis
 class RedisPool {
 public:
     struct Config {

@@ -11,12 +11,12 @@
 #include <sstream>
 #include "../common/logger.hpp"
 
-// HTTP 连接池：懒创建 + 空闲回收 + 硬上限
+// HTTP connection pool: lazy create + idle reclaim + hard limit
 class HttpPool {
 public:
     struct Config {
         size_t max_size = 256;
-        size_t max_concurrent = 0;   // 0 表示不限制
+        size_t max_concurrent = 0;   // 0 means unlimited
         size_t max_body_size = 10 * 1024 * 1024;  // 10MB
         int connect_timeout_ms = 1000;
         int read_timeout_ms = 30000;
@@ -81,7 +81,7 @@ public:
         auto state = state_;
         if (!state->running.exchange(false)) return;
         std::lock_guard lock(state->mtx);
-        // 关闭 idle 连接
+        // close idle connections
         while (!state->idle.empty()) {
             asio::error_code ec;
             state->idle.front().socket.cancel(ec);
@@ -89,7 +89,7 @@ public:
             state->idle.pop_front();
             --state->total;
         }
-        // 关闭 in-flight 连接
+        // close in-flight connections
         for (auto* conn : state->active) {
             asio::error_code ec;
             conn->socket.cancel(ec);
@@ -209,7 +209,7 @@ public:
         state->released_idle.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // 标记为 bad 的连接：直接关闭，不归还池
+    // Release bad connection: close directly, do not return to pool
     void release_bad(HttpConn conn) {
         release_bad(state_, std::make_unique<HttpConn>(std::move(conn)));
     }

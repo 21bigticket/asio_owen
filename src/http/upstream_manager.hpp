@@ -5,7 +5,7 @@
 #include <asio.hpp>
 #include "http_pool.hpp"
 
-// 上游管理：路由 /proxy/{service}/... → 连接池
+// Upstream manager: route /{service}/... -> connection pool
 class UpstreamManager {
 public:
     struct UpstreamConfig {
@@ -27,8 +27,8 @@ public:
         pools_.try_emplace(name, ioc_, std::move(pool_cfg));
     }
 
-    // 路由 /{service}/...，返回上游配置、连接池和去掉服务名前缀后的路径
-    // 例如 /zebra-config/xxx → service=zebra-config
+    // Route /{service}/..., returns upstream config, pool, and path with service prefix stripped
+    // example: /zebra-config/xxx -> service=zebra-config
     std::optional<RouteResult> route(const std::string& path) {
         if (path.empty() || path[0] != '/') return std::nullopt;
         auto end = path.find('/', 1);
