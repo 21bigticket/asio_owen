@@ -175,10 +175,18 @@ public:
         const std::string& path,
         const std::string& service)
     {
-        auto ip_d = check(ip, cfg_.ip_rps, cfg_.ip_burst);
+        // snapshot rate config under lock to avoid race with update_config
+        double ip_rps, ip_burst, global_rps;
+        {
+            std::lock_guard<std::mutex> lock(cfg_mu_);
+            ip_rps = cfg_.ip_rps;
+            ip_burst = cfg_.ip_burst;
+            global_rps = cfg_.global_rps;
+        }
+        auto ip_d = check(ip, ip_rps, ip_burst);
         auto path_d = check_path(path);
         auto svc_d = check_service(service);
-        auto global_d = check_global(global_, cfg_.global_rps, cfg_.global_rps);
+        auto global_d = check_global(global_, global_rps, global_rps);
 
         if (ip_d.allowed && path_d.allowed && svc_d.allowed && global_d.allowed) {
             return {true, 0};

@@ -244,7 +244,9 @@ private:
         return true;
     }
 
-    // Parse rate limit value: supports "limit=10;window=60s;burst=10" or bare "10" (default 1s window)
+    // Parse rate limit value: supports "limit=10;window=60s;burst=10" or bare "10"
+    // window parameter: value is per-window, auto-convert to per-second rate
+    // example: limit=10;window=60s -> rate = 10/60 = 0.167 req/s
     static RateLimitRule parse_rate_limit_value(const std::string& val) {
         RateLimitRule rule{100.0, 100.0};  // default
 
@@ -258,6 +260,10 @@ private:
         }
 
         // key=value;key=value format
+        double window_sec = 1.0;  // default 1s window
+        double limit = 0.0;
+        bool has_limit = false;
+
         size_t pos = 0;
         while (pos < val.size()) {
             auto semi = val.find(';', pos);
@@ -273,10 +279,13 @@ private:
                 while (!v.empty() && std::isspace(v.back())) v.pop_back();
 
                 try {
-                    if (k == "limit") rule.rate = std::stod(v);
-                    else if (k == "burst") rule.burst = std::stod(v);
-                    else if (k == "window") {
-                        // support "60s", "1m" suffixes
+                    if (k == "limit") {
+                        limit = std::stod(v);
+                        has_limit = true;
+                    } else if (k == "burst") {
+                        rule.burst = std::stod(v);
+                    } else if (k == "window") {
+                        // support "60s", "1m", "1h" suffixes
                         auto val_str = v;
                         double multiplier = 1.0;
                         if (!val_str.empty()) {
@@ -292,15 +301,18 @@ private:
                                 val_str.pop_back();
                             }
                         }
-                        double window_sec = std::stod(val_str) * multiplier;
-                        // limit is already per-second rate, no conversion needed
-                        (void)window_sec;
+                        window_sec = std::stod(val_str) * multiplier;
                     }
                 } catch (...) {}
             }
             pos = (semi == std::string::npos) ? val.size() : semi + 1;
         }
 
+        // convert per-window limit to per-second rate
+        if (has_limit) {
+            rule.rate = limit / window_sec;
+            if (rule.burst == 100.0) rule.burst = rule.rate;  // default burst = rate
+        }
         return rule;
     }
 };
