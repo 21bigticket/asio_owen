@@ -665,6 +665,9 @@ public:
 | B14 | 根路径 `/`：service 抽取为空，直接返回 404，不进鉴权流程 | 404 |
 | B15 | JWT 日志脱敏：失败的 token 不记录完整 payload，只记 fingerprint（SHA256 前 8 字节）| 仅 fingerprint |
 | B16 | `%2F` 处理：路径规范化时不解码，保留字面量，不作为路径分隔符 | 保留 |
+| B16 | `%2F` 处理：路径规范化时不解码，保留字面量，不作为路径分隔符 | 保留 |
+| B20 | `%2F` upstream 契约：gateway 转发时使用 raw path（含 `%2F`），upstream **必须不解码 `%2F`**，否则攻击者可通过 `%2F` 绕过 gateway 的路径黑名单 | upstream NOT decode %2F |
+| B21 | 路径大小写匹配：`case_sensitive_paths=false`（默认）时路径统一转小写做 ACL 匹配；设为 `true` 时保留原始大小写，适用于 upstream 大小写敏感的场景 | `case_sensitive_paths = false` |
 | B17 | 限流落盘间隔 | 30s |
 | B18 | 限流桶 LRU 上限 | 100,000 条 |
 | B19 | 限流响应含 `Retry-After` 头 | 是 |

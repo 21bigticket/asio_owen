@@ -239,6 +239,7 @@ order = 127.0.0.1:30009
 | 连接预热 | 第一次请求需要承担 connect 延迟 |
 | 可观测性 | 目前只有 `LOG_INFO`/`LOG_WARN`；没有 QPS、p99、连接池 gauge |
 | 热更新 | `[upstream]` 变化需要重启 |
+| `%2F` upstream 契约 | gateway 转发时使用 raw path（含 `%2F`）。upstream **必须不解码 `%2F`**，否则攻击者可通过 `%2F` 绕过 gateway 的路径黑名单 |
 
 ## 构建与测试
 

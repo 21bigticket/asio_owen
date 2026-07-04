@@ -20,15 +20,26 @@ class SecurityRules {
 public:
     // Load all rules from Config
     void load_from_config(const Config& cfg) {
+        // 0. Path case-sensitivity config
+        {
+            case_sensitive_paths_ = cfg.get("security", "case_sensitive_paths", "false") == "true";
+        }
+
         // 1. IP blacklist
         {
             auto items = cfg.get_list("ip_blacklist");
             ip_blacklist_.reload(items);
         }
 
-        // 2. Trusted proxies
+        // 2. Trusted proxies (pre-normalized at load time to avoid per-request normalize_ip_str calls)
         {
-            trusted_proxies_ = cfg.get_list("trusted_proxies");
+            auto items = cfg.get_list("trusted_proxies");
+            std::vector<std::string> normalized;
+            normalized.reserve(items.size());
+            for (auto& ip : items) {
+                normalized.push_back(normalize_ip_str(ip));
+            }
+            trusted_proxies_ = std::move(normalized);
         }
 
         // 3. Auth whitelist
@@ -109,6 +120,18 @@ public:
         const std::string& xff_header,
         const std::string& auth_header) const
     {
+        return check(socket, method, raw_path, xff_header, auth_header, case_sensitive_paths_);
+    }
+
+    // Full-chain security check with case_sensitive flag
+    CheckResult check(
+        asio::ip::tcp::socket& socket,
+        const std::string& method,
+        const std::string& raw_path,
+        const std::string& xff_header,
+        const std::string& auth_header,
+        bool case_sensitive) const
+    {
         // 0. OPTIONS always allowed (CORS preflight)
         if (method == "OPTIONS") {
             return {0, ""};
@@ -132,8 +155,8 @@ public:
         auto client_ip = get_client_ip(socket, xff_header, proxies_copy);
         auto normalized_ip = normalize_ip_str(client_ip);
 
-        // 2. Path normalization
-        auto norm = normalize_path(raw_path);
+        // 2. Path normalization (case_sensitive controls whether paths are lowercased)
+        auto norm = normalize_path(raw_path, case_sensitive);
         auto& path = norm.path;
 
         // 3. Extract service name
@@ -167,19 +190,19 @@ public:
             }
         }
 
-        // 8. Path blacklist
-        if (path_blacklist_.is_blocked(path)) {
+        // 8. Path blacklist (single lock for both blocked + role check)
+        auto path_result = path_blacklist_.check(path);
+        if (path_result.blocked) {
             return {403, "path blocked"};
         }
         // Role check: compare JWT claims roles with path requirements
-        auto required = path_blacklist_.required_role(path);
-        if (!required.empty()) {
+        if (!path_result.required_role.empty()) {
             // Path requires a role but request is whitelisted (no JWT), reject
             if (is_whitelisted) {
                 return {403, "role required"};
             }
             // Check if JWT claims contain the required role
-            if (!claims || !has_role(*claims, required)) {
+            if (!claims || !has_role(*claims, path_result.required_role)) {
                 return {403, "insufficient role"};
             }
         }
@@ -207,6 +230,7 @@ private:
     std::shared_ptr<JWTAuth> jwt_auth_;
     std::unique_ptr<RateLimiter> rate_limiter_;
     std::vector<std::string> trusted_proxies_;
+    bool case_sensitive_paths_ = false;
 
     // Check if JWT claims contain the specified role
     static bool has_role(const JWTClaims& claims, const std::string& role) {

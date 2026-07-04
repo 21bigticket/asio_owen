@@ -54,6 +54,38 @@ public:
         return false;
     }
 
+    // Combined check: returns (blocked, required_role) in one lock instead of two
+    struct BlockResult {
+        bool blocked = false;
+        std::string required_role;
+    };
+
+    BlockResult check(const std::string& path) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        BlockResult result;
+        if (paths_) {
+            for (auto& p : *paths_) {
+                if (path == p) return {true, {}};
+                if (path.find(p) == 0 &&
+                    (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/')) {
+                    return {true, {}};
+                }
+            }
+        }
+        if (role_paths_) {
+            for (auto& [p, role] : *role_paths_) {
+                bool match = (path == p) ||
+                    (path.find(p) == 0 &&
+                     (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/'));
+                if (match) {
+                    result.required_role = extract_role_from_val(role);
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
     // Return the required role, empty means unrestricted
     std::string required_role(const std::string& path) const {
         std::lock_guard<std::mutex> lock(mu_);

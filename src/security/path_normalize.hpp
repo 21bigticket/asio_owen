@@ -46,9 +46,11 @@ inline std::string percent_decode(std::string_view s) {
     return result;
 }
 
-// Normalize path: percent-decode + resolve dot-segments + collapse slashes + lowercase
+// Normalize path: percent-decode + resolve dot-segments + collapse slashes + optional lowercase
 // Input is the path portion parsed by picohttpparser (no host, no query string)
-inline NormalizedPath normalize_path(std::string_view path_only) {
+// case_sensitive=false (default): normalize to lowercase for uniform ACL matching
+// case_sensitive=true: preserve original case
+inline NormalizedPath normalize_path(std::string_view path_only, bool case_sensitive = false) {
     // 1. percent-decode (%2F preserved as literal)
     std::string decoded = percent_decode(path_only);
     if (decoded.empty()) {
@@ -84,9 +86,11 @@ inline NormalizedPath normalize_path(std::string_view path_only) {
     normalized += "/";
     for (size_t i = 0; i < segments.size(); ++i) {
         if (i > 0) normalized += "/";
-        // normalize to lowercase
+        // normalize to lowercase (unless case-sensitive mode)
         for (auto c : segments[i]) {
-            normalized += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto ch = static_cast<unsigned char>(c);
+            normalized += case_sensitive ? static_cast<char>(ch)
+                : static_cast<char>(std::tolower(ch));
         }
     }
 

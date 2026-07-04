@@ -81,6 +81,12 @@ inline Decision check_global(GlobalBucket& global, double rate, double burst) {
 
     int64_t before = global.tokens_milli.fetch_sub(1000, std::memory_order_relaxed);
     if (before >= 1000) return {true, 0};
+    // Refund: rejected requests should not consume tokens.
+    // Unlike per-shard buckets (which are mutex-protected and refilled immediately),
+    // the global bucket is atomic and refills slowly at `rate` per second.
+    // Without refund, 1000 concurrent rejections would drain tokens_milli to -1,000,000,
+    // taking ~20 seconds to recover at 50k RPS.
+    global.tokens_milli.fetch_add(1000, std::memory_order_relaxed);
     int retry_ms = static_cast<int>(std::ceil(1000.0 / rate));
     return {false, retry_ms};
 }
@@ -121,10 +127,20 @@ public:
     };
 
     explicit RateLimiter(Config cfg)
-        : cfg_(std::move(cfg))
-        , max_buckets_per_shard_(cfg_.max_buckets / kShards)
-        , shards_(kShards)
+        : shards_(kShards)
     {
+        if (cfg.max_buckets < kShards) {
+            LOG_WARN("rate_limit: max_buckets=", cfg.max_buckets,
+                     " < kShards=", kShards, ", clamping to ", kShards);
+            cfg.max_buckets = kShards;
+        }
+        // Sort path prefixes by length descending for deterministic match order
+        std::sort(cfg.path_prefix_limits.begin(), cfg.path_prefix_limits.end(),
+            [](const auto& a, const auto& b) {
+                return a.first.size() > b.first.size();
+            });
+        cfg_ = std::move(cfg);
+        max_buckets_per_shard_ = cfg_.max_buckets / kShards;
         load_snapshot();
     }
 
@@ -200,6 +216,13 @@ public:
     // Update rate limit config (hot reload)
     void update_config(Config cfg) {
         std::lock_guard<std::mutex> lock(cfg_mu_);
+        // Sort path prefixes by length descending (longest match first)
+        // The input order from Config::get_section is non-deterministic (unordered_map),
+        // so explicit sorting is required for deterministic first-match-wins behavior.
+        std::sort(cfg.path_prefix_limits.begin(), cfg.path_prefix_limits.end(),
+            [](const auto& a, const auto& b) {
+                return a.first.size() > b.first.size();
+            });
         cfg_ = std::move(cfg);
         max_buckets_per_shard_ = cfg_.max_buckets / kShards;
     }
