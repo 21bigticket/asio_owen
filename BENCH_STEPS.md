@@ -1,0 +1,224 @@
+# 压测执行手册
+
+## 前置条件
+
+### 服务启动
+
+```bash
+# 1. 确保 Redis 运行
+redis-cli ping || redis-server --daemonize yes
+
+# 2. 确保上游 zebra-config 运行
+curl -s --max-time 3 http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey \
+  -H 'Content-Type: application/json' \
+  -d '{"appid":"member_03150715","config_key":"black_list"}' | head -1
+
+# 3. 杀旧 server（精确匹配进程名，不会误杀 redis-server）
+pgrep -x server | xargs kill -9 2>/dev/null
+sleep 2
+
+# 4. 启动新 server
+cd /mnt/mac/Users/mac/code/croot/asio_owen/build
+rm -f server.log
+./server > /dev/null 2>&1 &
+sleep 3
+
+# 5. 确认服务正常
+curl -s http://127.0.0.1:8081/api/health
+# 期望: {"code":0,"msg":"ok","data":"running"}
+```
+
+### 清理日志（每轮压测前）
+
+```bash
+rm -f /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log
+```
+
+---
+
+## 步骤 1：Health（纯网关，无 IO）
+
+```bash
+echo "=== Health #1 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/health 2>&1 | grep -A3 'Elapsed.*30s'
+sleep 15
+
+echo "=== Health #2 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/health 2>&1 | grep -A3 'Elapsed.*30s'
+
+echo "=== 检查 ==="
+grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health
+```
+
+---
+
+## 步骤 2：Redis
+
+```bash
+echo "=== Redis #1 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/redis 2>&1 | grep -A3 'Elapsed.*30s'
+sleep 15
+
+echo "=== Redis #2 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/redis 2>&1 | grep -A3 'Elapsed.*30s'
+
+echo "=== 检查 ==="
+grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis
+```
+
+---
+
+## 步骤 3：MySQL
+
+```bash
+echo "=== MySQL #1 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/mysql 2>&1 | grep -A3 'Elapsed.*30s'
+sleep 15
+
+echo "=== MySQL #2 ==="
+/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/mysql 2>&1 | grep -A3 'Elapsed.*30s'
+
+echo "=== 检查 ==="
+grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql
+```
+
+---
+
+## 步骤 4：Config 直连（上游 baseline）
+
+```bash
+BODY='{"appid":"member_03150715","config_key":"black_list"}'
+
+echo "=== Config Direct #1 ==="
+/root/go/bin/plow -c 100 -d 30s -m POST \
+  -H 'Content-Type: application/json' \
+  -b "$BODY" \
+  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
+sleep 15
+
+echo "=== Config Direct #2 ==="
+/root/go/bin/plow -c 100 -d 30s -m POST \
+  -H 'Content-Type: application/json' \
+  -b "$BODY" \
+  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
+
+echo "=== 检查 ==="
+grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
+```
+
+---
+
+## 步骤 5：Config 网关转发
+
+```bash
+BODY='{"appid":"member_03150715","config_key":"black_list"}'
+
+echo "=== Config Via Gateway #1 ==="
+/root/go/bin/plow -c 100 -d 30s -m POST \
+  -H 'Content-Type: application/json' \
+  -b "$BODY" \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
+sleep 15
+
+echo "=== Config Via Gateway #2 ==="
+/root/go/bin/plow -c 100 -d 30s -m POST \
+  -H 'Content-Type: application/json' \
+  -b "$BODY" \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
+
+echo "=== 检查 ==="
+grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
+```
+
+---
+
+## 步骤 6：ASAN 内存检查压测
+
+```bash
+# 编译
+cd /mnt/mac/Users/mac/code/croot/asio_owen
+rm -rf build_asan
+CXX=g++ CC=gcc cmake -B build_asan -S . -Wno-dev \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake --build build_asan --target server -j$(nproc)
+
+# 启动
+pgrep -x server | xargs kill -9 2>/dev/null
+sleep 2
+cd build_asan
+rm -f server.log
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server > /tmp/asan_stdout.log 2>&1 &
+sleep 3
+curl -s http://127.0.0.1:8081/api/health
+
+# 记录初始 RSS
+PID=$(pgrep -x server)
+grep VmRSS /proc/$PID/status
+
+# 分阶段压测（每个 3min，间隔 15s 观察 RSS）
+echo "=== Phase 1: Health 3min ==="
+/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/health 2>&1 | tail -3
+grep VmRSS /proc/$PID/status
+sleep 15
+
+echo "=== Phase 2: Redis 3min ==="
+/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/redis 2>&1 | tail -3
+grep VmRSS /proc/$PID/status
+sleep 15
+
+echo "=== Phase 3: MySQL 3min ==="
+/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/mysql 2>&1 | tail -3
+grep VmRSS /proc/$PID/status
+sleep 15
+
+echo "=== Phase 4: Config Gateway 3min ==="
+BODY='{"appid":"member_03150715","config_key":"black_list"}'
+/root/go/bin/plow -c 100 -d 180s -m POST \
+  -H 'Content-Type: application/json' \
+  -b "$BODY" \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | tail -3
+grep VmRSS /proc/$PID/status
+
+# 正常退出（SIGTERM 触发 LSAN 检测）
+kill -TERM $PID
+wait $PID 2>/dev/null
+echo "=== ASAN done. Check stderr for leak report ==="
+```
+
+---
+
+## 结果记录模板
+
+| 接口 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
+|:----|:------:|:------:|:--------:|:------:|
+| Health | | | | % |
+| Redis | | | | % |
+| MySQL | | | | % |
+| Config 直连 | | | | % |
+| Config 网关 | | | | % |
+
+### ASAN RSS 记录
+
+| 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 |
+|:----|:------------:|:------------:|:----:|
+| Health 3min | | | |
+| Redis 3min | | | |
+| MySQL 3min | | | |
+| Config 3min | | | |
+
+---
+
+## 陷阱记录
+
+| 陷阱 | 说明 |
+|:----|:------|
+| ❌ `pkill -9 server` | 会误杀 `redis-server`，改用 `pgrep -x server \| xargs kill -9` |
+| ❌ `-b @/tmp/file.json` | plow 不支持 `-b @file` 语法，发的是文件名本身，上游返回 404 |
+| ❌ `-d '{"key":"val"}'` | `-d` 是 duration 不是 body，body 用 `-b` |
+| ❌ 旧 server 未完全退出就启动 | 新版 bind 失败，`sleep 2` 等端口释放 |
