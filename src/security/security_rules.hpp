@@ -179,11 +179,9 @@ public:
         bool is_whitelisted = auth_whitelist_.is_whitelisted(path, service);
 
         // 7. JWT verification (non-whitelisted paths, using jwt_copy without lock)
+        // If jwt_secret is empty (jwt_copy == nullptr), JWT is disabled — skip verification.
         std::optional<JWTClaims> claims;
-        if (!is_whitelisted) {
-            if (!jwt_copy) {
-                return {401, "jwt not configured"};
-            }
+        if (!is_whitelisted && jwt_copy) {
             claims = jwt_copy->verify(auth_header);
             if (!claims) {
                 return {401, "invalid jwt"};

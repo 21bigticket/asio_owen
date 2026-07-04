@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <fstream>
 #include <cstring>
+#include <filesystem>
 
 #include "../common/logger.hpp"
 
@@ -120,7 +121,7 @@ public:
         double global_rps = 50000.0;
         size_t max_buckets = 100000;
         int snapshot_interval_sec = 30;
-        std::string snapshot_path = "/var/lib/asio_owen/rate_limit.bin";
+        std::string snapshot_path = "./rate_limit.bin";   // relative path, dev-friendly; override for production
         std::unordered_map<std::string, RateLimitRule> path_limits;
         std::vector<std::pair<std::string, RateLimitRule>> path_prefix_limits;
         std::unordered_map<std::string, RateLimitRule> service_limits;
@@ -231,6 +232,15 @@ public:
     void persist_snapshot() {
         // prevent concurrent persist from destructor and timer
         if (snapshot_busy_.exchange(true)) return;
+
+        // Ensure parent directory exists for snapshot file
+        auto parent_end = cfg_.snapshot_path.find_last_of('/');
+        if (parent_end != std::string::npos && parent_end > 0) {
+            auto dir = cfg_.snapshot_path.substr(0, parent_end);
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            // silent failure -- write_snapshot will log WARN if it fails
+        }
 
         Snapshot snap;
         snap.header.written_at_ms = now_ms();

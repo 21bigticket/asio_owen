@@ -328,38 +328,32 @@ ctest --test-dir build --output-on-failure
 ### plow POST 请求
 
 ```bash
-# 直接指定 body 字符串
-plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/example \
-  -m POST \
+# 直接指定 body 字符串（-b 参数接收字符串，-d 是 duration 不是 body）
+plow -c 100 -d 30s -m POST \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <token>' \
-  -d '{"key":"value"}'
-
-# 从文件读取 body（必须加 @ 前缀）
-echo '{"key":"value"}' > /tmp/body.json
-plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/example \
-  -m POST \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer <token>' \
-  --body=@/tmp/body.json
+  -b '{"key":"value"}' \
+  http://127.0.0.1:8081/api/example
 ```
 
-> **注意：** `--body` 参数如果值是文件路径，必须加 `@` 前缀（`--body=@file.json`），否则 body 内容会是文件名字符串本身，而非文件内容，导致上游解析失败返回 4xx。
+> **注意：** `-b` 是 body 参数，`-d` 是 duration（时长），不要搞混。
+> ⚠️ 实测 `-b @/tmp/file.json` 语法在当前 plow 版本（v1.x）无效，会发送文件名字符串本身而非文件内容，导致上游返回 404。必须用 `-b '{"key":"val"}'` 直接传 JSON 字符串。
+> 如果 JSON 较长或需要换行，可以先赋值给 shell 变量：`BODY='{"key":"val"}'` 然后 `-b "$BODY"`。
 
 ### plow GET 请求
 
 ```bash
-plow --concurrency=100 --duration=30s http://127.0.0.1:8081/api/health
+plow -c 100 -d 30s http://127.0.0.1:8081/api/health
 ```
 
 ### 常用参数
 
-| 参数 | 说明 |
-|------|------|
-| `--concurrency=N` | 并发连接数 |
-| `--duration=DUR` | 压测时长，如 `30s`、`2m` |
-| `-m METHOD` | HTTP 方法（GET / POST / PUT 等） |
-| `-H 'Key: Value'` | 请求头，可重复 |
-| `-d 'body'` | 请求 body 字符串 |
-| `--body=@file` | 从文件读取 body（必须带 `@`） |
-| `-T 'Content-Type'` | 快捷设置 Content-Type 头 |
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `-c, --concurrency=N` | 并发连接数 | `-c 100` |
+| `-d, --duration=DUR` | 压测时长 | `-d 30s`、`-d 5m` |
+| `-m, --method=METHOD` | HTTP 方法 | `-m POST` |
+| `-H 'Key: Value'` | 请求头，可重复 | `-H 'Content-Type: application/json'` |
+| `-b, --body=BODY` | 请求 body；以 `@` 开头则为文件路径 | `-b '{"k":"v"}'`、`-b @file.json` |
+| `-T, --content=TYPE` | 快捷设置 Content-Type 头 | `-T 'application/json'` |
+| `--json` | 输出 JSON 格式结果 | `--json` |

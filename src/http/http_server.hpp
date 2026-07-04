@@ -719,8 +719,14 @@ private:
                 while (client_preread.find("\r\n\r\n") == std::string::npos) {
                     auto n = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
                     if (!n) {
-                        LOG_WARN("Client read returned 0 before request header complete, preread=",
-                            client_preread.size());
+                        if (client_preread.empty()) {
+                            // Peer closed before sending any data -- LB probe / port scan, not abnormal
+                            LOG_DEBUG("Client closed before sending any data");
+                        } else {
+                            // Partial data received but header incomplete -- client bug or network issue
+                            LOG_WARN("Client read returned 0 mid-header, preread=",
+                                client_preread.size());
+                        }
                         co_return;
                     }
                     client_preread.append(buf, n);
