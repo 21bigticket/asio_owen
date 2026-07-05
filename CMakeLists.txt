@@ -187,8 +187,21 @@ add_executable(server
 )
 target_link_libraries(server PRIVATE asio_owen_deps)
 
-# 构建后自动复制 config.ini 到输出目录
+# 构建后自动复制 config 文件到输出目录
 configure_file(${PROJECT_SOURCE_DIR}/config.ini ${CMAKE_CURRENT_BINARY_DIR}/config.ini COPYONLY)
+
+# 复制 config.d/ 目录（如果存在），排除本地覆盖文件
+if(EXISTS ${PROJECT_SOURCE_DIR}/config.d)
+    file(COPY ${PROJECT_SOURCE_DIR}/config.d/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/config.d/
+        PATTERN "99-local.ini" EXCLUDE)
+    message(STATUS "config.d: copied to build directory (excluded 99-local.ini)")
+endif()
+
+# 复制 jwt_keys/ 公钥目录（如果存在，供 RS256 JWT 验证使用）
+if(EXISTS ${PROJECT_SOURCE_DIR}/jwt_keys)
+    file(COPY ${PROJECT_SOURCE_DIR}/jwt_keys/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/jwt_keys/)
+    message(STATUS "jwt_keys: copied to build directory")
+endif()
 
 # ==================== GoogleTest（本地已有才启用，否则跳过）====================
 if(EXISTS ${PROJECT_SOURCE_DIR}/googletest/CMakeLists.txt)

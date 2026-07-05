@@ -173,25 +173,6 @@ int main(int argc, char* argv[]) {
             g_security_rules->load_from_config(cfg);
             g_server->set_security_rules(g_security_rules.get());
 
-            // security rules hot-reload timer (shared_ptr wraps self-reference to avoid dangling)
-            int reload_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
-            if (reload_sec > 0) {
-                g_reload_timer = std::make_unique<asio::steady_timer>(ioc);
-                auto schedule_reload = std::make_shared<std::function<void()>>();
-                *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), reload_sec]() {
-                    timer->expires_after(std::chrono::seconds(reload_sec));
-                    timer->async_wait([this_reload](std::error_code ec) {
-                        if (ec) return;
-                        Config new_cfg;
-                        if (new_cfg.load("config.ini") && g_security_rules) {
-                            g_security_rules->reload(new_cfg);
-                        }
-                        if (*this_reload) (*this_reload)();
-                    });
-                };
-                (*schedule_reload)();
-            }
-
             // rate limit snapshot persist timer (shared_ptr wraps self-reference)
             int snapshot_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
             if (snapshot_sec > 0 && g_security_rules->has_rate_limiter()) {
@@ -217,9 +198,8 @@ int main(int argc, char* argv[]) {
             g_server->route("/api/mysql", api_mysql);
             g_server->route("/api/combo", api_combo);
 
-            // register proxy routes: read from [upstream] config section
-            // format: service_name = host:port
-            // example: config = 127.0.0.1:30001
+            // register proxy routes and start reload timer
+            // http_pool_cfg must be in scope for reload callback
             HttpPool::Config http_pool_cfg{
                 .max_size = (size_t)std::max(1, cfg.get_int("http_pool", "max_size", 256)),
                 .max_concurrent = (size_t)std::max(0, cfg.get_int("http_pool", "max_concurrent", 0)),
@@ -233,9 +213,37 @@ int main(int argc, char* argv[]) {
                 auto colon = val.find(':');
                 if (colon != std::string::npos) {
                     auto host = val.substr(0, colon);
-                    int port = std::stoi(val.substr(colon + 1));
-                    g_server->upstreams().add_upstream(key, host, port, http_pool_cfg);
-                    LOG_INFO("upstream ", key, " -> ", host, ":", port);
+                    auto port_str = val.substr(colon + 1);
+                    if (port_str.empty()) continue;
+                    try {
+                        int port = std::stoi(port_str);
+                        g_server->upstreams().add_upstream(key, host, port, http_pool_cfg);
+                        LOG_INFO("upstream ", key, " -> ", host, ":", port);
+                    } catch (...) {
+                        LOG_WARN("upstream ", key, ": invalid port '", port_str, "'");
+                    }
+                }
+            }
+
+            // hot-reload timer: reloads security rules and upstream config every 30s
+            {
+                int reload_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
+                if (reload_sec > 0) {
+                    g_reload_timer = std::make_unique<asio::steady_timer>(ioc);
+                    auto schedule_reload = std::make_shared<std::function<void()>>();
+                    *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), reload_sec, &http_pool_cfg]() {
+                        timer->expires_after(std::chrono::seconds(reload_sec));
+                        timer->async_wait([this_reload, &http_pool_cfg](std::error_code ec) {
+                            if (ec) return;
+                            Config new_cfg;
+                            if (new_cfg.load("config.ini")) {
+                                if (g_security_rules) g_security_rules->reload(new_cfg);
+                                if (g_server) g_server->upstreams().reload(new_cfg, http_pool_cfg);
+                            }
+                            if (*this_reload) (*this_reload)();
+                        });
+                    };
+                    (*schedule_reload)();
                 }
             }
 

@@ -4,16 +4,17 @@
 #include <unordered_map>
 #include <tuple>
 #include <fstream>
+#include <dirent.h>
+#include <algorithm>
+#include <cstring>
 #include "logger.hpp"
 
 class Config {
 public:
-    bool load(const std::string& path) {
+    // Load a single ini file
+    bool load_file(const std::string& path) {
         std::ifstream file(path);
-        if (!file.is_open()) {
-            LOG_ERROR("Config file not found: ", path);
-            return false;
-        }
+        if (!file.is_open()) return false;
 
         std::string line, section;
         while (std::getline(file, line)) {
@@ -32,8 +33,39 @@ public:
             std::string val = line.substr(eq + 1);
             trim(key); trim(val);
             data_[section + "." + key] = val;
-            // Preserve all entries with duplicate keys for list sections
             raw_entries_.emplace_back(section, key, val);
+        }
+        return true;
+    }
+
+    // Load all config files from config.d/ directory next to the given path.
+    // Files are loaded in sorted order by name (00-*.ini loaded first, 99-*.ini last).
+    bool load(const std::string& path) {
+        auto base_dir = path.substr(0, path.find_last_of("/\\") + 1);
+        auto dir_path = base_dir + "config.d";
+
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) {
+            LOG_ERROR("Config directory not found: ", dir_path);
+            return false;
+        }
+
+        // Collect .ini files, sort by name, load in order
+        std::vector<std::string> files;
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name(entry->d_name);
+            if (name.size() > 4 && name.substr(name.size() - 4) == ".ini") {
+                files.push_back(name);
+            }
+        }
+        closedir(dir);
+
+        std::sort(files.begin(), files.end());
+        for (auto& f : files) {
+            if (!load_file(dir_path + "/" + f)) {
+                LOG_WARN("Failed to load config: ", dir_path, "/", f);
+            }
         }
         return true;
     }

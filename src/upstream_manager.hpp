@@ -4,14 +4,13 @@
 #include <unordered_set>
 #include <optional>
 #include <memory>
-#include <shared_mutex>
 #include <asio.hpp>
 #include "http_pool.hpp"
 #include "../common/config.hpp"
 #include "../common/logger.hpp"
 
 // Upstream manager: route /{service}/... -> connection pool
-// Uses shared_ptr for pools so in-flight requests keep the old pool alive during hot-reload.
+// Supports hot-reload via reload(const Config&) — adds new, updates existing, removes deleted upstreams.
 class UpstreamManager {
 public:
     struct UpstreamConfig {
@@ -21,7 +20,7 @@ public:
 
     struct RouteResult {
         UpstreamConfig config;
-        std::shared_ptr<HttpPool> pool;
+        HttpPool* pool;
         std::string upstream_path;
     };
 
@@ -30,29 +29,27 @@ public:
     void add_upstream(const std::string& name, std::string host, int port,
                       HttpPool::Config pool_cfg = HttpPool::Config{}) {
         upstreams_[name] = {std::move(host), port};
-        pools_[name] = std::make_shared<HttpPool>(ioc_, std::move(pool_cfg));
+        pools_.try_emplace(name, ioc_, std::move(pool_cfg));
     }
 
-    // Route /{service}/..., returns upstream config, shared pool, and path with service prefix stripped
+    // Route /{service}/..., returns upstream config, pool, and path with service prefix stripped
     // example: /zebra-config/xxx -> service=zebra-config
     std::optional<RouteResult> route(const std::string& path) {
-        std::shared_lock lock(mtx_);
         if (path.empty() || path[0] != '/') return std::nullopt;
         auto end = path.find('/', 1);
         auto svc = (end == std::string::npos) ? path.substr(1) : path.substr(1, end - 1);
         auto it = upstreams_.find(svc);
         if (it == upstreams_.end()) return std::nullopt;
         std::string upstream_path = (end == std::string::npos) ? "/" : path.substr(end);
-        auto pool = pools_.at(svc);
-        return RouteResult{it->second, pool, std::move(upstream_path)};
+        return RouteResult{it->second, &pools_.at(svc), std::move(upstream_path)};
     }
 
     // Hot-reload upstream config from [upstream] section.
-    // Old pool is kept alive by in-flight requests holding shared_ptr references.
+    // Adds new upstreams, updates existing (host:port), removes deleted (shuts down pool).
     void reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
-        std::unique_lock lock(mtx_);
         auto new_upstreams = cfg.get_section("upstream");
 
+        // Track which upstreams are still present after reload
         std::unordered_set<std::string> kept;
 
         for (auto& [name, val] : new_upstreams) {
@@ -60,21 +57,23 @@ public:
             if (colon == std::string::npos) continue;
 
             auto host = val.substr(0, colon);
-            auto port_str = val.substr(colon + 1);
-            if (port_str.empty()) continue;
-            int port = 0;
-            try { port = std::stoi(port_str); } catch (...) { continue; }
+            int port = std::stoi(val.substr(colon + 1));
             kept.insert(name);
 
             auto it = upstreams_.find(name);
             if (it != upstreams_.end()) {
+                // Update existing: check if host:port changed
                 if (it->second.host != host || it->second.port != port) {
-                    // Replace pool: old one lives until last shared_ptr goes out of scope
-                    pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
+                    // Shutdown old pool, replace config
+                    pools_.at(name).shutdown();
+                    pools_.erase(name);
+                    pools_.try_emplace(name, ioc_, pool_cfg);
                     it->second = {std::move(host), port};
                     LOG_INFO("upstream updated: ", name, " -> ", host, ":", port);
                 }
+                // else unchanged, skip
             } else {
+                // New upstream
                 add_upstream(name, host, port, pool_cfg);
                 LOG_INFO("upstream added: ", name, " -> ", host, ":", port);
             }
@@ -88,6 +87,7 @@ public:
             }
         }
         for (auto& name : to_remove) {
+            pools_.at(name).shutdown();
             pools_.erase(name);
             upstreams_.erase(name);
             LOG_INFO("upstream removed: ", name);
@@ -95,8 +95,7 @@ public:
     }
 
 private:
-    mutable std::shared_mutex mtx_;
     asio::io_context& ioc_;
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
-    std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+    std::unordered_map<std::string, HttpPool> pools_;
 };

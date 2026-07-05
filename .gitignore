@@ -18,5 +18,14 @@ build_*/
 server.log
 *.log
 
+# Security keys (not committed)
+jwt_keys/
+
+# Local config override (not committed)
+config.d/99-local.ini
+
+# Security keys (not committed)
+jwt_keys/
+
 # OS files
 .DS_Store

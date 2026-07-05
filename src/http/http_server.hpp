@@ -168,13 +168,15 @@ public:
 
 private:
     // ConnGuard: RAII connection return, auto-mark bad on exception paths
+    // Holds a shared_ptr to HttpPool to keep the pool alive during hot-reload.
     struct ConnGuard {
+        std::shared_ptr<HttpPool> pool_holder_;  // keep pool alive
         std::shared_ptr<HttpPool::State> pool_state_;
         std::unique_ptr<HttpPool::HttpConn> conn_;
         bool good_ = true;
 
-        ConnGuard(HttpPool* pool, std::unique_ptr<HttpPool::HttpConn> conn)
-            : pool_state_(pool->state()), conn_(std::move(conn)) {}
+        ConnGuard(std::shared_ptr<HttpPool> pool, std::unique_ptr<HttpPool::HttpConn> conn)
+            : pool_holder_(std::move(pool)), pool_state_(pool_holder_->state()), conn_(std::move(conn)) {}
 
         ConnGuard(const ConnGuard&) = delete;
         ConnGuard& operator=(const ConnGuard&) = delete;
@@ -978,7 +980,7 @@ private:
                     auto upstream = upman_.route(path_str);
                     if (upstream) {
                         const auto& cfg = upstream->config;
-                        auto* pool = upstream->pool;
+                        auto pool = upstream->pool;  // shared_ptr, keeps pool alive
                         LOG_DEBUG("Proxy route matched: method=", method_str,
                             ", path=", path_str,
                             ", upstream_path=", upstream->upstream_path,
@@ -995,7 +997,7 @@ private:
                                     break;
                                 }
 
-                                ConnGuard guard(pool, std::move(conn_opt));
+                                ConnGuard guard(pool, std::move(conn_opt));  // pool is shared_ptr, keeps old pool alive during hot-reload
                                 auto& conn = guard.conn();
                                 bool can_retry_stale_idle = conn.reused_from_idle && attempt == 0;
 
