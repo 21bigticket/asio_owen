@@ -1,5 +1,21 @@
 # 压测执行手册
 
+## 黄金法则
+
+> **先验证，后压测。** 每次上 plow 前，先 curl 单次确认接口返回 200 + 响应体正常（尤其 JWT Token 是否过期）。
+> 不要拿着一个失效的 token/挂掉的上游直接跑 30s 压测，白白浪费 7~20 分钟。
+
+## 测试环境
+
+| 项目 | 值 |
+|:-----|:----|
+| 虚拟机 | `192.168.139.230`，6 核 / 15GB RAM，Ubuntu 22.04 |
+| 帐密 | `root` / `123456` |
+| 代码挂载 | `/mnt/mac/Users/mac/code/croot/asio_owen`（macOS NFS 自动同步） |
+| 压测工具 | `/root/go/bin/plow` |
+| 构建命令 | `cd /mnt/mac/Users/mac/code/croot/asio_owen && cmake --build build --target server -j\$(nproc)` |
+| 服务端口 | `8081`（网关），`30001`（zebra-config） |
+
 ## 前置条件
 
 ### 服务启动
@@ -39,6 +55,9 @@ rm -f /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log
 ## 步骤 1：Health（纯网关，无 IO）
 
 ```bash
+# 先 curl 验证
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health || exit 1
+
 echo "=== Health #1 ==="
 /root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/health 2>&1 | grep -A3 'Elapsed.*30s'
 sleep 15
@@ -56,6 +75,9 @@ curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/he
 ## 步骤 2：Redis
 
 ```bash
+# 先 curl 验证
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis || exit 1
+
 echo "=== Redis #1 ==="
 /root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/redis 2>&1 | grep -A3 'Elapsed.*30s'
 sleep 15
@@ -73,6 +95,9 @@ curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/re
 ## 步骤 3：MySQL
 
 ```bash
+# 先 curl 验证
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql || exit 1
+
 echo "=== MySQL #1 ==="
 /root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/mysql 2>&1 | grep -A3 'Elapsed.*30s'
 sleep 15
@@ -91,6 +116,12 @@ curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/my
 
 ```bash
 BODY='{"appid":"member_03150715","config_key":"black_list"}'
+
+# 先 curl 验证直连
+curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  -H 'Content-Type: application/json' \
+  -d "$BODY" \
+  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey || exit 1
 
 echo "=== Config Direct #1 ==="
 /root/go/bin/plow -c 100 -d 30s -m POST \
@@ -118,6 +149,13 @@ grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/serve
 ```bash
 BODY='{"appid":"member_03150715","config_key":"black_list"}'
 TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJjbGllbnRfdHlwZSI6ImFkbWluIiwiZGV2aWNlX2lkIjoiN2FmZjAzNTctMjQzNS00NjcxLThlNTMtOTM3MzY3MWUwZTEwIiwiZXhwIjoxNzgzNDIwMTU0LCJpYXQiOjE3ODMxNjA5NTQsImlzcyI6InBpeGl1LWdhdGV3YXkiLCJqdGkiOiIxNzgzMTYwOTU0ODQ5Mjc3NDc3MDkiLCJuYW1lIjoiYWRtaW4iLCJuYmYiOjE3ODMxNjA5NTQsInN1YiI6IjEiLCJ0eXBlIjoiYWNjZXNzIiwidXNlcl9pZCI6MSwidXNlcl9uYW1lIjoiYWRtaW4ifQ.OBgz_LmThzMgOvZ6Mr9xdkv4II15Jmd-QwDJwgK_s6zyAHFmIOnFhvus0g_ThwJXdXiKYWN6dpwZAj_DZjTBoDgC_MWLN1ksydmkR9Ta6ySHp-Y1CdWcmKe2qlae3bQg6Ji19o3ZzJYlpUrcAvKh6EEwLGbOCzCSLxl_ZmfxrWCQKtalUagkOEzINDB9jW7d_n09yg2tfRLEm8pzpSaxtH4dpQHdvNvdn92qt6XWwsOFJlffoLfWukAJvz2DsphfjiFZegk3hBemIq5RrXYKlp0E5pkm8BDY_usL84MCAYYM56o3SWkD5EqWthIuqJZ7vAgSZe_C-QHEo8eQOxAkIw'
+
+# 先 curl 验证网关（Token 是否过期，服务是否正常）
+curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "$BODY" \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey || exit 1
 
 echo "=== Config Via Gateway #1 ==="
 /root/go/bin/plow -c 100 -d 30s -m POST \
@@ -169,17 +207,21 @@ curl -s http://127.0.0.1:8081/api/health
 grep VmRSS /proc/$ASAN_PID/status
 
 # 分阶段压测（每个 3min，间隔 15s 观察 RSS）
+# 每阶段先 curl 确认接口正常
 echo "=== Phase 1: Health 3min ==="
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health || break
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/health 2>&1 | tail -3
 grep VmRSS /proc/$ASAN_PID/status
 sleep 15
 
 echo "=== Phase 2: Redis 3min ==="
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis || break
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/redis 2>&1 | tail -3
 grep VmRSS /proc/$ASAN_PID/status
 sleep 15
 
 echo "=== Phase 3: MySQL 3min ==="
+curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql || break
 /root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/mysql 2>&1 | tail -3
 grep VmRSS /proc/$ASAN_PID/status
 sleep 15
@@ -187,6 +229,11 @@ sleep 15
 echo "=== Phase 4: Config Gateway 3min ==="
 TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJjbGllbnRfdHlwZSI6ImFkbWluIiwiZGV2aWNlX2lkIjoiN2FmZjAzNTctMjQzNS00NjcxLThlNTMtOTM3MzY3MWUwZTEwIiwiZXhwIjoxNzgzNDIwMTU0LCJpYXQiOjE3ODMxNjA5NTQsImlzcyI6InBpeGl1LWdhdGV3YXkiLCJqdGkiOiIxNzgzMTYwOTU0ODQ5Mjc3NDc3MDkiLCJuYW1lIjoiYWRtaW4iLCJuYmYiOjE3ODMxNjA5NTQsInN1YiI6IjEiLCJ0eXBlIjoiYWNjZXNzIiwidXNlcl9pZCI6MSwidXNlcl9uYW1lIjoiYWRtaW4ifQ.OBgz_LmThzMgOvZ6Mr9xdkv4II15Jmd-QwDJwgK_s6zyAHFmIOnFhvus0g_ThwJXdXiKYWN6dpwZAj_DZjTBoDgC_MWLN1ksydmkR9Ta6ySHp-Y1CdWcmKe2qlae3bQg6Ji19o3ZzJYlpUrcAvKh6EEwLGbOCzCSLxl_ZmfxrWCQKtalUagkOEzINDB9jW7d_n09yg2tfRLEm8pzpSaxtH4dpQHdvNvdn92qt6XWwsOFJlffoLfWukAJvz2DsphfjiFZegk3hBemIq5RrXYKlp0E5pkm8BDY_usL84MCAYYM56o3SWkD5EqWthIuqJZ7vAgSZe_C-QHEo8eQOxAkIw'
 BODY='{"appid":"member_03150715","config_key":"black_list"}'
+curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "$BODY" \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey || break
 /root/go/bin/plow -c 100 -d 180s -m POST \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $TOKEN" \
@@ -235,27 +282,66 @@ echo "=== ASAN done ==="
 | ❌ `-d '{"key":"val"}'` | `-d` 是 duration 不是 body，body 用 `-b` |
 | ❌ 旧 server 未完全退出就启动 | 新版 bind 失败，`sleep 2` 等端口释放 |
 | ❌ Config 网关缺少 JWT 头 | 网关启用 JWT 鉴权后，缺少 `Authorization: Bearer` 会返回 401/403 |
+| ❌ 拿着失效 token/挂掉上游直接压测 | 浪费 7~20 分钟。先用 curl 单次确认 200，再上 plow |
 | ❌ ASAN 版本 LSAN 报告被 `2>&1` 吞掉 | 不要用 `./server > /dev/null 2>&1`，LSAN 报告在 stderr；或用 `ASAN_OPTIONS=log_path=/tmp/asan_log` |
 
-## v3.5 已验证的结果记录
+## v3.6 压测结果（wrk，VM 本地，2026-07-05）
 
-### 常规压测（30s × 2，100 并发）
+### 工具与参数
 
-| 接口 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
-|:----|:------:|:------:|:--------:|:------:|
-| Health | 75,131 | 74,829 | **74,980** | 100% |
-| Redis | 22,685 | 22,511 | **22,598** | 100% |
-| MySQL | 7,708 | 7,688 | **7,698** | 100% |
-| Config 直连 | 6,199 | 6,167 | **6,183** | 100% |
-| Config 网关 | 5,492 | 5,776 | **5,634** | 100% |
+- **工具：** wrk 4.1.0（VM 本地安装）
+- **配置：** 30 线程 / 100 连接 / 30s 时长 / 10s 超时
+- **程序状态：** 去掉 `Connection: keep-alive` 硬编码，`case_sensitive_paths = true`，Config 接口免鉴权
 
-### ASAN RSS 记录（每阶段 3min）
+### 结果
+
+| 接口 | #1 RPS | #2 RPS | 平均 RPS | avg_lat | Socket Errors |
+|:----|:------:|:------:|:--------:|:-------:|:-------------:|
+| Health | 94,812 | 97,097 | **95,955** | 0.96ms | 0 |
+| Redis | 25,930 | 27,206 | **26,568** | 3.42ms | 0 |
+| MySQL | 10,533 | 8,419 | **9,476** | 10.62ms | 0 |
+| Config 直连 | 4,483 | 4,309 | **4,396** | 22.79ms | 0 |
+| Config 网关 | 3,405 | 4,679 | **4,042** | 24.25ms | 0 |
+
+**网关转发效率：** 4,042 / 4,396 = **92%**
+
+**错误统计：** 压测期间上游（zebra-config）和网关日志均无 error / timeout / cancel。
+
+### 与 v3.5（plow）对比
+
+> 两轮工具不同（plow vs wrk）、测试位置不同（VM 本地 vs 本机跨网络），绝对值不可直接对比。仅供参考。
+
+| 接口 | v3.5 plow | v3.6 wrk |
+|:----|:---------:|:--------:|
+| Health | 74,980 | **95,955** |
+| Redis | 22,598 | **26,568** |
+| MySQL | 7,698 | **9,476** |
+| Config 直连 | 6,183 | **4,396** |
+| Config 网关 | 5,634 | **4,042** |
+
+### 压测脚本
+
+```bash
+# wrk lua 脚本（bench/wrk_post.lua）
+wrk.method = "POST"
+wrk.body = '{"appid":"member_03150715","config_key":"black_list"}'
+wrk.headers["Content-Type"] = "application/json"
+
+# 全部压测
+bash bench/bench_full.sh
+
+# 单接口
+bash bench/verify.sh config     # curl 确认 + wrk 5s 小批量
+THREADS=30 bash bench/bench.sh config  # 正式压测
+```
+
+完整脚本见 `bench/` 目录。
+
+### ASAN RSS 记录（待执行）
 
 | 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 |
 |:----|:------------:|:------------:|:----:|
-| Health 3min | 3,668 KB | 2,772 KB | -24% |
-| Redis 3min | 3,704 KB | 2,612 KB | -30% |
-| MySQL 3min | 3,744 KB | 2,728 KB | -27% |
-| Config 3min | 3,668 KB | 2,736 KB | -25% |
-
-> 结论：全部 2xx，无泄漏趋势，RSS 不增反降。
+| Health 3min | - | - | - |
+| Redis 3min | - | - | - |
+| MySQL 3min | - | - | - |
+| Config 3min | - | - | - |

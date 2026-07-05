@@ -226,23 +226,38 @@ int main(int argc, char* argv[]) {
             }
 
             // hot-reload timer: reloads security rules and upstream config every 30s
+            // The interval itself is also hot-reloadable — each cycle re-reads
+            // config_reload_interval_sec from the latest config and re-arms.
             {
-                int reload_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
-                if (reload_sec > 0) {
-                    g_reload_timer = std::make_unique<asio::steady_timer>(ioc);
-                    auto schedule_reload = std::make_shared<std::function<void()>>();
-                    *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), reload_sec, &http_pool_cfg]() {
-                        timer->expires_after(std::chrono::seconds(reload_sec));
+                if (g_reload_timer) g_reload_timer->cancel();
+                g_reload_timer = std::make_unique<asio::steady_timer>(ioc);
+                auto schedule_reload = std::make_shared<std::function<void()>>();
+                *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), &http_pool_cfg]() {
+                    Config new_cfg;
+                    if (!new_cfg.load("config.ini")) {
+                        // reload failed — retry with default 30s
+                        timer->expires_after(std::chrono::seconds(30));
                         timer->async_wait([this_reload, &http_pool_cfg](std::error_code ec) {
                             if (ec) return;
-                            Config new_cfg;
-                            if (new_cfg.load("config.ini")) {
-                                if (g_security_rules) g_security_rules->reload(new_cfg);
-                                if (g_server) g_server->upstreams().reload(new_cfg, http_pool_cfg);
-                            }
                             if (*this_reload) (*this_reload)();
                         });
-                    };
+                        return;
+                    }
+                    if (g_security_rules) g_security_rules->reload(new_cfg);
+                    if (g_server) g_server->upstreams().reload(new_cfg, http_pool_cfg);
+
+                    // re-arm with the latest interval (supports hot-changing the interval itself)
+                    int next_sec = new_cfg.get_int("security", "config_reload_interval_sec", 30);
+                    if (next_sec > 0) {
+                        timer->expires_after(std::chrono::seconds(next_sec));
+                        timer->async_wait([this_reload, &http_pool_cfg](std::error_code ec) {
+                            if (ec) return;
+                            if (*this_reload) (*this_reload)();
+                        });
+                    }
+                };
+                int reload_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
+                if (reload_sec > 0) {
                     (*schedule_reload)();
                 }
             }

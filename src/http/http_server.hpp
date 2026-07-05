@@ -1005,7 +1005,6 @@ private:
                                 // e.g. /zebra-config/config.ConfigService/xxx -> /config.ConfigService/xxx
                                 std::string forward_req = method_str + " " + upstream->upstream_path + " HTTP/1.1\r\n";
                                 forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
-                                forward_req += "Connection: keep-alive\r\n";
                                 LOG_DEBUG("Proxy request: method=", method_str,
                                     ", path=", path_str,
                                     ", upstream_path=", upstream->upstream_path,
@@ -1013,7 +1012,7 @@ private:
                                     ", body_size=", ctx.body.size());
 
                                 std::vector<std::string> filtered = {
-                                    "connection", "keep-alive", "proxy-authenticate",
+                                    "connection", "proxy-connection", "proxy-authenticate",
                                     "proxy-authorization", "te", "trailer",
                                     "transfer-encoding", "upgrade",
                                     "host", "accept-encoding"
