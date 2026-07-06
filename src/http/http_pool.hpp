@@ -201,23 +201,37 @@ public:
         // No reusable idle connection -> create new one
         std::unique_ptr<HttpConn> new_conn;
         {
-            std::lock_guard lock(shard.mtx);
-            if (!reserved) {
-                if (shard.total >= state->cfg.max_size / kShards + 1) {
-                    // Per-shard limit reached; could try another shard, but for simplicity return nullptr
-                    // The caller should retry or create anyway since max_size is a soft limit per shard.
+            // Try up to kShards shards before giving up (hard limit check)
+            bool all_shards_full = false;
+            for (size_t try_idx = 0; try_idx < kShards; ++try_idx) {
+                auto& try_shard = state->shards[shard_idx];
+                std::lock_guard lock(try_shard.mtx);
+                if (!reserved) {
+                    if (try_shard.total >= (state->cfg.max_size + kShards - 1) / kShards) {
+                        if (try_idx + 1 < kShards) {
+                            shard_idx = (shard_idx + 1) % kShards;
+                            continue;  // try next shard
+                        }
+                        all_shards_full = true;
+                        break;
+                    }
+                    if (state->cfg.max_concurrent > 0 && try_shard.in_flight >= (state->cfg.max_concurrent + kShards - 1) / kShards) {
+                        LOG_WARN("HttpPool: max_concurrent reached on shard ", shard_idx);
+                        co_return nullptr;
+                    }
+                    ++try_shard.total;
+                    ++try_shard.in_flight;
+                    reserved = true;
                 }
-                if (state->cfg.max_concurrent > 0 && shard.in_flight >= state->cfg.max_concurrent / kShards + 1) {
-                    LOG_WARN("HttpPool: max_concurrent reached on shard ", shard_idx);
-                    co_return nullptr;
-                }
-                ++shard.total;
-                ++shard.in_flight;
-                reserved = true;
+                new_conn = std::make_unique<HttpConn>(state->ioc);
+                new_conn->shard_idx = shard_idx;
+                try_shard.active.insert(new_conn.get());
+                break;
             }
-            new_conn = std::make_unique<HttpConn>(state->ioc);
-            new_conn->shard_idx = shard_idx;
-            shard.active.insert(new_conn.get());
+            if (all_shards_full) {
+                LOG_WARN("HttpPool: max_size reached, all shards full");
+                co_return nullptr;
+            }
         }
 
         try {

@@ -17,16 +17,20 @@
 3. **低侵入**：安全中间件是 check 函数链，不改变现有路由和转发逻辑。
 4. **可观测**：拒绝的请求记录日志，包含原因和客户端信息。
 
-## 执行顺序（已修正 Critical 问题）
+## 执行顺序
+
+> **设计原则：** 尽早拒绝，减少资源浪费。当前实现为保持 keep-alive/pipeline 正确性，先完整消费 body 再执行安全链，拒绝后强制 `Connection: close`。
 
 ```
 客户端请求
   ↓
+body 消费（含 chunked de-chunk）
+  ↓
 ① 真实 IP 解析            → 从 XFF 取客户端真实 IP
   ↓
-② IP 黑名单检查            → 403 Forbidden（只查 IP，不依赖路径，先做可尽早拦截）
+② IP 黑名单检查            → 403 Forbidden
   ↓
-③ 路径规范化              → percent-decode + 去点段 + 统一大小写策略（限流前必须规范化）
+③ 路径规范化              → percent-decode + 去点段 + 统一大小写策略 + 剥离 query string
   ↓
 ④ 免鉴权白名单匹配         → 跳过 JWT 验证
   ↓
@@ -34,10 +38,10 @@
   ↓
 ⑥ 路由黑名单检查           → 403 Forbidden
   ↓
-body 消费
-  ↓
 路由分发（本地 / 代理）
 ```
+
+> **为什么 body 消费在先：** 如果先鉴权再消费 body，拒绝后 body 残留管道中，会被后续 pipelined 请求误读为下一个请求的起始。因此必须先完整消费 framing 确定边界，再执行安全链。代价是大 body 的无权限请求仍需先读完。
 
 > **🔴 关键修正：** 真实 IP 解析必须在 IP 黑名单之前。有 LB 时 `socket.remote_endpoint()` 是 LB IP，必须先解析出客户端真实 IP 才能做黑名单判断。
 
@@ -88,6 +92,7 @@ body 消费
 
 ```cpp
 std::string normalize_path(std::string_view raw) {
+    // 0. 先按 ? 剥离 query string
     // 1. percent-decode
     // 2. 去掉 // → /
     // 3. 解析 . 和 .. （不能超出 root）
@@ -117,27 +122,34 @@ verifier.verify(decoded);
 
 ### 🟠 High（逻辑缺陷）
 
-#### H1. 热加载的"原子替换"实现
+#### H1. 热加载实现：细粒度 mutex + shared_ptr 替换
 
-**风险：** `mutex + swap` 让每个请求抢锁，放热路径上影响 RPS。
+**风险：** 当前实现不是 `atomic<shared_ptr>` 无锁读，而是 `rules_mu_` + 内部子模块各自锁。
 
-**修正：** 用 `shared_ptr<const Rules> + atomic_exchange`，读侧无锁。
+**当前实现：**
 
 ```cpp
 class SecurityRules {
-    std::shared_ptr<const Rules> rules_;
-    std::mutex write_mutex_;
-public:
-    std::shared_ptr<const Rules> read() const {
-        return std::atomic_load(&rules_);  // 无锁
+    mutable std::mutex rules_mu_;
+    IpBlacklist ip_blacklist_;
+    AuthWhitelist auth_whitelist_;
+    PathBlacklist path_blacklist_;
+    std::shared_ptr<JWTAuth> jwt_auth_;
+
+    void reload(const Config& cfg) {
+        std::lock_guard<std::mutex> lock(rules_mu_);
+        load_from_config(cfg);
     }
-    void reload(const std::string& path) {
-        auto new_rules = std::make_shared<Rules>(parse(path));
-        std::lock_guard lock(write_mutex_);
-        std::atomic_store(&rules_, new_rules);  // 原子替换
+
+    CheckResult check(...) const {
+        std::lock_guard<std::mutex> lock(rules_mu_);
+        // 复制 proxies_copy 和 jwt_copy，然后释放锁
+        // 子模块内部（IpBlacklist / AuthWhitelist / etc）各自有 mutex
     }
 };
 ```
+
+读侧有少量锁（`rules_mu_` + 子模块 mutex），但锁持有时间极短（仅复制 shared_ptr 和简单查询）。在 Config 免鉴权场景下，热路径上没有 JWT 验证，锁竞争对 RPS 影响有限。
 
 #### H2. 解析失败的回退行为未定义
 
@@ -585,37 +597,40 @@ config_reload_interval_sec = 30
 
 ### 触发方式
 
-双重触发：定时刷新 + SIGHUP。
+定时轮询：每 `config_reload_interval_sec` 秒重新加载配置并替换规则。
 
 ```ini
 [security]
 config_reload_interval_sec = 30   ; 定时刷新间隔（秒），0 表示关闭
 ```
 
-**定时刷新：** `asio::steady_timer` 每 N 秒检查配置文件 `mtime` + `size` 做 fingerprint，有变化则原子替换规则集。
+**定时刷新：** `asio::steady_timer` 每 N 秒调用 `Config::load()` 重新加载所有配置，再调用 `SecurityRules::reload()` 原子替换规则。
 
-**SIGHUP：** 用于紧急场景，立即生效。
+> 当前未实现 SIGHUP 触发，只有定时轮询。
 
-### 原子替换
+### 实现方式
 
 ```cpp
 class SecurityRules {
-    std::atomic<std::shared_ptr<const Rules>> rules_;
+    mutable std::mutex rules_mu_;  // 保护 trusted_proxies_ 和 jwt_auth_ 写操作
+    IpBlacklist ip_blacklist_;
+    AuthWhitelist auth_whitelist_;
+    PathBlacklist path_blacklist_;
+    std::shared_ptr<JWTAuth> jwt_auth_;
 public:
-    std::shared_ptr<const Rules> read() const {
-        return rules_.load(std::memory_order_acquire);
+    void reload(const Config& cfg) {
+        std::lock_guard<std::mutex> lock(rules_mu_);
+        load_from_config(cfg);
     }
-    void reload(const std::string& path) {
-        rules_.store(
-            std::make_shared<const Rules>(parse_security_rules(path)),
-            std::memory_order_release);
+    CheckResult check(...) const {
+        // 1. 复制 proxies_copy 和 jwt_copy（持 rules_mu_ 极短时间）
+        // 2. 释放 rules_mu_ 后执行 IP 黑名单 / 白名单 / JWT 验证
+        //    子模块各自有内部 mutex（IpBlacklist 无锁，AuthWhitelist 有 mu_）
     }
 };
 ```
 
-读侧无锁，不影响热路径 RPS。
-
-> C++20 使用 `std::atomic<std::shared_ptr<T>>`，`std::atomic_load`/`atomic_store` 已弃用。
+读侧有少量 mutex，但持有时间极短。在免鉴权场景下热路径无 JWT 验证，不影响 RPS。
 
 ---
 

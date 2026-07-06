@@ -1028,9 +1028,19 @@ private:
                                 LOG_DEBUG("Proxy header policy: upstream_path=", upstream->upstream_path,
                                     ", forwarding_transfer_encoding=", forwarding_transfer_encoding,
                                     ", original_headers=[", describe_headers(ctx.headers), "]");
+                                // If the original request was chunked, we dechunked the body.
+                                // Forward with Content-Length instead of Transfer-Encoding: chunked.
+                                if (request_header_state.is_chunked) {
+                                    forward_req += "Content-Length: " + std::to_string(ctx.body.size()) + "\r\n";
+                                }
                                 for (auto& [k, v] : ctx.headers) {
                                     auto lk = to_lower(k);
-                                    // transfer-encoding: chunked must be preserved for downstream parsing
+                                    // transfer-encoding: chunked was dechunked; skip forwarding TE
+                                    if (lk == "transfer-encoding" && request_header_state.is_chunked) {
+                                        LOG_DEBUG("Proxy forward header skip: ", k,
+                                            ", reason=dechunked-body");
+                                        continue;
+                                    }
                                     if (lk == "transfer-encoding") {
                                         LOG_DEBUG("Proxy forward header keep: ", k,
                                             "=", sanitize_header_value(k, v));

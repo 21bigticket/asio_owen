@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-HOST=${HOST:-192.168.139.230}
+HOST=${HOST:-127.0.0.1}
 DURATION=5s
 CONCURRENCY=50
 THREADS=4
@@ -16,16 +16,19 @@ ok()   { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
 verify() {
-    local label="$1" url="$2" script="$3"
+    local label="$1" url="$2" script="$3" method="${4:-GET}" body="${5:-}"
     echo ""
     echo "=== $label ==="
 
     # 1. curl 单次确认
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
-      -H "Content-Type: application/json" \
-      -d '{"appid":"member_03150715","config_key":"black_list"}' \
-      "$url" 2>/dev/null)
+    if [ "$method" = "POST" ]; then
+        code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X POST \
+          -H "Content-Type: application/json" \
+          -d "$body" "$url" 2>/dev/null)
+    else
+        code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
+    fi
     if [ "$code" != "200" ]; then
         fail "curl $url => HTTP $code (expected 200)"
         return
@@ -50,24 +53,26 @@ verify() {
 
 case "${1:-all}" in
     config)
+        BODY='{"appid":"member_03150715","config_key":"black_list"}'
         verify "Config Direct" \
           "http://${HOST}:30001/config.ConfigService/GetByAppAndKey" \
-          "bench/wrk_post.lua"
+          "bench/wrk_post.lua" POST "$BODY"
         verify "Config Gateway" \
           "http://${HOST}:8081/zebra-config/config.ConfigService/GetByAppAndKey" \
-          "bench/wrk_post.lua"
+          "bench/wrk_post.lua" POST "$BODY"
         ;;
     health)
         verify "Health" "http://${HOST}:8081/api/health" "bench/wrk_get.lua"
         ;;
     all)
+        BODY='{"appid":"member_03150715","config_key":"black_list"}'
         verify "Health" "http://${HOST}:8081/api/health" "bench/wrk_get.lua"
         verify "Config Direct" \
           "http://${HOST}:30001/config.ConfigService/GetByAppAndKey" \
-          "bench/wrk_post.lua"
+          "bench/wrk_post.lua" POST "$BODY"
         verify "Config Gateway" \
           "http://${HOST}:8081/zebra-config/config.ConfigService/GetByAppAndKey" \
-          "bench/wrk_post.lua"
+          "bench/wrk_post.lua" POST "$BODY"
         ;;
 esac
 

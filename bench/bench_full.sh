@@ -9,15 +9,15 @@
 #   bash bench/bench_full.sh config       # 只跑 config
 #
 # 环境变量:
-#   DURATION=30s  CONCURRENCY=100  THREADS=10  COOLDOWN=10
-#   HOST=192.168.139.230
+#   DURATION=30s  CONCURRENCY=100  THREADS=30  COOLDOWN=10
+#   HOST=127.0.0.1
 # ============================================================
 set -uo pipefail
 
-HOST=${HOST:-192.168.139.230}
+HOST=${HOST:-127.0.0.1}
 DURATION=${DURATION:-30s}
 CONCURRENCY=${CONCURRENCY:-100}
-THREADS=${THREADS:-10}
+THREADS=${THREADS:-30}
 TIMEOUT=10s
 COOLDOWN=${COOLDOWN:-10}
 ROUNDS=2
@@ -93,7 +93,7 @@ case "${1:-all}" in
         run_rounds "MySQL" "http://${HOST}:8081/api/mysql" "bench/wrk_get.lua"
         ;;
     config)
-        local BODY='{"appid":"member_03150715","config_key":"black_list"}'
+        BODY='{"appid":"member_03150715","config_key":"black_list"}'
         run_rounds "Config Direct" \
           "http://${HOST}:30001/config.ConfigService/GetByAppAndKey" \
           "bench/wrk_post.lua" POST "$BODY"
@@ -101,9 +101,9 @@ case "${1:-all}" in
           "http://${HOST}:8081/zebra-config/config.ConfigService/GetByAppAndKey" \
           "bench/wrk_post.lua" POST "$BODY"
         ;;
-    all)
+    all|*)
         # Health → 暂停 → Redis → 暂停 → MySQL → 暂停 → Config
-        local BODY='{"appid":"member_03150715","config_key":"black_list"}'
+        BODY='{"appid":"member_03150715","config_key":"black_list"}'
 
         run_rounds "Health" "http://${HOST}:8081/api/health" "bench/wrk_get.lua"
         echo ""; echo "--- 暂停 ${COOLDOWN}s ---"; sleep "$COOLDOWN"

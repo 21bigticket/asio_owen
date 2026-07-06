@@ -7,15 +7,15 @@
 #   bash bench/bench.sh health       # 只跑 health (GET)
 #
 # 环境变量:
-#   DURATION=30s  CONCURRENCY=100  THREADS=10
-#   HOST=192.168.139.230  (VM 地址)
+#   DURATION=30s  CONCURRENCY=100  THREADS=30
+#   HOST=127.0.0.1  (VM 地址)
 # ============================================================
 set -uo pipefail
 
-HOST=${HOST:-192.168.139.230}
+HOST=${HOST:-127.0.0.1}
 DURATION=${DURATION:-30s}
 CONCURRENCY=${CONCURRENCY:-100}
-THREADS=${THREADS:-10}
+THREADS=${THREADS:-30}
 TIMEOUT=10s
 
 PASS=0

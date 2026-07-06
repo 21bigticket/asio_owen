@@ -51,6 +51,12 @@ inline std::string percent_decode(std::string_view s) {
 // case_sensitive=false (default): normalize to lowercase for uniform ACL matching
 // case_sensitive=true: preserve original case
 inline NormalizedPath normalize_path(std::string_view path_only, bool case_sensitive = false) {
+    // Strip query string before normalization
+    auto qpos = path_only.find('?');
+    if (qpos != std::string_view::npos) {
+        path_only = path_only.substr(0, qpos);
+    }
+
     // 1. percent-decode (%2F preserved as literal)
     std::string decoded = percent_decode(path_only);
     if (decoded.empty()) {

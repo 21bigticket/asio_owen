@@ -85,10 +85,12 @@ struct HeaderParseState {
 
 ## 分块传输处理
 
-请求侧 chunked body 会按原始 chunked 字节转发给上游，因为上游期望看到客户端发来的同样 chunk framing。解析使用协议感知的 `read_chunked_stream`：
+请求侧 chunked body 被完整反分块（de-chunk）后再转发，不保留原始 chunk framing。
+
+实现使用协议感知的 `read_chunked_stream`：
 
 1. `consume_line` 读取到 `\r\n`。
-2. `parse_hex_size_line` 解析十六进制 chunk size，允许 `;` 后的 chunk extension。
+2. `parse_hex_size_line` 解析十六进制 chunk size，允许 `；` 后的 chunk extension。
 3. `consume_exact` 精确读取 `size` 字节数据和后续 CRLF，并校验末尾 `\r\n`。
 4. size 为 0 时继续读取 trailers，直到空行结束。
 
@@ -96,12 +98,15 @@ struct HeaderParseState {
 
 `max_body_size` 限制作用在完整输出 buffer 上，包括 chunk 数据和 trailers，并且每次 append 后都检查。
 
+当有 chunked 请求转发给上游时，网关会 de-chunk 后重写 `Content-Length`，不再保留 `Transfer-Encoding: chunked`。响应侧同样：网关会接管响应 framing，必要时 de-chunk，并重新计算 `Content-Length`。
+
 ## 逐跳 Header
 
 请求和响应转发都会移除 hop-by-hop header：
 
 - `Connection`
 - `Keep-Alive`
+- `Proxy-Connection`
 - `Proxy-Authenticate`
 - `Proxy-Authorization`
 - `TE`
@@ -109,9 +114,11 @@ struct HeaderParseState {
 - `Transfer-Encoding`
 - `Upgrade`
 
-`Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`，并显式发送 `Connection: keep-alive`。当前实现还会过滤 `Accept-Encoding`，避免上游返回 gzip/br 压缩 body 后影响网关日志和排查。
+`Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`。
 
-请求侧如果是 `Transfer-Encoding: chunked`，会保留 `Transfer-Encoding` 并移除 `Content-Length`，原始 chunked body 字节原样转发给上游。响应侧不同：网关会接管响应 framing，必要时 de-chunk，并重新计算 `Content-Length`。
+> `Connection: keep-alive` 不再显式发送（HTTP/1.1 默认 keep-alive），避免触发 dubbo-go 的 h2c 升级检测。
+
+请求侧如果是 `Transfer-Encoding: chunked`，网关会移除 `Transfer-Encoding` 并写入 `Content-Length`。响应侧：网关接管响应 framing，必要时 de-chunk 并计算 Content-Length。
 
 ## 响应分帧
 
