@@ -2,7 +2,7 @@
 
 ## 黄金法则
 
-> **先验证，后压测。** 每次上 plow 前，先 curl 单次确认接口返回 200 + 响应体正常（尤其 JWT Token 是否过期）。
+> **先验证，后压测。** 每次压测前，先 curl 单次确认接口返回 200 + 响应体正常（尤其 JWT Token 是否过期）。
 > 不要拿着一个失效的 token/挂掉的上游直接跑 30s 压测，白白浪费 7~20 分钟。
 
 ## 测试环境
@@ -12,9 +12,120 @@
 | 虚拟机 | `192.168.139.230`，6 核 / 15GB RAM，Ubuntu 22.04 |
 | 帐密 | `root` / `123456` |
 | 代码挂载 | `/mnt/mac/Users/mac/code/croot/asio_owen`（macOS NFS 自动同步） |
-| 压测工具 | `/root/go/bin/plow` |
-| 构建命令 | `cd /mnt/mac/Users/mac/code/croot/asio_owen && cmake --build build --target server -j\$(nproc)` |
+| 构建命令 | `cd /mnt/mac/Users/mac/code/croot/asio_owen && /usr/bin/cmake --build build --target server -j\$(nproc)` |
 | 服务端口 | `8081`（网关），`30001`（zebra-config） |
+
+## 压测工具规范
+
+### 统一使用 wrk
+
+以后压测统一使用 **wrk**（VM 本地已安装 wrk 4.1.0），原因：
+
+- wrk 纯 epoll 多线程，数据更稳定
+- wrk 输出连接错误统计（Socket Errors、Non-2xx）
+- 本机 macOS 和 VM Ubuntu 均可安装
+- plow 作为补充工具保留，仅用于特殊场景
+
+### wrk Lua 脚本规范
+
+所有 POST 请求用 Lua 脚本，存放于 `bench/` 目录：
+
+| 脚本 | 用途 |
+|:-----|:-----|
+| `bench/wrk_post.lua` | POST JSON（不带 JWT token） |
+| `bench/wrk_jwt.lua` | POST JSON（带 JWT token） |
+| `bench/wrk_get.lua` | GET 请求 |
+
+创建示例：
+```bash
+cat > /tmp/wrk_post.lua << "EOF"
+wrk.method = "POST"
+wrk.body = '{"appid":"member_03150715","config_key":"black_list"}'
+wrk.headers["Content-Type"] = "application/json"
+EOF
+```
+
+### 参数规范
+
+| 参数 | 常规压测值 | 小批量验证值 | 说明 |
+|:-----|:---------:|:-----------:|:-----|
+| `-t`（线程） | 30 | 4 | 网关 Health 用 30 最优；纯 IO 接口（Redis/MySQL）也用 30 |
+| `-c`（连接） | 100 | 50 | 保持 100 连接不变 |
+| `-d`（时长） | 30s | 5s | 每轮 30s，每接口 2 轮 |
+| `--timeout` | 10s | 10s | 超时 10s，避免长尾请求挂住 |
+| 轮间暂停 | 10s | - | 接口间暂停 10s 互不影响 |
+
+### 全量压测脚本
+
+```bash
+# 全部 5 个接口（Health → Redis → MySQL → Config直连 → Config网关）
+# 每接口 2 轮，轮间暂停 10s
+bash bench/bench_full.sh
+
+# 单接口
+bash bench/bench_full.sh health
+bash bench/bench_full.sh redis
+bash bench/bench_full.sh mysql
+bash bench/bench_full.sh config
+```
+
+### 单次验证脚本
+
+```bash
+# curl 确认 200 → wrk 小批量 5s，全部 2xx 才通过
+bash bench/verify.sh          # 全部
+bash bench/verify.sh config   # 只 config
+bash bench/verify.sh health   # 只 health
+```
+
+### 手动单条命令
+
+```bash
+# Health（GET）
+wrk -t30 -c100 -d30s --timeout 10s http://127.0.0.1:8081/api/health
+
+# Redis（GET）
+wrk -t30 -c100 -d30s --timeout 10s http://127.0.0.1:8081/api/redis
+
+# MySQL（GET）
+wrk -t30 -c100 -d30s --timeout 10s http://127.0.0.1:8081/api/mysql
+
+# Config 直连（POST）
+wrk -t30 -c100 -d30s --timeout 10s -s /tmp/wrk_post.lua \
+  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey
+
+# Config 网关（POST，无 token）
+wrk -t30 -c100 -d30s --timeout 10s -s /tmp/wrk_post.lua \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey
+
+# Config 网关（POST，带 JWT token）
+wrk -t30 -c100 -d30s --timeout 10s -s /tmp/wrk_jwt.lua \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey
+```
+
+### 输出解读
+
+关键看两个指标：
+1. **Requests/sec** — 吞吐量
+2. **Socket Errors**（如果出现则表示连接故障）：
+   - `connect` — TCP 连接失败（上游挂了或端口耗尽）
+   - `read / write` — 读写超时或断开
+   - `timeout` — 请求超时
+3. **Non-2xx**（如果出现则表示业务错误）
+
+正常输出只显示 `Thread Stats` 和 `Requests/sec`，有错误时会有 `Socket errors` 和 `Non-2xx` 行。
+
+### 陷阱记录
+
+| 陷阱 | 说明 |
+|:----|:------|
+| ❌ `pkill -9 server` | 会误杀 `redis-server` + `zebra-config`（Go 二进制也叫 server），改用按路径匹配杀 |
+| ❌ 旧 server 未完全退出就启动 | 新版 bind 失败，`sleep 2` 等端口释放 |
+| ❌ Config 网关缺少 JWT 头 | 网关启用 JWT 鉴权后，缺少 `Authorization: Bearer` 会返回 401/403 |
+| ❌ 拿着失效 token/挂掉上游直接压测 | 浪费 7~20 分钟。先用 curl 单次确认 200，再上 wrk |
+| ❌ ASAN 版本 LSAN 报告被 `2>&1` 吞掉 | 不要用 `./server > /dev/null 2>&1`，LSAN 报告在 stderr |
+| ❌ wrk 从本机跨网络压 VM | 网络延迟会拉低 RPS，必须在 VM 本地压 |
+| ❌ 本机 `rm -rf build` 后 VM 编译 | 代码挂载 NFS 自动同步，直接在 VM 上编译即可，本机 keep 源码不动 |
 
 ## 前置条件
 
@@ -29,8 +140,13 @@ curl -s --max-time 3 http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey 
   -H 'Content-Type: application/json' \
   -d '{"appid":"member_03150715","config_key":"black_list"}' | head -1
 
-# 3. 杀旧 server（精确匹配进程名，不会误杀 redis-server）
-pgrep -x server | xargs kill -9 2>/dev/null
+# 3. 杀旧 server（按路径匹配，不会误杀 Go server）
+for pid in $(pgrep -x server); do
+    exe=$(readlink -f /proc/$pid/exe 2>/dev/null || echo "")
+    if echo "$exe" | grep -q "build/server$"; then
+        kill -9 $pid 2>/dev/null || true
+    fi
+done
 sleep 2
 
 # 4. 启动新 server
@@ -44,148 +160,46 @@ curl -s http://127.0.0.1:8081/api/health
 # 期望: {"code":0,"msg":"ok","data":"running"}
 ```
 
-### 清理日志（每轮压测前）
+## 内存检测
+
+### 方法一：RSS 监控（常规压测前 + 后对比）
 
 ```bash
-rm -f /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log
+PID=$(pgrep -x server | head -1)
+grep VmRSS /proc/$PID/status
+# 跑完压测后再看一次
+grep VmRSS /proc/$PID/status
+# 不变则无泄漏
 ```
 
----
-
-## 步骤 1：Health（纯网关，无 IO）
+### 方法二：Valgrind memcheck
 
 ```bash
-# 先 curl 验证
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health || exit 1
+# 启动 Valgrind
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+  --track-origins=yes --log-file=/tmp/valgrind.log \
+  ./server &
 
-echo "=== Health #1 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/health 2>&1 | grep -A3 'Elapsed.*30s'
-sleep 15
+# 做一轮短压测（各 10s 即可）
+wrk -t10 -c50 -d10s http://127.0.0.1:8081/api/health
+wrk -t10 -c50 -d10s http://127.0.0.1:8081/api/redis
+wrk -t10 -c50 -d10s http://127.0.0.1:8081/api/mysql
+wrk -t10 -c50 -d10s -s /tmp/wrk_post.lua \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey
 
-echo "=== Health #2 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/health 2>&1 | grep -A3 'Elapsed.*30s'
+# SIGINT 退出触发报告
+kill -INT $PID
 
-echo "=== 检查 ==="
-grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health
+# 检查结果
+grep -E "definitely|indirectly|possibly|still reachable|ERROR SUMMARY" /tmp/valgrind.log
 ```
 
----
+期望结果：`definitely lost: 0 bytes in 0 blocks`
 
-## 步骤 2：Redis
-
-```bash
-# 先 curl 验证
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis || exit 1
-
-echo "=== Redis #1 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/redis 2>&1 | grep -A3 'Elapsed.*30s'
-sleep 15
-
-echo "=== Redis #2 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/redis 2>&1 | grep -A3 'Elapsed.*30s'
-
-echo "=== 检查 ==="
-grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis
-```
-
----
-
-## 步骤 3：MySQL
+### 方法三：ASAN（AddressSanitizer）长压
 
 ```bash
-# 先 curl 验证
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql || exit 1
-
-echo "=== MySQL #1 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/mysql 2>&1 | grep -A3 'Elapsed.*30s'
-sleep 15
-
-echo "=== MySQL #2 ==="
-/root/go/bin/plow -c 100 -d 30s http://127.0.0.1:8081/api/mysql 2>&1 | grep -A3 'Elapsed.*30s'
-
-echo "=== 检查 ==="
-grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql
-```
-
----
-
-## 步骤 4：Config 直连（上游 baseline）
-
-```bash
-BODY='{"appid":"member_03150715","config_key":"black_list"}'
-
-# 先 curl 验证直连
-curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  -H 'Content-Type: application/json' \
-  -d "$BODY" \
-  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey || exit 1
-
-echo "=== Config Direct #1 ==="
-/root/go/bin/plow -c 100 -d 30s -m POST \
-  -H 'Content-Type: application/json' \
-  -b "$BODY" \
-  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
-sleep 15
-
-echo "=== Config Direct #2 ==="
-/root/go/bin/plow -c 100 -d 30s -m POST \
-  -H 'Content-Type: application/json' \
-  -b "$BODY" \
-  http://127.0.0.1:30001/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
-
-echo "=== 检查 ==="
-grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
-```
-
----
-
-## 步骤 5：Config 网关转发
-
-> ⚠️ Config 网关需要 JWT 鉴权。`jwt_algorithm=RS256`，使用 pixiu-gateway 签发的 RS256 token。
-
-```bash
-BODY='{"appid":"member_03150715","config_key":"black_list"}'
-TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJjbGllbnRfdHlwZSI6ImFkbWluIiwiZGV2aWNlX2lkIjoiN2FmZjAzNTctMjQzNS00NjcxLThlNTMtOTM3MzY3MWUwZTEwIiwiZXhwIjoxNzgzNDIwMTU0LCJpYXQiOjE3ODMxNjA5NTQsImlzcyI6InBpeGl1LWdhdGV3YXkiLCJqdGkiOiIxNzgzMTYwOTU0ODQ5Mjc3NDc3MDkiLCJuYW1lIjoiYWRtaW4iLCJuYmYiOjE3ODMxNjA5NTQsInN1YiI6IjEiLCJ0eXBlIjoiYWNjZXNzIiwidXNlcl9pZCI6MSwidXNlcl9uYW1lIjoiYWRtaW4ifQ.OBgz_LmThzMgOvZ6Mr9xdkv4II15Jmd-QwDJwgK_s6zyAHFmIOnFhvus0g_ThwJXdXiKYWN6dpwZAj_DZjTBoDgC_MWLN1ksydmkR9Ta6ySHp-Y1CdWcmKe2qlae3bQg6Ji19o3ZzJYlpUrcAvKh6EEwLGbOCzCSLxl_ZmfxrWCQKtalUagkOEzINDB9jW7d_n09yg2tfRLEm8pzpSaxtH4dpQHdvNvdn92qt6XWwsOFJlffoLfWukAJvz2DsphfjiFZegk3hBemIq5RrXYKlp0E5pkm8BDY_usL84MCAYYM56o3SWkD5EqWthIuqJZ7vAgSZe_C-QHEo8eQOxAkIw'
-
-# 先 curl 验证网关（Token 是否过期，服务是否正常）
-curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d "$BODY" \
-  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey || exit 1
-
-echo "=== Config Via Gateway #1 ==="
-/root/go/bin/plow -c 100 -d 30s -m POST \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -b "$BODY" \
-  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
-sleep 15
-
-echo "=== Config Via Gateway #2 ==="
-/root/go/bin/plow -c 100 -d 30s -m POST \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -b "$BODY" \
-  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | grep -A3 'Elapsed.*30s'
-
-echo "=== 检查 ==="
-grep -ciE 'warn|error|fatal' /mnt/mac/Users/mac/code/croot/asio_owen/build/server.log 2>/dev/null || echo '0'
-```
-
----
-
-## 步骤 6：ASAN 内存检查压测
-
-> ⚠️ 以下命令需在 **Linux 测试机** 执行（macOS 无 `/proc`）。
-> Config 网关需要 JWT 鉴权头。
-
-```bash
-# 编译
-cd /mnt/mac/Users/mac/code/croot/asio_owen
+# 编译 ASAN 版本
 rm -rf build_asan
 CXX=g++ CC=gcc cmake -B build_asan -S . -Wno-dev \
   -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
@@ -194,96 +208,23 @@ CXX=g++ CC=gcc cmake -B build_asan -S . -Wno-dev \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
 cmake --build build_asan --target server -j$(nproc)
 
-# 启动（保留 stderr 给 LSAN）
-# 注意：不能用 > /dev/null 2>&1，否则 LSAN 报告丢失
+# 启动（注意：stderr 不能重定向，否则 LSAN 报告丢失）
 cd build_asan
-rm -f server.log
 ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0 ./server &
-ASAN_PID=$!
+PID=$!
 sleep 4
-curl -s http://127.0.0.1:8081/api/health
 
-# 记录初始 RSS
-grep VmRSS /proc/$ASAN_PID/status
+# 记录初始 RSS，压测每阶段 3min，观察 RSS
+grep VmRSS /proc/$PID/status
+wrk -t30 -c100 -d180s http://127.0.0.1:8081/api/health
+grep VmRSS /proc/$PID/status
+# ... 同法压 Redis / MySQL / Config Gateway
 
-# 分阶段压测（每个 3min，间隔 15s 观察 RSS）
-# 每阶段先 curl 确认接口正常
-echo "=== Phase 1: Health 3min ==="
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/health || break
-/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/health 2>&1 | tail -3
-grep VmRSS /proc/$ASAN_PID/status
-sleep 15
-
-echo "=== Phase 2: Redis 3min ==="
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/redis || break
-/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/redis 2>&1 | tail -3
-grep VmRSS /proc/$ASAN_PID/status
-sleep 15
-
-echo "=== Phase 3: MySQL 3min ==="
-curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8081/api/mysql || break
-/root/go/bin/plow -c 100 -d 180s http://127.0.0.1:8081/api/mysql 2>&1 | tail -3
-grep VmRSS /proc/$ASAN_PID/status
-sleep 15
-
-echo "=== Phase 4: Config Gateway 3min ==="
-TOKEN='eyJhbGciOiJSUzI1NiIsImtpZCI6InBpeGl1LWp3dC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJwaXhpdS1hcGkiLCJjbGllbnRfdHlwZSI6ImFkbWluIiwiZGV2aWNlX2lkIjoiN2FmZjAzNTctMjQzNS00NjcxLThlNTMtOTM3MzY3MWUwZTEwIiwiZXhwIjoxNzgzNDIwMTU0LCJpYXQiOjE3ODMxNjA5NTQsImlzcyI6InBpeGl1LWdhdGV3YXkiLCJqdGkiOiIxNzgzMTYwOTU0ODQ5Mjc3NDc3MDkiLCJuYW1lIjoiYWRtaW4iLCJuYmYiOjE3ODMxNjA5NTQsInN1YiI6IjEiLCJ0eXBlIjoiYWNjZXNzIiwidXNlcl9pZCI6MSwidXNlcl9uYW1lIjoiYWRtaW4ifQ.OBgz_LmThzMgOvZ6Mr9xdkv4II15Jmd-QwDJwgK_s6zyAHFmIOnFhvus0g_ThwJXdXiKYWN6dpwZAj_DZjTBoDgC_MWLN1ksydmkR9Ta6ySHp-Y1CdWcmKe2qlae3bQg6Ji19o3ZzJYlpUrcAvKh6EEwLGbOCzCSLxl_ZmfxrWCQKtalUagkOEzINDB9jW7d_n09yg2tfRLEm8pzpSaxtH4dpQHdvNvdn92qt6XWwsOFJlffoLfWukAJvz2DsphfjiFZegk3hBemIq5RrXYKlp0E5pkm8BDY_usL84MCAYYM56o3SWkD5EqWthIuqJZ7vAgSZe_C-QHEo8eQOxAkIw'
-BODY='{"appid":"member_03150715","config_key":"black_list"}'
-curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d "$BODY" \
-  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey || break
-/root/go/bin/plow -c 100 -d 180s -m POST \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -b "$BODY" \
-  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey 2>&1 | tail -3
-grep VmRSS /proc/$ASAN_PID/status
-
-# 正常退出（SIGTERM 触发 LSAN 检测）
-kill -TERM $ASAN_PID
-wait $ASAN_PID 2>/dev/null
-# LSAN 报告打印在 stderr 上（直接在当前终端输出）
-echo "=== ASAN done ==="
+# SIGTERM 触发 LSAN 检测
+kill -TERM $PID
 ```
 
-> **v3.5 实际执行结果：** RSS 全程 3.6→2.7 KB，无增长趋势。Config Gateway 需要 JWT Token，已在脚本中硬编码。见 MEM_CHECK.md 详细记录。
-
----
-
-## 结果记录模板
-
-| 接口 | #1 RPS | #2 RPS | 平均 RPS | 成功率 |
-|:----|:------:|:------:|:--------:|:------:|
-| Health | | | | % |
-| Redis | | | | % |
-| MySQL | | | | % |
-| Config 直连 | | | | % |
-| Config 网关 | | | | % |
-
-### ASAN RSS 记录
-
-| 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 |
-|:----|:------------:|:------------:|:----:|
-| Health 3min | | | |
-| Redis 3min | | | |
-| MySQL 3min | | | |
-| Config 3min | | | |
-
----
-
-## 陷阱记录
-
-| 陷阱 | 说明 |
-|:----|:------|
-| ❌ `pkill -9 server` | 会误杀 `redis-server` + `zebra-config`（Go 二进制也叫 server），改用 `pgrep -x server \| xargs kill -9` |
-| ❌ `-b @/tmp/file.json` | plow 不支持 `-b @file` 语法，发的是文件名本身，上游返回 404 |
-| ❌ `-d '{"key":"val"}'` | `-d` 是 duration 不是 body，body 用 `-b` |
-| ❌ 旧 server 未完全退出就启动 | 新版 bind 失败，`sleep 2` 等端口释放 |
-| ❌ Config 网关缺少 JWT 头 | 网关启用 JWT 鉴权后，缺少 `Authorization: Bearer` 会返回 401/403 |
-| ❌ 拿着失效 token/挂掉上游直接压测 | 浪费 7~20 分钟。先用 curl 单次确认 200，再上 plow |
-| ❌ ASAN 版本 LSAN 报告被 `2>&1` 吞掉 | 不要用 `./server > /dev/null 2>&1`，LSAN 报告在 stderr；或用 `ASAN_OPTIONS=log_path=/tmp/asan_log` |
+> ASAN 版本 RSS 会比普通版本高很多（142MB→1GB+），这是 ASAN 自身的 quarantine/shadow/fake-stack overhead，不是泄漏。详见 `docs/PERF_2026-07-05.md`。
 
 ## v3.6 压测结果（wrk，VM 本地，2026-07-05）
 
@@ -309,7 +250,7 @@ echo "=== ASAN done ==="
 
 ### 与 v3.5（plow）对比
 
-> 两轮工具不同（plow vs wrk）、测试位置不同（VM 本地 vs 本机跨网络），绝对值不可直接对比。仅供参考。
+> 两轮工具不同（plow vs wrk），绝对值不可直接对比。仅供参考。
 
 | 接口 | v3.5 plow | v3.6 wrk |
 |:----|:---------:|:--------:|
@@ -319,29 +260,10 @@ echo "=== ASAN done ==="
 | Config 直连 | 6,183 | **4,396** |
 | Config 网关 | 5,634 | **4,042** |
 
-### 压测脚本
+### 内存检测结论
 
-```bash
-# wrk lua 脚本（bench/wrk_post.lua）
-wrk.method = "POST"
-wrk.body = '{"appid":"member_03150715","config_key":"black_list"}'
-wrk.headers["Content-Type"] = "application/json"
-
-# 全部压测
-bash bench/bench_full.sh
-
-# 单接口
-bash bench/verify.sh config     # curl 确认 + wrk 5s 小批量
-THREADS=30 bash bench/bench.sh config  # 正式压测
-```
-
-完整脚本见 `bench/` 目录。
-
-### ASAN RSS 记录（待执行）
-
-| 阶段 | 压测前 VmRSS | 压测后 VmRSS | 变化 |
-|:----|:------------:|:------------:|:----:|
-| Health 3min | - | - | - |
-| Redis 3min | - | - | - |
-| MySQL 3min | - | - | - |
-| Config 3min | - | - | - |
+| 检测方法 | 结果 | 结论 |
+|:---------|:-----|:------|
+| RSS 监控（普通版本） | 四轮压测 RSS 恒定 75MB 不变 | 无泄漏 |
+| Valgrind memcheck | definitely lost = 0 | 无泄漏 |
+| ASAN 12min 长压 | 零报错，RSS 增长来自 ASAN 自身 | 无泄漏 |
