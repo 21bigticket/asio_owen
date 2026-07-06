@@ -126,7 +126,7 @@ asio::awaitable<void> api_build(HttpContext& ctx) {
 int main(int argc, char* argv[]) {
     try {
         Config cfg;
-        if (!cfg.load("config.ini")) {
+        if (!cfg.load(".")) {
             std::cerr << "Load config failed" << std::endl;
             return 1;
         }
@@ -234,7 +234,7 @@ int main(int argc, char* argv[]) {
                 auto schedule_reload = std::make_shared<std::function<void()>>();
                 *schedule_reload = [this_reload = schedule_reload, timer = g_reload_timer.get(), &http_pool_cfg]() {
                     Config new_cfg;
-                    if (!new_cfg.load("config.ini")) {
+                    if (!new_cfg.load(".")) {
                         // reload failed — retry with default 30s
                         timer->expires_after(std::chrono::seconds(30));
                         timer->async_wait([this_reload, &http_pool_cfg](std::error_code ec) {

@@ -6,9 +6,9 @@
 
 ## Build, Test, and Development Commands
 
-- `cmake -B build -S .`: configure CMake and copy `config.ini` into `build/`.
+- `cmake -B build -S .`: configure CMake and copy `config.d/` into `build/`.
 - `cmake --build build`: build the `server` target.
-- `./build/server`: run the local server using `build/config.ini`.
+- `./build/server`: run the local server (loads config from `build/config.d/`).
 - `CXX=g++ CC=gcc cmake -B build -S .`: configure on Linux with GCC.
 - `./build.sh`: build, restart, and smoke-test `/api/health`, `/api/redis`, and `/api/mysql`.
 
@@ -28,7 +28,7 @@ Tests use GoogleTest and should be named `test_<component>.cpp`. Add executables
 
 ## Runtime & Configuration Notes
 
-`config.ini` has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections and is copied beside the binary during configure; re-run CMake after edits. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/{service}/...` (gateway reverse proxy, for example `/zebra-config/...`). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
+Configuration is split across `config.d/*.ini` files (loaded in sorted order, later overrides earlier). Key sections: `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]`. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/{service}/...` (gateway reverse proxy, for example `/zebra-config/...`). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
 
 ## Commit & Pull Request Guidelines
 
@@ -36,4 +36,4 @@ Recent history uses short imperative or descriptive subjects, for example `renam
 
 ## Security & Configuration Tips
 
-Treat `config.ini` as environment-specific because it contains database credentials. Do not hard-code secrets in source, tests, docs, or logs. Document any pool sizing, timeout, or shutdown-ordering change.
+Treat config files under `config.d/` as environment-specific because they contain database credentials. Do not hard-code secrets in source, tests, docs, or logs. `99-local.ini` is gitignored for local overrides. Document any pool sizing, timeout, or shutdown-ordering change.

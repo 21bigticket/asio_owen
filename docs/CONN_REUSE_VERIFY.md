@@ -287,7 +287,7 @@ conn.connection_close = header_state.connection_close ||
 
 如果响应解析逻辑误判（比如某条响应头没正确解析），会让连接被错误标记 close。
 
-排查：开 DEBUG 日志（`config.ini` 把 logger level 调到 `debug`），grep：
+排查：开 DEBUG 日志（`config.d/00-server.ini` 把 log_level 调到 `debug`），grep：
 
 ```bash
 grep "connection_close=1" build/server.log | head -20
@@ -296,7 +296,7 @@ grep "Proxy response header parsed" build/server.log | head -5
 
 ### 3. HttpPool idle_timeout 配置
 
-`config.ini` 的 `[http_pool]` 段：
+`config.d/` 的 `[http_pool]` 段：
 
 ```ini
 [http_pool]

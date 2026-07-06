@@ -554,7 +554,7 @@ plow -c 200 -d 60s http://127.0.0.1:8081/api/health
 # 阶段 5：黑名单触发（IP 维度）
 # 1. 获取本机主 IP
 CLIENT_IP=$(hostname -I | awk '{print $1}')
-# 2. 编辑 config.ini，在 [ip_blacklist] 段加一行 $CLIENT_IP
+# 2. 编辑 config.d/32-ip_blacklist.ini，在 [ip_blacklist] 段加一行 $CLIENT_IP
 # 3. 热加载触发（如果实现了 SIGHUP）：kill -HUP $(pgrep server)
 # 4. 验证返回 403
 curl -i http://127.0.0.1:8081/api/health | head -1

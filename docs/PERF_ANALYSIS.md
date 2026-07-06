@@ -266,7 +266,7 @@ strace -p $PID -c -S time 2>&1
 | `src/security/jwt_auth.hpp` | JWT 验签 |
 | `src/security/security_rules.hpp` | 安全规则编排 |
 
-### 5.3 连接池配置（config.ini）
+### 5.3 连接池配置（config.d/21-http_pool.ini）
 
 ```ini
 [http_pool]

@@ -15,7 +15,7 @@ CMake 3.20+, C++20. Single-config generators default to `Release` unless `-DCMAK
 cmake -B build -S .
 cmake --build build
 
-# Run (config.ini must sit next to the binary — configure_file() copies it at build time)
+# Run (loads config from `config.d/` next to the binary — configure_file() copies it at build time)
 ./build/server
 ```
 
@@ -56,7 +56,7 @@ The two pools use **deliberately different async strategies** — this is the co
 
 ## Configuration
 
-`config.ini` (INI format, parsed by `src/common/config.hpp`) has `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]` sections. The config file is **gitignored** because it carries DB credentials, but a reference copy is checked in at `config.ini`. It is copied next to the binary at configure time via `configure_file(... COPYONLY)`, so edit the source-tree copy and re-run CMake to update the runtime copy.
+Configuration is split across `config.d/*.ini` files (loaded in sorted order, later overrides earlier), see `config.d/00-server.ini` ~ `99-local.ini`. The config files are **gitignored** because they carry DB credentials, but reference copies are checked in at `config.d/*.ini`. The directory is copied next to the binary at configure time via `file(COPY ...)`, so edit the source-tree copy and re-run CMake to update the runtime copy.
 
 ## Known runtime endpoints
 

@@ -671,7 +671,7 @@ public:
 | B6 | INI 裸值格式兼容性：`[ip_blacklist]` 下直接写 IP，非 key=value 格式。现有 `Config` 类不支持，需改用逐行 parser 或改为 `ip = xxx` 兼容格式 | TBD |
 | B7 | jwt-cpp `leeway` 参数 | 60s |
 | B8 | JWT secret 最小长度，HS256 推荐 ≥ 32 字节，启动时校验并 WARN 提示 | 32B |
-| B8 | secret 存储：`config.ini` 明文存（已 gitignored），生产建议走环境变量或受限权限文件 | 明文（开发）/ 环境变量（生产） |
+| B8 | secret 存储：`config.d/` 下文件明文存（已 gitignored 99-local.ini），生产建议走环境变量或受限权限文件 | 明文（开发）/ 环境变量（生产） |
 | B9 | `Authorization` 解析：`Bearer` 前缀大小写不敏感；多余空格用 trim；非 `Bearer` scheme 直接 401；token 为空直接 401 | insensitive |
 | B10 | 最大 header 大小（含 JWT 大 token 场景） | 16KB，超限返回 431 |
 | B11 | 鉴权失败时（401/403）：是否消费完 body 再关连接，还是直接关闭？鉴权失败时 body 未消费，保持连接可能导致 pipeline 错位。建议直接 `Connection: close` 后断连 | `Connection: close` + 断连 |
