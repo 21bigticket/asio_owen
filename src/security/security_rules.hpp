@@ -152,18 +152,6 @@ public:
         const std::string& xff_header,
         const std::string& auth_header) const
     {
-        return check(socket, method, raw_path, xff_header, auth_header, case_sensitive_paths_);
-    }
-
-    // Full-chain security check with case_sensitive flag
-    CheckResult check(
-        asio::ip::tcp::socket& socket,
-        const std::string& method,
-        const std::string& raw_path,
-        const std::string& xff_header,
-        const std::string& auth_header,
-        bool case_sensitive) const
-    {
         // 0. OPTIONS always allowed (CORS preflight)
         if (method == "OPTIONS") {
             return {0, ""};
@@ -177,10 +165,12 @@ public:
         // Snapshot trusted_proxies_ and jwt_auth_ (fine-grained lock, does not block CPU-heavy operations)
         std::vector<std::string> proxies_copy;
         std::shared_ptr<const JWTAuth> jwt_copy;
+        bool case_sensitive_copy = false;
         {
             std::lock_guard<std::mutex> lock(rules_mu_);
             proxies_copy = trusted_proxies_;
             jwt_copy = jwt_auth_;
+            case_sensitive_copy = case_sensitive_paths_;
         }
 
         // 1. Extract real IP (uses proxies_copy, not holding rules_mu_)
@@ -188,7 +178,7 @@ public:
         auto normalized_ip = normalize_ip_str(client_ip);
 
         // 2. Path normalization (case_sensitive controls whether paths are lowercased)
-        auto norm = normalize_path(raw_path, case_sensitive);
+        auto norm = normalize_path(raw_path, case_sensitive_copy);
         auto& path = norm.path;
 
         // 3. Extract service name

@@ -2,6 +2,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <cctype>
 #include <asio.hpp>
 
 #include "../common/logger.hpp"
@@ -120,51 +121,4 @@ inline std::string get_client_ip(
 
     // all IPs are trusted or empty, fall back to direct IP
     return direct_ip;
-}
-
-// CIDR match: check if IP is within a CIDR range
-inline bool ip_in_cidr(const std::string& ip_str, const std::string& cidr_str) {
-    auto normalized_ip = normalize_ip_str(ip_str);
-    auto slash = cidr_str.find('/');
-    if (slash == std::string::npos) {
-        // exact IP match
-        return normalized_ip == cidr_str;
-    }
-
-    auto cidr_ip_str = cidr_str.substr(0, slash);
-    int prefix_len = 0;
-    try {
-        prefix_len = std::stoi(cidr_str.substr(slash + 1));
-    } catch (...) {
-        return false;
-    }
-    if (prefix_len < 0 || prefix_len > 128) return false;
-
-    asio::error_code ec;
-    auto addr = asio::ip::make_address(normalized_ip, ec);
-    if (ec) return false;
-    auto cidr_addr = asio::ip::make_address(cidr_ip_str, ec);
-    if (ec) return false;
-
-    // unify to v6 (v4 -> v4-mapped v6 for aligned CIDR bit comparison)
-    asio::ip::address_v6 addr_v6 = addr.is_v6() ? addr.to_v6()
-        : asio::ip::make_address_v6(asio::ip::v4_mapped, addr.to_v4());
-    asio::ip::address_v6 cidr_v6 = cidr_addr.is_v6() ? cidr_addr.to_v6()
-        : asio::ip::make_address_v6(asio::ip::v4_mapped, cidr_addr.to_v4());
-
-    auto addr_bytes = addr_v6.to_bytes();
-    auto cidr_bytes = cidr_v6.to_bytes();
-
-    // compare prefix_len bits
-    for (int i = 0; i < prefix_len / 8; ++i) {
-        if (addr_bytes[i] != cidr_bytes[i]) return false;
-    }
-    if (prefix_len % 8 != 0) {
-        int remaining = prefix_len % 8;
-        uint8_t mask = static_cast<uint8_t>(0xFF << (8 - remaining));
-        if ((addr_bytes[prefix_len / 8] & mask) != (cidr_bytes[prefix_len / 8] & mask)) {
-            return false;
-        }
-    }
-    return true;
 }

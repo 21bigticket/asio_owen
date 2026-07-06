@@ -10,10 +10,12 @@
 
 #include <jwt-cpp/jwt.h>
 #include <openssl/bio.h>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/bn.h>
-#include <openssl/rsa.h>
 #include "../common/logger.hpp"
 
 // JWT verification result
@@ -61,33 +63,49 @@ inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const
     auto e_bytes = b64url_decode(e_b64url);
     if (n_bytes.empty() || e_bytes.empty()) return {};
     
-    // 2. Build RSA key from n and e
-    auto rsa = RSA_new();
-    if (!rsa) return {};
-    auto n_bn = BN_bin2bn(n_bytes.data(), static_cast<int>(n_bytes.size()), nullptr);
-    auto e_bn = BN_bin2bn(e_bytes.data(), static_cast<int>(e_bytes.size()), nullptr);
+    // 2. Build RSA key from n and e via EVP_PKEY_fromdata (OpenSSL 3 compatible).
+    struct BignumDeleter { void operator()(BIGNUM* p) const { BN_free(p); } };
+    struct ParamBldDeleter { void operator()(OSSL_PARAM_BLD* p) const { OSSL_PARAM_BLD_free(p); } };
+    struct ParamDeleter { void operator()(OSSL_PARAM* p) const { OSSL_PARAM_free(p); } };
+    struct PkeyCtxDeleter { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+
+    std::unique_ptr<BIGNUM, BignumDeleter> n_bn(
+        BN_bin2bn(n_bytes.data(), static_cast<int>(n_bytes.size()), nullptr));
+    std::unique_ptr<BIGNUM, BignumDeleter> e_bn(
+        BN_bin2bn(e_bytes.data(), static_cast<int>(e_bytes.size()), nullptr));
     if (!n_bn || !e_bn) {
-        BN_free(n_bn); BN_free(e_bn); RSA_free(rsa);
         return {};
     }
-    if (RSA_set0_key(rsa, n_bn, e_bn, nullptr) != 1) {
-        BN_free(n_bn); BN_free(e_bn); RSA_free(rsa);
+
+    std::unique_ptr<OSSL_PARAM_BLD, ParamBldDeleter> bld(OSSL_PARAM_BLD_new());
+    if (!bld) return {};
+    if (OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_N, n_bn.get()) != 1 ||
+        OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_E, e_bn.get()) != 1) {
         return {};
     }
-    
-    // 3. Convert to EVP_PKEY then write PEM
-    auto pkey = EVP_PKEY_new();
-    if (!pkey) { RSA_free(rsa); return {}; }
-    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
-        EVP_PKEY_free(pkey); RSA_free(rsa);
+
+    std::unique_ptr<OSSL_PARAM, ParamDeleter> params(OSSL_PARAM_BLD_to_param(bld.get()));
+    if (!params) return {};
+
+    std::unique_ptr<EVP_PKEY_CTX, PkeyCtxDeleter> ctx(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr));
+    if (!ctx) return {};
+
+    EVP_PKEY* raw_pkey = nullptr;
+    bool ok = EVP_PKEY_fromdata_init(ctx.get()) == 1 &&
+        EVP_PKEY_fromdata(ctx.get(), &raw_pkey, EVP_PKEY_PUBLIC_KEY, params.get()) == 1;
+    if (!ok || !raw_pkey) {
+        EVP_PKEY_free(raw_pkey);
         return {};
     }
+
+    struct EVP_PKEY_Deleter { void operator()(EVP_PKEY* p) const { EVP_PKEY_free(p); } };
+    std::unique_ptr<EVP_PKEY, EVP_PKEY_Deleter> pkey(raw_pkey);
     
     auto mem_bio = BIO_new(BIO_s_mem());
-    if (!mem_bio) { EVP_PKEY_free(pkey); return {}; }
+    if (!mem_bio) return {};
     
-    if (PEM_write_bio_PUBKEY(mem_bio, pkey) != 1) {
-        BIO_free(mem_bio); EVP_PKEY_free(pkey);
+    if (PEM_write_bio_PUBKEY(mem_bio, pkey.get()) != 1) {
+        BIO_free(mem_bio);
         return {};
     }
     
@@ -96,7 +114,6 @@ inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const
     std::string pem(pem_data, static_cast<size_t>(pem_len));
     
     BIO_free(mem_bio);
-    EVP_PKEY_free(pkey);  // frees rsa internally
     return pem;
 }
 
@@ -220,6 +237,28 @@ private:
         return ok;
     }
 
+    template <typename DecodedJwt>
+    void verify_registered_claims(const DecodedJwt& decoded) const {
+        constexpr auto leeway = std::chrono::seconds(60);
+        auto now = std::chrono::system_clock::now();
+
+        auto iss = decoded.get_issuer();
+        if (iss != issuer_) {
+            throw std::runtime_error("wrong issuer: expected " + issuer_ + ", got " + iss);
+        }
+
+        if (!decoded.has_expires_at()) {
+            throw std::runtime_error("missing exp");
+        }
+        if (now > decoded.get_expires_at() + leeway) {
+            throw std::runtime_error("token expired");
+        }
+
+        if (decoded.has_not_before() && now + leeway < decoded.get_not_before()) {
+            throw std::runtime_error("token not active yet");
+        }
+    }
+
     // Actual JWT verification via jwt-cpp
     std::optional<JWTClaims> do_verify(const std::string& token) const {
         auto decoded = jwt::decode(token);
@@ -245,17 +284,7 @@ private:
             if (algo != "RS256") {
                 throw std::runtime_error("wrong algorithm: expected RS256, got " + algo);
             }
-            auto iss = decoded.get_issuer();
-            if (iss != issuer_) {
-                throw std::runtime_error("wrong issuer: expected " + issuer_ + ", got " + iss);
-            }
-            if (decoded.has_expires_at()) {
-                auto exp = decoded.get_expires_at();
-                auto now = std::chrono::system_clock::now();
-                if (now > exp + std::chrono::seconds(60)) {
-                    throw std::runtime_error("token expired");
-                }
-            }
+            verify_registered_claims(decoded);
         }
 
         // extract claims

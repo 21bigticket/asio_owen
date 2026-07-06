@@ -21,11 +21,11 @@ cmake --build build
 
 External dependencies are **fetched via CMake FetchContent** (`asio/` 1.38.0, `spdlog/` v1.17.0, `googletest/` v1.14.0), or used from local vendored directories when present (gitignored). macOS Homebrew paths for `mysql-client`, `hiredis`, and `openssl@3` are probed; Linux uses `pkg-config`.
 
-**Test targets exist** in `tests/` (placeholder, mysql, redis) but require local googletest/ directory — disabled automatically when absent.
+**Test targets exist** in `tests/`. GoogleTest is used from local `googletest/` when present, otherwise CMake FetchContent downloads v1.14.0 when `BUILD_TESTING=ON`.
 
 ## Architecture
 
-The runtime is a **single `asio::io_context` driven by N threads** (N = `std::thread::hardware_concurrency()`, fallback 4). All coroutines share that one `io_context`. See `src/main.cpp:142-148` for the spawn loop.
+The runtime is a **single `asio::io_context` driven by N threads** (N = `std::thread::hardware_concurrency()`, fallback 4). All coroutines share that one `io_context`. `src/main.cpp` is only bootstrap glue; runtime wiring lives in `src/app/application.cpp`.
 
 ### HTTP layer (`src/http/`)
 
@@ -50,8 +50,8 @@ The two pools use **deliberately different async strategies** — this is the co
 
 ### Lifecycle
 
-- Globals in `main.cpp`: `g_mysql`, `g_redis`, `g_server` (all `unique_ptr`).
-- `SignalExit` listens on `SIGINT`/`SIGTERM` and runs a callback that calls `stop()`/`shutdown()` on each subsystem before `ioc.stop()`. Add new subsystems with shutdown ordering here.
+- `Application` owns `MysqlPool`, `RedisPool`, `HttpServer`, `SecurityRules`, `ReloadService`, and `SnapshotService`.
+- `SignalExit` listens on `SIGINT`/`SIGTERM` and asks `Application` to stop accepting, then a drain timer stops the `io_context`. Add new subsystems to `Application::cleanup()` with explicit shutdown ordering.
 - `with_timeout` (`src/common/timeout.hpp`) is a template that races a child coroutine against a `steady_timer` and returns `std::optional<T>` — used by the `/api/combo` handler for cache-then-DB fallback.
 
 ## Configuration

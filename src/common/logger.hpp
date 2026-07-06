@@ -47,7 +47,15 @@ public:
         }
     }
 
-    std::shared_ptr<spdlog::logger>& get() { return logger_; }
+    std::shared_ptr<spdlog::logger>& get() {
+        if (!logger_) {
+            logger_ = spdlog::default_logger();
+            if (!logger_) {
+                logger_ = spdlog::stdout_color_mt("default");
+            }
+        }
+        return logger_;
+    }
 
 private:
     Logger() = default;

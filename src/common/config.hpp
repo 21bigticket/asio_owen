@@ -4,15 +4,15 @@
 #include <unordered_map>
 #include <tuple>
 #include <fstream>
-#include <dirent.h>
 #include <algorithm>
-#include <cstring>
+#include <cctype>
+#include <filesystem>
 #include "logger.hpp"
 
 class Config {
 public:
     // Load a single ini file
-    bool load_file(const std::string& path) {
+    bool load_file(const std::filesystem::path& path) {
         std::ifstream file(path);
         if (!file.is_open()) return false;
 
@@ -38,33 +38,35 @@ public:
         return true;
     }
 
-    // Load all config files from config.d/ directory next to the given path.
+    // Load all config files from config.d/ under the given base directory.
     // Files are loaded in sorted order by name (00-*.ini loaded first, 99-*.ini last).
-    bool load(const std::string& path) {
-        auto base_dir = path.substr(0, path.find_last_of("/\\") + 1);
-        auto dir_path = base_dir + "config.d";
+    bool load(const std::filesystem::path& base_dir) {
+        auto dir_path = base_dir / "config.d";
 
-        DIR* dir = opendir(dir_path.c_str());
-        if (!dir) {
-            LOG_ERROR("Config directory not found: ", dir_path);
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir_path, ec)) {
+            LOG_ERROR("Config directory not found: ", dir_path.string());
             return false;
         }
 
-        // Collect .ini files, sort by name, load in order
-        std::vector<std::string> files;
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != nullptr) {
-            std::string name(entry->d_name);
-            if (name.size() > 4 && name.substr(name.size() - 4) == ".ini") {
-                files.push_back(name);
+        std::vector<std::filesystem::path> files;
+        for (const auto& entry : std::filesystem::directory_iterator(dir_path, ec)) {
+            if (ec) {
+                LOG_ERROR("Failed to scan config directory: ", dir_path.string());
+                return false;
+            }
+            if (entry.is_regular_file(ec) && entry.path().extension() == ".ini") {
+                files.push_back(entry.path());
             }
         }
-        closedir(dir);
 
-        std::sort(files.begin(), files.end());
+        std::sort(files.begin(), files.end(),
+            [](const auto& a, const auto& b) {
+                return a.filename().string() < b.filename().string();
+            });
         for (auto& f : files) {
-            if (!load_file(dir_path + "/" + f)) {
-                LOG_WARN("Failed to load config: ", dir_path, "/", f);
+            if (!load_file(f)) {
+                LOG_WARN("Failed to load config: ", f.string());
             }
         }
         return true;

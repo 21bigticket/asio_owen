@@ -210,7 +210,5 @@ private:
     Config cfg_;
     std::atomic<size_t> total_conns_{0};
 
-    static thread_local RedisPtr tls_conn_;
+    inline static thread_local RedisPtr tls_conn_{nullptr, redisFree};
 };
-
-thread_local RedisPool::RedisPtr RedisPool::tls_conn_{nullptr, redisFree};

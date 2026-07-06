@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 project(asio_owen LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -183,6 +186,8 @@ target_link_libraries(asio_owen_deps INTERFACE
 # 可执行文件
 add_executable(server
         src/main.cpp
+        src/app/application.cpp
+        src/app/routes.cpp
         picohttpparser.c
 )
 target_link_libraries(server PRIVATE asio_owen_deps)
@@ -203,9 +208,20 @@ if(EXISTS ${PROJECT_SOURCE_DIR}/jwt_keys)
     message(STATUS "jwt_keys: copied to build directory")
 endif()
 
-# ==================== GoogleTest（本地已有才启用，否则跳过）====================
-if(EXISTS ${PROJECT_SOURCE_DIR}/googletest/CMakeLists.txt)
-    enable_testing()
-    add_subdirectory(googletest)
+# ==================== GoogleTest（优先本地，否则 FetchContent 自动拉取）====================
+include(CTest)
+if(BUILD_TESTING)
+    if(EXISTS ${PROJECT_SOURCE_DIR}/googletest/CMakeLists.txt)
+        message(STATUS "googletest: using local ${PROJECT_SOURCE_DIR}/googletest")
+        add_subdirectory(googletest)
+    else()
+        FetchContent_Declare(
+            googletest
+            URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
+        )
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(googletest)
+        message(STATUS "googletest: fetched from remote")
+    endif()
     add_subdirectory(tests)
 endif()
