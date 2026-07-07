@@ -25,6 +25,8 @@ struct BodyReadResult {
     bool ok() const { return status == BodyReadStatus::Success; }
 };
 
+static constexpr size_t kMaxChunkControlLineSize = 8192;
+
 inline BodyReadStatus body_status_from_io(const IoResult& result) {
     switch (result.status) {
         case IoStatus::Success: return BodyReadStatus::Success;
@@ -40,13 +42,18 @@ inline asio::awaitable<std::optional<std::string>> consume_line(
     std::string& buffer,
     std::chrono::milliseconds timeout,
     asio::error_code* out_ec = nullptr,
-    BodyReadStatus* out_status = nullptr) {
+    BodyReadStatus* out_status = nullptr,
+    size_t max_line_size = kMaxChunkControlLineSize) {
     while (true) {
         auto pos = buffer.find("\r\n");
         if (pos != std::string::npos) {
             std::string line = buffer.substr(0, pos);
             buffer.erase(0, pos + 2);
             co_return line;
+        }
+        if (buffer.size() > max_line_size) {
+            if (out_status) *out_status = BodyReadStatus::InvalidChunk;
+            co_return std::nullopt;
         }
         char tmp[kHttpIoBufferSize];
         auto read = co_await read_with_timeout(sock, tmp, sizeof(tmp), timeout);

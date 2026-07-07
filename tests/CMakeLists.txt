@@ -26,6 +26,11 @@ add_executable(test_http_protocol test_http_protocol.cpp)
 target_link_libraries(test_http_protocol PRIVATE gtest_main asio_owen_deps)
 gtest_discover_tests(test_http_protocol)
 
+# HTTP connection pool
+add_executable(test_http_pool test_http_pool.cpp)
+target_link_libraries(test_http_pool PRIVATE gtest_main asio_owen_deps)
+gtest_discover_tests(test_http_pool)
+
 # 配置目录加载
 add_executable(test_config_load test_config_load.cpp)
 target_link_libraries(test_config_load PRIVATE gtest_main asio_owen_deps)

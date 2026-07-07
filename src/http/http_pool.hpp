@@ -1,5 +1,6 @@
 #pragma once
 #include <asio.hpp>
+#include <asio/experimental/parallel_group.hpp>
 #include <string>
 #include <deque>
 #include <mutex>
@@ -249,11 +250,12 @@ public:
             state->acquire_created.fetch_add(1, std::memory_order_relaxed);
             co_return std::move(new_conn);
         } catch (...) {
+            auto& failed_shard = state->shards[new_conn->shard_idx];
             {
-                std::lock_guard lock(shard.mtx);
-                shard.active.erase(new_conn.get());
-                --shard.total;
-                --shard.in_flight;
+                std::lock_guard lock(failed_shard.mtx);
+                failed_shard.active.erase(new_conn.get());
+                --failed_shard.total;
+                --failed_shard.in_flight;
             }
             throw;
         }
@@ -351,17 +353,19 @@ private:
         asio::ip::tcp::resolver& resolver, const std::string& host,
         const std::string& service, int timeout_ms) {
         auto ex = co_await asio::this_coro::executor;
-        auto timed_out = std::make_shared<bool>(false);
         asio::steady_timer timer(ex);
         timer.expires_after(std::chrono::milliseconds(timeout_ms));
-        timer.async_wait([timed_out, &resolver](asio::error_code ec) {
-            if (!ec) { *timed_out = true; resolver.cancel(); }
-        });
-        asio::error_code ec;
-        auto results = co_await resolver.async_resolve(
-            host, service, asio::redirect_error(asio::use_awaitable, ec));
-        timer.cancel();
-        if (*timed_out || ec) co_return std::nullopt;
+
+        auto [order, resolve_ec, results, timer_ec] = co_await asio::experimental::make_parallel_group(
+            [&](auto token) {
+                return resolver.async_resolve(host, service, token);
+            },
+            [&](auto token) {
+                return timer.async_wait(token);
+            }
+        ).async_wait(asio::experimental::wait_for_one(), asio::use_awaitable);
+
+        if ((order[0] == 1 && !timer_ec) || resolve_ec) co_return std::nullopt;
         co_return results;
     }
 
@@ -369,22 +373,25 @@ private:
         asio::ip::tcp::socket& socket, const asio::ip::tcp::resolver::results_type& endpoints,
         int timeout_ms) {
         auto ex = co_await asio::this_coro::executor;
-        auto timed_out = std::make_shared<bool>(false);
         asio::steady_timer timer(ex);
         timer.expires_after(std::chrono::milliseconds(timeout_ms));
-        timer.async_wait([timed_out, &socket](asio::error_code ec) {
-            if (!ec) {
-                *timed_out = true;
-                asio::error_code ignored;
-                socket.cancel(ignored);
-                socket.close(ignored);
+
+        auto [order, connect_ec, endpoint, timer_ec] = co_await asio::experimental::make_parallel_group(
+            [&](auto token) {
+                return asio::async_connect(socket, endpoints, token);
+            },
+            [&](auto token) {
+                return timer.async_wait(token);
             }
-        });
-        asio::error_code ec;
-        co_await asio::async_connect(
-            socket, endpoints, asio::redirect_error(asio::use_awaitable, ec));
-        timer.cancel();
-        co_return !*timed_out && !ec;
+        ).async_wait(asio::experimental::wait_for_one(), asio::use_awaitable);
+        (void)endpoint;
+
+        if (order[0] == 1 && !timer_ec) {
+            asio::error_code ignored;
+            socket.close(ignored);
+            co_return false;
+        }
+        co_return !connect_ec;
     }
 
     static void evict_stale_idle(Shard& shard, const Config& cfg) {
