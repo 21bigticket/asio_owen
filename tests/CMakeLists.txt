@@ -11,6 +11,21 @@ add_executable(test_upstream_manager test_upstream_manager.cpp)
 target_link_libraries(test_upstream_manager PRIVATE gtest_main asio_owen_deps)
 gtest_discover_tests(test_upstream_manager)
 
+# JSON key 转换
+add_executable(test_json_transform test_json_transform.cpp)
+target_link_libraries(test_json_transform PRIVATE gtest_main asio_owen_deps)
+gtest_discover_tests(test_json_transform)
+
+# Proxy response framing
+add_executable(test_proxy_framing test_proxy_framing.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)
+target_link_libraries(test_proxy_framing PRIVATE gtest_main asio_owen_deps)
+gtest_discover_tests(test_proxy_framing)
+
+# HTTP protocol helpers
+add_executable(test_http_protocol test_http_protocol.cpp)
+target_link_libraries(test_http_protocol PRIVATE gtest_main asio_owen_deps)
+gtest_discover_tests(test_http_protocol)
+
 # 配置目录加载
 add_executable(test_config_load test_config_load.cpp)
 target_link_libraries(test_config_load PRIVATE gtest_main asio_owen_deps)
