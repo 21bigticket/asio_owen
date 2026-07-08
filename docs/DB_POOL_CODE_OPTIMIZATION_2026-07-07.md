@@ -230,13 +230,14 @@ inline static thread_local RedisPtr tls_conn_{nullptr, redisFree};
 - 当前应用是单实例，正常。
 - 但测试、多实例、reload 或重建 RedisPool 时，可能复用旧配置的连接。
 
-建议：
+建议（已实现）：
 
-给 TLS 包一层状态：
+给 TLS 包一层状态，并同时记录 `generation`，避免 `RedisPool*` 地址复用时误判 owner 匹配：
 
 ```cpp
 struct TlsRedisConn {
     const RedisPool* owner = nullptr;
+    uint64_t generation = 0;
     RedisPtr conn{nullptr, redisFree};
 };
 inline static thread_local TlsRedisConn tls_;
@@ -245,13 +246,17 @@ inline static thread_local TlsRedisConn tls_;
 `get_conn()` 中检查：
 
 ```cpp
-if (tls_.owner != this) {
+if (tls_.owner != this || tls_.generation != generation_) {
     tls_.conn.reset();
     tls_.owner = this;
+    tls_.generation = generation_;
 }
 ```
 
-这样不会破坏 thread-local 快路径，也能消除多实例隐患。
+这样不会破坏 thread-local 快路径，也能消除多实例和地址复用隐患。实现落点：
+
+- `src/db/redis_connection.hpp` / `.cpp`：`TlsRedisConn`、`redis_tls_owner_matches()`、`reset_redis_tls_owner()`。
+- `src/db/redis_pool.hpp`：`generation_`、`next_generation_`、owner/generation 匹配后才复用 TLS 连接。
 
 ## P2：结构拆分优化
 
@@ -315,7 +320,7 @@ public:
 
 - 冷启动或连接全断时恢复较慢。
 
-建议：
+建议（已实现）：
 
 增加配置：
 
@@ -327,6 +332,7 @@ max_creating = 2
 默认保守值：
 
 ```cpp
+// MysqlPool::Config::max_creating == 0 表示自动推导
 max_creating = std::min({
     static_cast<size_t>(4),
     std::max<size_t>(1, cfg_.max_size / 8),
@@ -335,6 +341,11 @@ max_creating = std::min({
 ```
 
 只有当 `total_ < max_size` 且 `creating_ < max_creating` 时才并发建连。
+
+实现语义：
+
+- `MysqlPool::Config::max_creating` 默认为 `0`，表示按上述公式自动推导。
+- 配置显式设置 `max_creating > 0` 时，以配置值为准，并限制不超过 `max_size`。
 
 原因：
 

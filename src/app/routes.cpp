@@ -7,6 +7,8 @@
 
 namespace {
 
+asio::awaitable<void> set_cache(RedisPool* redis, std::string data);
+
 asio::awaitable<void> api_mysql(HttpContext& ctx, AppServices services) {
     auto res = co_await services.mysql->execute("SELECT * FROM sys_dict_type LIMIT 20");
     ctx.response_headers.emplace_back("Content-Type", "application/json");
