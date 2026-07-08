@@ -37,7 +37,7 @@ asio::awaitable<void> api_redis(HttpContext& ctx, AppServices services) {
 }
 
 asio::awaitable<void> api_combo(HttpContext& ctx, AppServices services) {
-    auto redis_resp = co_await services.redis->cmd("GET cache:user:1");
+    auto redis_resp = co_await services.redis->get("cache:user:1");
     std::string redis_ret = redis_resp.ok ? redis_resp.str : "";
 
     std::string data;
@@ -55,16 +55,18 @@ asio::awaitable<void> api_combo(HttpContext& ctx, AppServices services) {
             }
             auto ex = co_await asio::this_coro::executor;
             auto redis = services.redis;
-            co_spawn(ex, [redis, data]() -> asio::awaitable<void> {
-                co_await redis->cmd("SET cache:user:1 %s", data.c_str());
-                co_await redis->cmd("EXPIRE cache:user:1 300");
-            }, asio::detached);
+            co_spawn(ex, set_cache(redis, data), asio::detached);
         }
     }
 
     ctx.response_headers.emplace_back("Content-Type", "application/json");
     ctx.status_code = 200;
     ctx.response_body = resp_ok_str(data);
+}
+
+asio::awaitable<void> set_cache(RedisPool* redis, std::string data) {
+    co_await redis->cmd_argv({"SET", "cache:user:1", data});
+    co_await redis->cmd_argv({"EXPIRE", "cache:user:1", "300"});
 }
 
 asio::awaitable<void> api_health(HttpContext& ctx) {

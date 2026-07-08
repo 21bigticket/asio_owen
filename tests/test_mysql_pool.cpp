@@ -4,6 +4,10 @@
 #include <vector>
 #include <chrono>
 #include <atomic>
+#include <optional>
+
+#include "db/mysql_pool.hpp"
+#include "db/redis_pool.hpp"
 
 // 这些测试不需要真实的 MySQL/Redis 连接。
 // 它们测试池的逻辑正确性：acquire/release 流程、容量控制、创建_ 防护。
@@ -20,6 +24,23 @@
 // 由于当前 MysqlPool 的 acquire/release 是 private 的，测试无法直接调用。
 // 集成测试通过 execute() 间接验证，需要真实数据库。
 
+namespace {
+
+asio::awaitable<void> store_sql_result(
+    MysqlPool& pool,
+    std::string sql,
+    std::optional<MysqlPool::Result>& out) {
+    out = co_await pool.execute(sql);
+}
+
+asio::awaitable<void> store_empty_redis_argv_reply(
+    RedisPool& pool,
+    std::optional<RedisPool::Reply>& out) {
+    out = co_await pool.cmd_argv({});
+}
+
+}  // namespace
+
 TEST(MysqlPoolTest, Placeholder) {
     // 真正的测试需要 MySQL 实例，在 CI 环境中启用。
     // 本地测试：cd build && ./tests/test_mysql_pool
@@ -28,6 +49,64 @@ TEST(MysqlPoolTest, Placeholder) {
 
 TEST(RedisPoolTest, Placeholder) {
     SUCCEED() << "Integration tests require a real Redis instance";
+}
+
+TEST(MysqlPoolTest, RejectsSqlLongerThanStackBufferBeforeAcquire) {
+    asio::io_context ioc;
+    MysqlPool::Config cfg;
+    cfg.min_size = 0;
+    cfg.max_size = 1;
+    cfg.worker_threads = 1;
+    cfg.keepalive_sec = 60;
+    MysqlPool pool(ioc, cfg);
+
+    std::optional<MysqlPool::Result> result;
+    co_spawn(ioc, store_sql_result(pool, std::string(4096, 'x'), result), asio::detached);
+
+    ioc.run();
+    pool.shutdown();
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->ok);
+    EXPECT_EQ(result->error, "sql too long");
+
+    auto stats = pool.snapshot();
+    EXPECT_EQ(stats.query_fail_total, 1u);
+    EXPECT_EQ(stats.max_creating, 1u);
+}
+
+TEST(MysqlPoolTest, ComputesDefaultMaxCreatingFromPoolAndWorkerSize) {
+    asio::io_context ioc;
+    MysqlPool::Config cfg;
+    cfg.min_size = 0;
+    cfg.max_size = 64;
+    cfg.worker_threads = 4;
+    cfg.keepalive_sec = 60;
+    MysqlPool pool(ioc, cfg);
+
+    auto stats = pool.snapshot();
+    pool.shutdown();
+
+    EXPECT_EQ(stats.max_creating, 2u);
+}
+
+TEST(RedisPoolTest, EmptyArgvCommandReturnsErrorBeforeConnect) {
+    asio::io_context ioc;
+    RedisPool pool(ioc, RedisPool::Config{});
+
+    std::optional<RedisPool::Reply> reply;
+    co_spawn(ioc, store_empty_redis_argv_reply(pool, reply), asio::detached);
+
+    ioc.run();
+    pool.shutdown();
+
+    ASSERT_TRUE(reply.has_value());
+    EXPECT_FALSE(reply->ok);
+    EXPECT_EQ(reply->error, "empty Redis command");
+
+    auto stats = pool.snapshot();
+    EXPECT_EQ(stats.cmd_fail_total, 1u);
+    EXPECT_EQ(stats.cmd_ok_total, 0u);
 }
 
 // === 池容量逻辑验证（纯逻辑，不依赖 MySQL） ===

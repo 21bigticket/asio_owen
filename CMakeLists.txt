@@ -183,6 +183,17 @@ target_link_libraries(asio_owen_deps INTERFACE
     Threads::Threads
 )
 
+add_library(asio_owen_core STATIC
+        src/db/mysql_connection.cpp
+        src/db/mysql_pool_stats.cpp
+        src/db/mysql_result_json.cpp
+        src/db/redis_command.cpp
+        src/db/redis_connection.cpp
+        src/db/redis_pool_stats.cpp
+        src/db/redis_reply.cpp
+)
+target_link_libraries(asio_owen_core PUBLIC asio_owen_deps)
+
 # 可执行文件
 add_executable(server
         src/main.cpp
@@ -190,10 +201,7 @@ add_executable(server
         src/app/routes.cpp
         picohttpparser.c
 )
-target_link_libraries(server PRIVATE asio_owen_deps)
-
-# 构建后自动复制 config 文件到输出目录
-configure_file(${PROJECT_SOURCE_DIR}/config.ini ${CMAKE_CURRENT_BINARY_DIR}/config.ini COPYONLY)
+target_link_libraries(server PRIVATE asio_owen_core)
 
 # 复制 config.d/ 目录（如果存在），排除本地覆盖文件
 if(EXISTS ${PROJECT_SOURCE_DIR}/config.d)

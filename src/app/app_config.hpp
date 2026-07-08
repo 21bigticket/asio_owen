@@ -44,7 +44,8 @@ inline AppConfig app_config_from(const Config& cfg) {
         .connect_timeout_ms = cfg.get_int("mysql", "connect_timeout_ms", 1000),
         .read_timeout_ms = cfg.get_int("mysql", "read_timeout_ms", 500),
         .keepalive_sec = cfg.get_int("mysql", "keepalive_sec", 30),
-        .worker_threads = static_cast<size_t>(std::max(1, cfg.get_int("mysql", "worker_threads", 32)))
+        .worker_threads = static_cast<size_t>(std::max(1, cfg.get_int("mysql", "worker_threads", 32))),
+        .max_creating = static_cast<size_t>(std::max(0, cfg.get_int("mysql", "max_creating", 0)))
     };
 
     app.redis = RedisPool::Config{

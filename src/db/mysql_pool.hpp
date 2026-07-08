@@ -1,6 +1,8 @@
 #pragma once
 #include <asio.hpp>
 #include <mysql/mysql.h>
+#include <algorithm>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <cstring>
@@ -9,12 +11,15 @@
 #include <chrono>
 #include <vector>
 #include "../common/logger.hpp"
+#include "mysql_connection.hpp"
+#include "mysql_pool_stats.hpp"
+#include "mysql_result_json.hpp"
 
 // MySQL connection pool v3.3: shared mutex pool + dedicated maintain thread
 //
 // Core design:
 //   - idle_pool_ (deque<IdleConn>) — front is oldest, back is newest
-//   - creating_ — at most 1 concurrent connect (prevents thundering herd)
+//   - creating_ — bounded concurrent connects (prevents thundering herd)
 //   - total_ — current total connections (idle + in-use)
 //   - max_idle_sec — time-based reclamation, not count-based
 //   - maintain runs on its own thread — does not block io_context
@@ -35,6 +40,7 @@ public:
         int read_timeout_ms = 500;
         int keepalive_sec = 30;
         size_t worker_threads = 32;  // SQL worker threads, mysql_query is synchronous blocking IO, recommended > CPU cores
+        size_t max_creating = 0;     // 0 表示按 max_size/worker_threads 保守推导
     };
 
     struct Result {
@@ -44,11 +50,15 @@ public:
     };
 
     MysqlPool(asio::io_context& ioc, Config cfg)
-        : ioc_(ioc), cfg_(std::move(cfg)), running_(true),
+        : running_(true),
+          ioc_(ioc),
+          cfg_(std::move(cfg)),
+          max_creating_limit_(compute_max_creating_limit(cfg_)),
           worker_pool_(cfg_.worker_threads)  // SQL worker threads, independent of pool size
     {
         LOG_INFO("MySQL pool initializing, host=", cfg_.host, ":", cfg_.port,
-                 ", min=", cfg_.min_size, ", max=", cfg_.max_size);
+                 ", min=", cfg_.min_size, ", max=", cfg_.max_size,
+                 ", max_creating=", max_creating_limit_);
 
         // pre-create min_size connections at startup (outside lock, 1s timeout)
         size_t created = 0;
@@ -74,12 +84,12 @@ public:
         if (!running_.exchange(false)) return;
         cv_.notify_all();
 
-        // wait for SQL workers to finish
-        worker_pool_.join();
-
-        // wait for maintain thread to exit
+        // stop maintain first so shutdown is not gated by keepalive_sec.
         if (maintain_thread_.joinable())
             maintain_thread_.join();
+
+        // wait for SQL workers to finish
+        worker_pool_.join();
 
         // close all idle connections
         {
@@ -97,7 +107,10 @@ public:
         // copy SQL to stack buffer to avoid std::string across threads
         char sql_buf[4096];
         size_t len = sql.size();
-        if (len > sizeof(sql_buf) - 1) len = sizeof(sql_buf) - 1;
+        if (len >= sizeof(sql_buf)) {
+            stats_.inc_query_fail();
+            co_return Result{false, "sql too long", ""};
+        }
         std::memcpy(sql_buf, sql.data(), len);
         sql_buf[len] = '\0';
 
@@ -109,6 +122,15 @@ public:
         co_return res;
     }
 
+    MysqlPoolStatsSnapshot snapshot() const {
+        std::lock_guard lock(mtx_);
+        return stats_.snapshot(total_, idle_pool_.size(), creating_, max_creating_limit_);
+    }
+
+    std::string stats() const {
+        return format_mysql_pool_stats(snapshot());
+    }
+
 private:
     struct IdleConn {
         MYSQL* conn;
@@ -117,54 +139,38 @@ private:
 
     Result do_query(const char* sql) {
         MYSQL* conn = acquire();
-        if (!conn) return {false, "no available connection", ""};
+        if (!conn) {
+            stats_.inc_query_fail();
+            return {false, "no available connection", ""};
+        }
 
         if (mysql_query(conn, sql)) {
             std::string err = mysql_error(conn);
             LOG_WARN("MySQL query failed: ", err);
-            mysql_close(conn);
-            // connection closed, notify pool to decrement count
-            {
-                std::lock_guard lock(mtx_);
-                --total_;
-                cv_.notify_all();
-            }
+            drop_bad_connection(conn);
+            stats_.inc_query_fail();
             return {false, std::move(err), ""};
         }
 
         MYSQL_RES* mr = mysql_store_result(conn);
-        release(conn);
 
-        if (!mr) return {true, "", "[]"};
-
-        unsigned int nf = mysql_num_fields(mr);
-        MYSQL_FIELD* fields = mysql_fetch_fields(mr);
-
-        std::string json;
-        json.reserve(4096);
-        json += '[';
-        MYSQL_ROW row;
-        bool first = true;
-        while ((row = mysql_fetch_row(mr))) {
-            if (!first) json += ',';
-            first = false;
-            json += '{';
-            for (unsigned int i = 0; i < nf; ++i) {
-                if (i > 0) json += ',';
-                json += '"';
-                json += fields[i].name;
-                json += "\":\"";
-                const char* val = row[i] ? row[i] : "NULL";
-                for (const char* p = val; *p; ++p) {
-                    if (*p == '"' || *p == '\\') json += '\\';
-                    json += *p;
-                }
-                json += '"';
+        if (!mr) {
+            if (mysql_field_count(conn) != 0) {
+                std::string err = mysql_error(conn);
+                LOG_WARN("MySQL store result failed: ", err);
+                drop_bad_connection(conn);
+                stats_.inc_query_fail();
+                return {false, std::move(err), ""};
             }
-            json += '}';
+            release(conn);
+            stats_.inc_query_ok();
+            return {true, "", "[]"};
         }
-        json += ']';
+
+        release(conn);
+        std::string json = mysql_result_to_json(mr);
         mysql_free_result(mr);
+        stats_.inc_query_ok();
         return {true, "", std::move(json)};
     }
 
@@ -181,15 +187,12 @@ private:
                         idle_pool_.pop_front();
                         return conn;
                     }
-                    if (creating_ > 0) {
-                        cv_.wait(lock);
-                        continue;
-                    }
-                    if (total_ < cfg_.max_size) {
+                    if (total_ < cfg_.max_size && creating_ < max_creating_limit_) {
                         ++total_;
                         ++creating_;
                         break;
                     }
+                    stats_.inc_acquire_wait();
                     cv_.wait(lock);
                 }
             }
@@ -211,6 +214,7 @@ private:
             // new connection needs session reset (rollback any pending transactions)
             if (mysql_reset_connection(conn) != 0) {
                 LOG_WARN("acquire: mysql_reset_connection failed: ", mysql_error(conn));
+                stats_.inc_reset_conn_fail();
                 mysql_close(conn);
                 {
                     std::lock_guard lock(mtx_);
@@ -224,6 +228,7 @@ private:
         }
 
         LOG_WARN("acquire: exhausted retries, returning nullptr");
+        stats_.inc_acquire_retry_exhausted();
         return nullptr;
     }
 
@@ -233,6 +238,14 @@ private:
         std::lock_guard lock(mtx_);
         idle_pool_.push_back({conn, std::chrono::steady_clock::now()});
         cv_.notify_one();
+    }
+
+    void drop_bad_connection(MYSQL* conn) {
+        if (!conn) return;
+        mysql_close(conn);
+        std::lock_guard lock(mtx_);
+        --total_;
+        cv_.notify_all();
     }
 
     // --- dedicated maintain thread ---
@@ -271,8 +284,10 @@ private:
         for (auto* c : to_close) {
             mysql_close(c);
         }
-        if (!to_close.empty())
+        if (!to_close.empty()) {
+            stats_.add_idle_recycled(to_close.size());
             LOG_INFO("maintain: recycled ", to_close.size(), " idle connections");
+        }
 
         if (!running_) return;
 
@@ -331,6 +346,7 @@ private:
             if (!running_) break;
             if (mysql_ping_with_timeout(to_check[checked].conn) != 0) {
                 mysql_close(to_check[checked].conn);
+                stats_.inc_ping_fail();
                 ++dead_count;
             } else {
                 std::lock_guard lock(mtx_);
@@ -358,57 +374,54 @@ private:
         }
     }
 
-    // --- Create connection (with timeout) ---
     MYSQL* create_connection_with_timeout() {
-        MYSQL* conn = mysql_init(nullptr);
-        if (!conn) {
-            LOG_ERROR("MySQL init failed");
-            return nullptr;
-        }
-
-        // connect timeout
-        unsigned int timeout_sec = cfg_.connect_timeout_ms / 1000;
-        if (timeout_sec < 1) timeout_sec = 1;
-        mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_sec);
-
-        // note: MYSQL_OPT_READ_TIMEOUT is NOT set during connect.
-        // read_timeout is only set temporarily by mysql_ping_with_timeout
-        // during ping, then restored to avoid affecting subsequent mysql_query.
-
-        if (!mysql_real_connect(conn, cfg_.host.c_str(), cfg_.user.c_str(),
-                cfg_.pass.c_str(), cfg_.db.c_str(), cfg_.port, nullptr, 0)) {
-            LOG_ERROR("MySQL connect failed: ", mysql_error(conn));
-            mysql_close(conn);
-            return nullptr;
+        MYSQL* conn = ::create_mysql_connection_with_timeout(connection_config());
+        if (conn) {
+            stats_.inc_connect_ok();
+        } else {
+            stats_.inc_connect_fail();
         }
         return conn;
     }
 
-    // --- Ping (set read_timeout, restore to 0 after ping) ---
     int mysql_ping_with_timeout(MYSQL* conn) {
-        // MYSQL_OPT_READ_TIMEOUT unit is seconds, round up to ensure >= 1s
-        unsigned int rt = (cfg_.read_timeout_ms + 999) / 1000;
-        if (rt < 1) rt = 1;
-        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &rt);
+        return ::mysql_ping_with_timeout(conn, cfg_.read_timeout_ms);
+    }
 
-        int ret = mysql_ping(conn);
+    MysqlConnectionConfig connection_config() const {
+        return MysqlConnectionConfig{
+            .host = cfg_.host,
+            .port = cfg_.port,
+            .user = cfg_.user,
+            .pass = cfg_.pass,
+            .db = cfg_.db,
+            .connect_timeout_ms = cfg_.connect_timeout_ms,
+            .read_timeout_ms = cfg_.read_timeout_ms
+        };
+    }
 
-        // restore read_timeout to 0 (unlimited), avoid affecting subsequent mysql_query
-        unsigned int restore_rt = 0;
-        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &restore_rt);
-
-        return ret;
+    static size_t compute_max_creating_limit(const Config& cfg) {
+        if (cfg.max_creating > 0) {
+            return std::max<size_t>(1, std::min(cfg.max_creating, cfg.max_size));
+        }
+        return std::min({
+            static_cast<size_t>(4),
+            std::max<size_t>(1, cfg.max_size / 8),
+            std::max<size_t>(1, cfg.worker_threads / 2)
+        });
     }
 
     std::atomic<bool> running_;
     asio::io_context& ioc_;
     Config cfg_;
+    size_t max_creating_limit_;
 
     std::deque<IdleConn> idle_pool_;
     size_t total_ = 0;             // protected by mtx_
     size_t creating_ = 0;          // protected by mtx_
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
     std::condition_variable cv_;
+    MysqlPoolStats stats_;
 
     asio::thread_pool worker_pool_;
     std::thread maintain_thread_;
