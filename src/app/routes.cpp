@@ -1,13 +1,13 @@
 #include "routes.hpp"
 
-#include <asio/co_spawn.hpp>
-#include <asio/detached.hpp>
+#include <asio/post.hpp>
+#include <asio/this_coro.hpp>
 
 #include "../http/response.hpp"
 
 namespace {
 
-asio::awaitable<void> set_cache(RedisPool* redis, std::string data);
+void set_cache(RedisPool* redis, const std::string& data);
 
 asio::awaitable<void> api_mysql(HttpContext& ctx, AppServices services) {
     auto res = co_await services.mysql->execute("SELECT * FROM sys_dict_type LIMIT 20");
@@ -57,7 +57,9 @@ asio::awaitable<void> api_combo(HttpContext& ctx, AppServices services) {
             }
             auto ex = co_await asio::this_coro::executor;
             auto redis = services.redis;
-            co_spawn(ex, set_cache(redis, data), asio::detached);
+            asio::post(ex, [redis, data] {
+                set_cache(redis, data);
+            });
         }
     }
 
@@ -66,9 +68,9 @@ asio::awaitable<void> api_combo(HttpContext& ctx, AppServices services) {
     ctx.response_body = resp_ok_str(data);
 }
 
-asio::awaitable<void> set_cache(RedisPool* redis, std::string data) {
-    co_await redis->cmd_argv({"SET", "cache:user:1", data});
-    co_await redis->cmd_argv({"EXPIRE", "cache:user:1", "300"});
+void set_cache(RedisPool* redis, const std::string& data) {
+    redis->cmd_argv_sync({"SET", "cache:user:1", data});
+    redis->cmd_argv_sync({"EXPIRE", "cache:user:1", "300"});
 }
 
 asio::awaitable<void> api_health(HttpContext& ctx) {

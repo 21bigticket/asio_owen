@@ -185,6 +185,7 @@ release(conn);
 
 ```cpp
 asio::awaitable<Reply> cmd_argv(std::vector<std::string> args);
+Reply cmd_argv_sync(std::vector<std::string> args);
 ```
 
 内部使用 `redisCommandArgv()`。
@@ -192,13 +193,14 @@ asio::awaitable<Reply> cmd_argv(std::vector<std::string> args);
 说明：
 
 - `cmd_argv` 参数使用 owning `std::vector<std::string>`，避免 coroutine awaitable 被保存时 `initializer_list<string_view>` 悬空。
+- `cmd_argv_sync` 复用同一安全路径，供不能使用 helper coroutine 的位置调用。
 - Redis 命令仍在 `io_context` 线程同步执行，不跨 worker pool。
 
 示例：
 
 ```cpp
-co_await redis->cmd_argv({"SET", "cache:user:1", data});
-co_await redis->cmd_argv({"EXPIRE", "cache:user:1", "300"});
+redis->cmd_argv_sync({"SET", "cache:user:1", data});
+redis->cmd_argv_sync({"EXPIRE", "cache:user:1", "300"});
 ```
 
 这是当前 `/api/combo` 的真实 bug，不只是防御性改进：`data` 来自 MySQL 查询结果，如果包含空格、换行或引号，`SET cache:user:1 %s` 会被拆成错误命令。
@@ -212,7 +214,8 @@ asio::awaitable<Reply> cmd(const char* fmt, ...);
 
 迁移原则：
 
-- 新代码一律使用 `cmd_argv()`。
+- 新 coroutine 调用优先使用 `cmd_argv()`。
+- 需要避开 GCC 11 coroutine ICE 的 helper 或普通函数可以使用 `cmd_argv_sync()`，但仍必须保证只在 `io_context` 线程调用。
 - 旧 `cmd(fmt, ...)` 只允许固定命令或纯内部常量。
 - `/api/combo` 的 `SET cache:user:1 %s` 必须在 P1 阶段优先迁移，因为 `data` 是动态值。
 
@@ -497,5 +500,99 @@ MysqlPoolStats snapshot() const;
 - `ctest --test-dir build_codex_stage0 --output-on-failure` 通过。
 - ASan+UBSan 单测通过。
 - `/api/mysql`、`/api/redis`、`/api/combo` 功能正常。
-- `THREADS=30 bash bench/bench_full.sh` 中 Redis/MySQL RPS 允许相对当前基线回退不超过 10%。
+- `THREADS=30 bash bench/bench_full.sh` 中 Redis/MySQL RPS 允许相对同一机器、同一构建类型、同一 `worker_threads` 配置下的最近有效基线回退不超过 10%。
 - 新增正确性测试覆盖 SQL 超长、JSON escape、Redis argv 参数边界、TLS owner 重建。
+
+## 压测复测记录与口径
+
+### 2026-07-09 本机复测记录
+
+复测命令：
+
+```bash
+THREADS=30 bash bench/bench_full.sh
+```
+
+配置与口径：
+
+- Release 服务进程，wrk 同机压测。
+- `config.d/10-mysql.ini` 默认 `worker_threads=32`，如需在 6 核虚拟机限流，应写入本地 `99-local.ini`，不提交到默认配置。
+- 该轮包含 Health、Redis、MySQL、Config Direct、Config Gateway，每项 2 轮，每轮 30s。
+
+结果摘要：
+
+| 接口 | #1 RPS | #2 RPS | 备注 |
+|------|-------:|-------:|------|
+| Health | 144,379 | 164,485 | 纯 HTTP 基线 |
+| Redis | 37,935 | 39,296 | `GET demo_key` |
+| MySQL | 10,970 | 12,488 | `SELECT * FROM sys_dict_type LIMIT 20` |
+| Config Direct | 15,318 | 15,796 | 直打 `127.0.0.1:30001` |
+| Config Gateway | 8,883 | 10,003 | 通过 `:8081/zebra-config/...` |
+
+该轮 10 项全部 HTTP 200，错误数 0。后续判断性能回退时，必须使用同机、同构建、同 `worker_threads` 的最近有效结果做基线，不能把 2026-07-08 的异常虚拟机结果或不同 worker 配置混入同一阈值。
+
+### 2026-07-08 虚拟机复测观察
+
+一次虚拟机压测中出现整体 RPS 明显低于前一日基线：
+
+- `Health` 从约 138k RPS 降到约 50k-72k RPS。
+- `Redis` 从约 34k RPS 降到约 9k RPS。
+- `MySQL` 从约 18k-19k RPS 降到约 6k RPS。
+- `Config Direct` 直打 `127.0.0.1:30001` 也从约 16k RPS 降到约 3.5k RPS。
+
+这组结果不能直接判定为 DB pool 代码回退。
+
+理由：
+
+- `/api/health` 不经过 Redis / MySQL / `cmd_argv_sync()`，但同样明显下降。
+- `Config Direct` 绕过 gateway/server 代码，仍明显下降，说明压测机、上游服务、VM CPU 或同机 wrk 抢占已经成为变量。
+- 该现象更像构建类型、同机压测抢 CPU、VM vCPU/steal time、上游服务状态或 warmup 不足导致的整体环境波动。
+
+### 下次压测前必须确认
+
+1. 使用 Release 构建，不使用 ASan/UBSan 或 Debug binary：
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/server
+```
+
+2. 先单独压 `/api/health` 建立本机 HTTP 基线：
+
+```bash
+THREADS=8 CONCURRENCY=100 DURATION=30s bash bench/bench_full.sh health
+THREADS=16 CONCURRENCY=100 DURATION=30s bash bench/bench_full.sh health
+THREADS=30 CONCURRENCY=100 DURATION=30s bash bench/bench_full.sh health
+```
+
+3. 观察 server、wrk、Redis、MySQL、上游服务的 CPU 竞争：
+
+```bash
+top -H
+mpstat 1
+lscpu
+```
+
+重点关注：
+
+- server 是否吃满 CPU。
+- wrk 是否和 server 抢同一批 vCPU。
+- VM `%steal` 是否偏高。
+- `Config Direct` 是否也低于历史基线。
+
+4. 如果 `Config Direct` 仍明显低于历史基线，则该环境不能用于判断 gateway / DB pool 代码是否性能回退。
+
+5. 更推荐用另一台机器跑 wrk，服务端机器只跑 server、Redis、MySQL 和上游服务，避免同机压测互相抢 CPU。
+
+### GCC 11.4 兼容性记录
+
+虚拟机 GCC 11.4.0 在 `routes.cpp` 的 `asio::awaitable<void>` helper coroutine 上触发 ICE（`build_special_member_call`）。这属于 GCC 11 coroutine 已知问题，不是业务代码语义错误。
+
+当前绕过方式：
+
+- 保留 `RedisPool::cmd_argv(std::vector<std::string>)` coroutine API。
+- 新增 `RedisPool::cmd_argv_sync(std::vector<std::string>)` 复用同一 `redisCommandArgv` 安全路径。
+- `/api/combo` 后台 cache miss 写 Redis 改为 `asio::post` 调普通 `set_cache()`，避免该 helper coroutine 触发 GCC 11 ICE。
+
+该绕过只影响 `/api/combo` cache miss 后的后台写缓存实现形式，不影响 `/api/health`、`/api/redis`、`/api/mysql` 或 gateway 转发主路径。

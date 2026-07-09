@@ -86,15 +86,19 @@ public:
     }
 
     asio::awaitable<Reply> cmd_argv(std::vector<std::string> args) {
+        co_return cmd_argv_sync(std::move(args));
+    }
+
+    Reply cmd_argv_sync(std::vector<std::string> args) {
         if (args.empty()) {
             stats_.inc_cmd_fail();
-            co_return Reply{false, "empty Redis command", "", 0};
+            return Reply{false, "empty Redis command", "", 0};
         }
 
         redisContext* ctx = get_conn();
         if (!ctx) {
             stats_.inc_cmd_fail();
-            co_return Reply{false, "no Redis connection", "", 0};
+            return Reply{false, "no Redis connection", "", 0};
         }
 
         RedisCommandArgv command(args);
@@ -109,14 +113,14 @@ public:
             std::string err = ctx->errstr;
             LOG_WARN("Redis cmd failed: ", err, ", connection will be rebuilt");
             record_command_failure(err);
-            co_return Reply{false, std::move(err), "", 0};
+            return Reply{false, std::move(err), "", 0};
         }
 
         Reply r;
         parse_redis_reply(reply, r);
         freeReplyObject(reply);
         record_command_result(r);
-        co_return r;
+        return r;
     }
 
     // 快速路径：直接执行固定命令，跳过 vsnprintf 格式化和 string 分配
