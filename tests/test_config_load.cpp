@@ -5,6 +5,7 @@
 #include <chrono>
 
 #include "common/config.hpp"
+#include "app/app_config.hpp"
 
 namespace {
 
@@ -65,6 +66,34 @@ TEST(ConfigLoad, ParsesBoolValues) {
     EXPECT_TRUE(cfg.get_bool("http_pool", "send_keep_alive_header", false));
     EXPECT_FALSE(cfg.get_bool("http_pool", "disabled", true));
     EXPECT_TRUE(cfg.get_bool("http_pool", "missing", true));
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, ParsesDownstreamWriteTimeout) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "downstream_write_timeout_ms = 1234\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.downstream_write_timeout_ms, 1234);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, ParsesMysqlQueryTimeout) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "10-mysql.ini",
+        "[mysql]\n"
+        "query_timeout_ms = 2500\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.mysql.query_timeout_ms, 2500);
 
     std::filesystem::remove_all(base);
 }

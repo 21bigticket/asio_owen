@@ -14,6 +14,7 @@ struct AppConfig {
     LogLevel log_level = INFO;
     std::string log_file = "server.log";
     int server_port = 8080;
+    int downstream_write_timeout_ms = 30000;
     MysqlPool::Config mysql;
     RedisPool::Config redis;
     HttpPool::Config http_pool;
@@ -32,6 +33,7 @@ inline AppConfig app_config_from(const Config& cfg) {
 
     app.log_file = cfg.get("server", "log_file", "server.log");
     app.server_port = cfg.get_int("server", "port", 8080);
+    app.downstream_write_timeout_ms = cfg.get_int("server", "downstream_write_timeout_ms", 30000);
 
     app.mysql = MysqlPool::Config{
         .host = cfg.get("mysql", "host", "127.0.0.1"),
@@ -44,6 +46,7 @@ inline AppConfig app_config_from(const Config& cfg) {
         .max_idle_sec = cfg.get_int("mysql", "max_idle_sec", 60),
         .connect_timeout_ms = cfg.get_int("mysql", "connect_timeout_ms", 1000),
         .read_timeout_ms = cfg.get_int("mysql", "read_timeout_ms", 500),
+        .query_timeout_ms = cfg.get_int("mysql", "query_timeout_ms", 0),
         .keepalive_sec = cfg.get_int("mysql", "keepalive_sec", 30),
         .worker_threads = static_cast<size_t>(std::max(1, cfg.get_int("mysql", "worker_threads", 32))),
         .max_creating = static_cast<size_t>(std::max(0, cfg.get_int("mysql", "max_creating", 0)))

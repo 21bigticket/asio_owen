@@ -217,7 +217,7 @@ pool state 通过 `shared_ptr<State>` 持有，因此 shutdown 和 in-flight gua
 |---|---|---|
 | 客户端 | header 读取、body 读取 | 30s |
 | 客户端 | header 大小 | 64KB 硬上限 |
-| 客户端 | 写响应 | 当前无独立 timer；写失败即关闭连接 |
+| 客户端 | 写响应 | `downstream_write_timeout_ms`，默认 30s |
 | 上游 | resolve | `connect_timeout_ms` |
 | 上游 | connect | `connect_timeout_ms` |
 | 上游 | 写请求 | `request_timeout_ms` |

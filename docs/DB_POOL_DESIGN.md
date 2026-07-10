@@ -74,6 +74,7 @@ max_size = 64
 max_idle_sec = 60           ; 空闲连接超过此秒数被回收
 connect_timeout_ms = 1000   ; 建连超时（TCP握手 + 认证）
 read_timeout_ms = 500       ; 仅用于 mysql_ping 探活读超时，不作用于查询
+query_timeout_ms = 0        ; 查询读超时，0 表示不限制（性能/兼容模式）
 keepalive_sec = 30          ; maintain 周期
 ```
 

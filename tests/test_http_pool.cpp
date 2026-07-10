@@ -15,16 +15,23 @@ namespace {
 
 using tcp = asio::ip::tcp;
 
-asio::awaitable<void> acquire_closed_port(
+asio::awaitable<void> acquire_closed_port_expect_failure_and_clean_counters(
     HttpPool& pool,
     int closed_port,
-    std::atomic<bool>& saw_failure) {
+    std::atomic<bool>& saw_failure,
+    std::atomic<bool>& counters_clean) {
     try {
         auto conn = co_await pool.acquire("127.0.0.1", closed_port);
         (void)conn;
     } catch (...) {
         saw_failure.store(true, std::memory_order_relaxed);
     }
+
+    auto state = pool.state();
+    counters_clean.store(
+        state->total_count.load(std::memory_order_relaxed) == 0 &&
+        state->in_flight_count.load(std::memory_order_relaxed) == 0,
+        std::memory_order_relaxed);
 }
 
 asio::awaitable<void> accept_one_and_hold(
@@ -51,50 +58,45 @@ asio::awaitable<void> acquire_release_acquire(
     HttpPool::release_bad(pool.state(), std::move(second));
 }
 
+asio::awaitable<void> acquire_twice_expect_second_null(
+    HttpPool& pool,
+    int port,
+    std::atomic<bool>& second_was_null) {
+    auto first = co_await pool.acquire("127.0.0.1", port);
+    if (!first) co_return;
+
+    auto second = co_await pool.acquire("127.0.0.1", port);
+    second_was_null.store(second == nullptr, std::memory_order_relaxed);
+
+    if (second) {
+        HttpPool::release_bad(pool.state(), std::move(second));
+    }
+    HttpPool::release_bad(pool.state(), std::move(first));
+}
+
 }  // namespace
 
-TEST(HttpPool, FailedConnectAfterShardSkipCleansActualReservedShard) {
+TEST(HttpPool, FailedConnectCleansGlobalAndShardCounters) {
     asio::io_context ioc;
     int closed_port = 1;
 
     HttpPool::Config cfg;
-    cfg.max_size = HttpPool::kShards;
+    cfg.max_size = 1;
     cfg.connect_timeout_ms = 100;
     HttpPool pool(ioc, cfg);
     auto state = pool.state();
 
-    size_t last = HttpPool::State::pick_shard();
-    size_t start_shard = (last + 1) % HttpPool::kShards;
-    size_t reserved_shard = (start_shard + 1) % HttpPool::kShards;
-    for (size_t i = 0; i < HttpPool::kShards; ++i) {
-        auto& shard = state->shards[i];
-        std::lock_guard lock(shard.mtx);
-        shard.total = (i == reserved_shard) ? 0 : 1;
-        shard.in_flight = 0;
-        shard.active.clear();
-        shard.idle.clear();
-    }
-
     std::atomic<bool> saw_failure{false};
-    co_spawn(ioc, acquire_closed_port(pool, closed_port, saw_failure), asio::detached);
+    std::atomic<bool> counters_clean{false};
+    co_spawn(ioc, acquire_closed_port_expect_failure_and_clean_counters(
+        pool, closed_port, saw_failure, counters_clean), asio::detached);
 
     ioc.run();
 
     EXPECT_TRUE(saw_failure.load(std::memory_order_relaxed));
-    {
-        auto& shard = state->shards[start_shard];
-        std::lock_guard lock(shard.mtx);
-        EXPECT_EQ(shard.total, 1u);
-        EXPECT_EQ(shard.in_flight, 0u);
-        EXPECT_TRUE(shard.active.empty());
-    }
-    {
-        auto& shard = state->shards[reserved_shard];
-        std::lock_guard lock(shard.mtx);
-        EXPECT_EQ(shard.total, 0u);
-        EXPECT_EQ(shard.in_flight, 0u);
-        EXPECT_TRUE(shard.active.empty());
-    }
+    EXPECT_TRUE(counters_clean.load(std::memory_order_relaxed));
+    EXPECT_EQ(state->total_count.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(state->in_flight_count.load(std::memory_order_relaxed), 0u);
 
     for (auto& shard : state->shards) {
         std::lock_guard lock(shard.mtx);
@@ -102,6 +104,61 @@ TEST(HttpPool, FailedConnectAfterShardSkipCleansActualReservedShard) {
         shard.in_flight = 0;
         shard.active.clear();
         shard.idle.clear();
+    }
+}
+
+TEST(HttpPool, MaxSizeIsGlobalHardLimit) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+
+    HttpPool::Config cfg;
+    cfg.max_size = 1;
+    cfg.connect_timeout_ms = 1000;
+    HttpPool pool(ioc, cfg);
+
+    std::atomic<bool> second_was_null{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_twice_expect_second_null(
+        pool, acceptor.local_endpoint().port(), second_was_null), asio::detached);
+
+    ioc.run();
+
+    EXPECT_TRUE(second_was_null.load(std::memory_order_relaxed));
+    EXPECT_EQ(pool.state()->total_count.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(pool.state()->in_flight_count.load(std::memory_order_relaxed), 0u);
+
+    asio::error_code ec;
+    if (held_socket->has_value()) {
+        (*held_socket)->close(ec);
+    }
+}
+
+TEST(HttpPool, MaxConcurrentIsGlobalHardLimit) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+
+    HttpPool::Config cfg;
+    cfg.max_size = 2;
+    cfg.max_concurrent = 1;
+    cfg.connect_timeout_ms = 1000;
+    HttpPool pool(ioc, cfg);
+
+    std::atomic<bool> second_was_null{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_twice_expect_second_null(
+        pool, acceptor.local_endpoint().port(), second_was_null), asio::detached);
+
+    ioc.run();
+
+    EXPECT_TRUE(second_was_null.load(std::memory_order_relaxed));
+    EXPECT_EQ(pool.state()->total_count.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(pool.state()->in_flight_count.load(std::memory_order_relaxed), 0u);
+
+    asio::error_code ec;
+    if (held_socket->has_value()) {
+        (*held_socket)->close(ec);
     }
 }
 

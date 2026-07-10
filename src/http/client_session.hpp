@@ -24,12 +24,15 @@
 using namespace std::chrono_literals;
 
 struct HttpServerState {
-    explicit HttpServerState(asio::io_context& ioc) : upstreams(ioc) {}
+    explicit HttpServerState(asio::io_context& ioc, int downstream_write_timeout_ms = 30000)
+        : upstreams(ioc),
+          downstream_write_timeout_ms(downstream_write_timeout_ms) {}
 
     std::unordered_map<std::string, Handler> routes;
     std::atomic<bool> running{true};
     UpstreamManager upstreams;
     SecurityRules* security_rules = nullptr;
+    int downstream_write_timeout_ms = 30000;
 };
 
 class ClientSession {
@@ -370,14 +373,14 @@ public:
 
                 auto resp = build_downstream_response(ctx, method_str, proxy_response);
 
-                asio::error_code write_ec;
-                co_await asio::async_write(socket, asio::buffer(resp),
-                    asio::redirect_error(asio::use_awaitable, write_ec));
-                if (write_ec) {
+                auto write_result = co_await write_with_timeout(socket, resp,
+                    std::chrono::milliseconds(state_->downstream_write_timeout_ms));
+                if (!write_result.ok()) {
                     LOG_WARN("Client response write failed: method=", method_str,
                         ", path=", path_str,
                         ", status=", ctx.status_code,
-                        ", error=", write_ec.message(),
+                        ", status_name=", io_status_name(write_result.status),
+                        ", error=", write_result.ec.message(),
                         ", response_bytes=", resp.size());
                     co_return;
                 }

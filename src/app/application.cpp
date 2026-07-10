@@ -70,7 +70,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
                              const std::filesystem::path& config_base) {
     mysql_ = std::make_unique<MysqlPool>(ioc_, app_cfg.mysql);
     redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
-    server_ = std::make_unique<HttpServer>(ioc_, app_cfg.server_port);
+    server_ = std::make_unique<HttpServer>(
+        ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms);
 
     security_rules_ = std::make_unique<SecurityRules>();
     security_rules_->load_from_config(cfg);

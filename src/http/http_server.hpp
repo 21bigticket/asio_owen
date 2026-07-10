@@ -35,9 +35,10 @@ using namespace std::chrono_literals;
 
 class HttpServer {
 public:
-    HttpServer(asio::io_context& ioc, unsigned short port)
+    HttpServer(asio::io_context& ioc, unsigned short port,
+               int downstream_write_timeout_ms = 30000)
         : ioc_(ioc), acceptor_(ioc, {asio::ip::tcp::v4(), port}),
-          state_(std::make_shared<HttpServerState>(ioc)) {}
+          state_(std::make_shared<HttpServerState>(ioc, downstream_write_timeout_ms)) {}
 
     void route(const std::string& path, Handler handler) {
         state_->routes[path] = std::move(handler);

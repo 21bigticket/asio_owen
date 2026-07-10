@@ -91,11 +91,14 @@ public:
                     }
                 }
             }
-            if (!secret.empty()) {
-                jwt_auth_ = std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
-            } else {
+            if (algorithm == "HS256" && secret.empty()) {
                 jwt_auth_.reset();
                 LOG_WARN("JWT secret not configured, JWT verification disabled");
+            } else if (algorithm == "RS256" && pub_key.empty()) {
+                jwt_auth_.reset();
+                LOG_WARN("JWT public key not configured for RS256, JWT verification disabled");
+            } else {
+                jwt_auth_ = std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
             }
         }
 
@@ -201,7 +204,7 @@ public:
         bool is_whitelisted = auth_whitelist_.is_whitelisted(path, service);
 
         // 7. JWT verification (non-whitelisted paths, using jwt_copy without lock)
-        // If jwt_secret is empty (jwt_copy == nullptr), JWT is disabled — skip verification.
+        // If jwt_copy == nullptr, JWT is disabled — skip verification.
         std::optional<JWTClaims> claims;
         if (!is_whitelisted && jwt_copy) {
             claims = jwt_copy->verify(auth_header);

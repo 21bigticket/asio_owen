@@ -1,12 +1,16 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 
 #include <jwt-cpp/jwt.h>
 
+#include "common/config.hpp"
 #include "security/jwt_auth.hpp"
+#include "security/security_rules.hpp"
 
 namespace {
 
@@ -77,6 +81,20 @@ JWTAuth make_auth() {
         "pixiu-gateway", "RS256", kPublicKey);
 }
 
+std::filesystem::path make_temp_config_dir() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto base = std::filesystem::temp_directory_path() /
+        ("asio_owen_jwt_test_" + std::to_string(now));
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base / "config.d");
+    return base;
+}
+
+void write_file(const std::filesystem::path& path, const std::string& content) {
+    std::ofstream out(path);
+    out << content;
+}
+
 }  // namespace
 
 TEST(JWTAuth, RS256AcceptsValidToken) {
@@ -134,4 +152,34 @@ TEST(JWTAuth, RS256RejectsHS256AlgorithmToken) {
     auto token = make_hs256_token();
 
     EXPECT_FALSE(auth.verify("Bearer " + token).has_value());
+}
+
+TEST(SecurityRules, RS256DoesNotRequireJwtSecretToEnableVerification) {
+    auto base = make_temp_config_dir();
+    auto key_path = base / "public-key.pem";
+    write_file(key_path, kPublicKey);
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_algorithm = RS256\n"
+        "jwt_public_key = " + key_path.string() + "\n"
+        "jwt_issuer = pixiu-gateway\n");
+    write_file(base / "config.d" / "40-rate_limit.ini",
+        "[rate_limit]\n"
+        "ip_rps = 0\n"
+        "global_rps = 0\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+
+    SecurityRules rules;
+    rules.load_from_config(cfg);
+
+    asio::io_context ioc;
+    asio::ip::tcp::socket socket(ioc);
+    auto result = rules.check(socket, "GET", "/zebra-config/config.ConfigService/Get",
+        "", "");
+
+    EXPECT_EQ(result.status_code, 401);
+
+    std::filesystem::remove_all(base);
 }

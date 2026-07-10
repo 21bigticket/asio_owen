@@ -38,6 +38,7 @@ public:
         int max_idle_sec = 60;
         int connect_timeout_ms = 1000;
         int read_timeout_ms = 500;
+        int query_timeout_ms = 0;   // 0 means no read timeout for mysql_query/mysql_store_result
         int keepalive_sec = 30;
         size_t worker_threads = 32;  // SQL worker threads, mysql_query is synchronous blocking IO, recommended > CPU cores
         size_t max_creating = 0;     // 0 表示按 max_size/worker_threads 保守推导
@@ -144,6 +145,7 @@ private:
             return {false, "no available connection", ""};
         }
 
+        apply_query_timeout(conn);
         if (mysql_query(conn, sql)) {
             std::string err = mysql_error(conn);
             LOG_WARN("MySQL query failed: ", err);
@@ -162,11 +164,13 @@ private:
                 stats_.inc_query_fail();
                 return {false, std::move(err), ""};
             }
+            clear_query_timeout(conn);
             release(conn);
             stats_.inc_query_ok();
             return {true, "", "[]"};
         }
 
+        clear_query_timeout(conn);
         release(conn);
         std::string json = mysql_result_to_json(mr);
         mysql_free_result(mr);
@@ -386,6 +390,19 @@ private:
 
     int mysql_ping_with_timeout(MYSQL* conn) {
         return ::mysql_ping_with_timeout(conn, cfg_.read_timeout_ms);
+    }
+
+    void apply_query_timeout(MYSQL* conn) {
+        if (cfg_.query_timeout_ms <= 0) return;
+        unsigned int rt = (cfg_.query_timeout_ms + 999) / 1000;
+        if (rt < 1) rt = 1;
+        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &rt);
+    }
+
+    void clear_query_timeout(MYSQL* conn) {
+        if (cfg_.query_timeout_ms <= 0) return;
+        unsigned int rt = 0;
+        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &rt);
     }
 
     MysqlConnectionConfig connection_config() const {

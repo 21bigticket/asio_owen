@@ -58,6 +58,8 @@ public:
         Config cfg;
         std::atomic<bool> running{true};
         Shard shards[kShards];
+        std::atomic<size_t> total_count{0};
+        std::atomic<size_t> in_flight_count{0};
         // Global counters (atomic, no lock needed)
         std::atomic<size_t> acquire_reused{0};
         std::atomic<size_t> acquire_created{0};
@@ -109,6 +111,7 @@ public:
                 shard.idle.front().socket.close(ec);
                 shard.idle.pop_front();
                 --shard.total;
+                decrement_counter(state->total_count);
             }
             for (auto* conn : shard.active) {
                 asio::error_code ec;
@@ -145,22 +148,30 @@ public:
         auto state = state_;
         if (!state->running) co_return nullptr;
 
-        size_t shard_idx = State::pick_shard();
-        auto& shard = state->shards[shard_idx];
+        size_t start_shard = State::pick_shard();
 
-        // Step 1: Try to pop an idle connection from this shard
+        // Step 1: Try to pop an idle connection from any shard.
         std::unique_ptr<HttpConn> idle_conn;
-        bool reserved = false;
-        {
+        size_t shard_idx = start_shard;
+        for (size_t try_idx = 0; try_idx < kShards && !idle_conn; ++try_idx) {
+            shard_idx = (start_shard + try_idx) % kShards;
+            auto& shard = state->shards[shard_idx];
             std::lock_guard lock(shard.mtx);
-            evict_stale_idle(shard, state->cfg);
+            evict_stale_idle(state, shard, state->cfg);
             while (!shard.idle.empty()) {
+                if (state->cfg.max_concurrent > 0 &&
+                    !try_increment_counter(state->in_flight_count, state->cfg.max_concurrent)) {
+                    LOG_WARN("HttpPool: max_concurrent reached");
+                    co_return nullptr;
+                }
                 idle_conn = std::make_unique<HttpConn>(std::move(shard.idle.front()));
                 shard.idle.pop_front();
                 if (idle_conn->connection_close) {
                     asio::error_code ec;
                     idle_conn->socket.close(ec);
                     --shard.total;
+                    decrement_counter(state->total_count);
+                    decrement_counter(state->in_flight_count);
                     idle_conn.reset();
                     continue;
                 }
@@ -168,16 +179,18 @@ public:
                     asio::error_code ec;
                     idle_conn->socket.close(ec);
                     --shard.total;
+                    decrement_counter(state->total_count);
+                    decrement_counter(state->in_flight_count);
                     idle_conn.reset();
                     continue;
                 }
                 ++shard.in_flight;
-                reserved = true;
                 break;
             }
         }
 
         if (idle_conn) {
+            auto& shard = state->shards[idle_conn->shard_idx];
             if (!is_reusable_idle(*idle_conn)) {
                 asio::error_code ec;
                 idle_conn->socket.close(ec);
@@ -186,9 +199,10 @@ public:
                     --shard.total;
                     --shard.in_flight;
                 }
+                decrement_counter(state->total_count);
+                decrement_counter(state->in_flight_count);
                 state->idle_probe_dropped.fetch_add(1, std::memory_order_relaxed);
                 idle_conn.reset();
-                reserved = false;
             } else {
                 idle_conn->reused_from_idle = true;
                 {
@@ -201,39 +215,30 @@ public:
         }
 
         // No reusable idle connection -> create new one
+        if (state->cfg.max_concurrent > 0 &&
+            !try_increment_counter(state->in_flight_count, state->cfg.max_concurrent)) {
+            LOG_WARN("HttpPool: max_concurrent reached");
+            co_return nullptr;
+        }
+        bool reserved_in_flight = true;
+        if (!try_increment_counter(state->total_count, state->cfg.max_size)) {
+            decrement_counter(state->in_flight_count);
+            reserved_in_flight = false;
+            LOG_WARN("HttpPool: max_size reached");
+            co_return nullptr;
+        }
+        bool reserved_total = true;
+
         std::unique_ptr<HttpConn> new_conn;
         {
-            // Try up to kShards shards before giving up (hard limit check)
-            bool all_shards_full = false;
-            for (size_t try_idx = 0; try_idx < kShards; ++try_idx) {
-                auto& try_shard = state->shards[shard_idx];
-                std::lock_guard lock(try_shard.mtx);
-                if (!reserved) {
-                    if (try_shard.total >= (state->cfg.max_size + kShards - 1) / kShards) {
-                        if (try_idx + 1 < kShards) {
-                            shard_idx = (shard_idx + 1) % kShards;
-                            continue;  // try next shard
-                        }
-                        all_shards_full = true;
-                        break;
-                    }
-                    if (state->cfg.max_concurrent > 0 && try_shard.in_flight >= (state->cfg.max_concurrent + kShards - 1) / kShards) {
-                        LOG_WARN("HttpPool: max_concurrent reached on shard ", shard_idx);
-                        co_return nullptr;
-                    }
-                    ++try_shard.total;
-                    ++try_shard.in_flight;
-                    reserved = true;
-                }
-                new_conn = std::make_unique<HttpConn>(state->ioc);
-                new_conn->shard_idx = shard_idx;
-                try_shard.active.insert(new_conn.get());
-                break;
-            }
-            if (all_shards_full) {
-                LOG_WARN("HttpPool: max_size reached, all shards full");
-                co_return nullptr;
-            }
+            shard_idx = start_shard;
+            auto& shard = state->shards[shard_idx];
+            std::lock_guard lock(shard.mtx);
+            ++shard.total;
+            ++shard.in_flight;
+            new_conn = std::make_unique<HttpConn>(state->ioc);
+            new_conn->shard_idx = shard_idx;
+            shard.active.insert(new_conn.get());
         }
 
         try {
@@ -258,6 +263,8 @@ public:
                 --failed_shard.total;
                 --failed_shard.in_flight;
             }
+            if (reserved_total) decrement_counter(state->total_count);
+            if (reserved_in_flight) decrement_counter(state->in_flight_count);
             throw;
         }
     }
@@ -279,6 +286,8 @@ public:
                 --shard.in_flight;
                 shard.active.erase(conn.get());
             }
+            decrement_counter(state->total_count);
+            decrement_counter(state->in_flight_count);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -291,6 +300,8 @@ public:
                 --shard.in_flight;
                 shard.active.erase(conn.get());
             }
+            decrement_counter(state->total_count);
+            decrement_counter(state->in_flight_count);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -301,6 +312,7 @@ public:
             shard.idle.push_back(std::move(*conn));
             --shard.in_flight;
         }
+        decrement_counter(state->in_flight_count);
         state->released_idle.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -320,6 +332,8 @@ public:
             --shard.in_flight;
             shard.active.erase(conn.get());
         }
+        decrement_counter(state->total_count);
+        decrement_counter(state->in_flight_count);
         state->released_bad.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -350,6 +364,27 @@ public:
     }
 
 private:
+    static bool try_increment_counter(std::atomic<size_t>& counter, size_t limit) {
+        size_t cur = counter.load(std::memory_order_relaxed);
+        while (cur < limit) {
+            if (counter.compare_exchange_weak(
+                    cur, cur + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void decrement_counter(std::atomic<size_t>& counter) {
+        size_t cur = counter.load(std::memory_order_relaxed);
+        while (cur > 0) {
+            if (counter.compare_exchange_weak(
+                    cur, cur - 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
     asio::awaitable<std::optional<asio::ip::tcp::resolver::results_type>> resolve_with_timeout(
         asio::ip::tcp::resolver& resolver, const std::string& host,
         const std::string& service, int timeout_ms) {
@@ -395,7 +430,8 @@ private:
         co_return !connect_ec;
     }
 
-    static void evict_stale_idle(Shard& shard, const Config& cfg) {
+    static void evict_stale_idle(
+        const std::shared_ptr<State>& state, Shard& shard, const Config& cfg) {
         auto now = std::chrono::steady_clock::now();
         while (!shard.idle.empty()) {
             auto age = std::chrono::duration_cast<std::chrono::seconds>(
@@ -405,6 +441,7 @@ private:
             shard.idle.front().socket.close(ec);
             shard.idle.pop_front();
             --shard.total;
+            decrement_counter(state->total_count);
         }
     }
 
