@@ -44,7 +44,7 @@
 | `max_check` | 8 | 每次 maintain 最多检查的空闲连接数 |
 | `query_timeout_ms` | 0（不设） | mysql_query 读超时，0 表示不限制（由 MySQL server 端的 wait_timeout 兜底） |
 
-> `read_timeout_ms` 只用于 `mysql_ping` 路径，防止探活卡死。`mysql_query` 执行查询时**不设置读超时**，避免大查询被截断。若需要查询超时控制，可单独设置 `query_timeout_ms`，但当前版本暂不启用。
+> `read_timeout_ms` 只用于 `mysql_ping` 路径，防止探活卡死。默认 `query_timeout_ms=0`，`mysql_query` / `mysql_store_result` 不设置读超时，避免大查询被截断。需要停机兜底或查询读超时时，可显式设置 `query_timeout_ms > 0`。
 
 > v3 到 v3.1 关键变化：(1) acquire 重试改迭代防死循环；(2) maintain 健康检查更新 last_used_at；(3) 补齐 Redis 文档/实现 gap；(4) 增加 shutdown 延迟说明；(5) 增加可观测性建议。
 
