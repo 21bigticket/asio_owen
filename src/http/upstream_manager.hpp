@@ -5,6 +5,7 @@
 #include <optional>
 #include <memory>
 #include <shared_mutex>
+#include <sstream>
 #include <asio.hpp>
 #include "http_pool.hpp"
 #include "../common/config.hpp"
@@ -92,6 +93,20 @@ public:
             upstreams_.erase(name);
             LOG_INFO("upstream removed: ", name);
         }
+    }
+
+    std::string pool_stats() const {
+        std::shared_lock lock(mtx_);
+        if (pools_.empty()) return "none";
+
+        std::ostringstream oss;
+        bool first = true;
+        for (const auto& [name, pool] : pools_) {
+            if (!first) oss << "; ";
+            first = false;
+            oss << name << "={" << pool->stats() << "}";
+        }
+        return oss.str();
     }
 
 private:

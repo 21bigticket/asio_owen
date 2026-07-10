@@ -52,3 +52,19 @@ TEST(ConfigLoad, LaterFilesOverrideEarlierFiles) {
 
     std::filesystem::remove_all(base);
 }
+
+TEST(ConfigLoad, ParsesBoolValues) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "21-http_pool.ini",
+        "[http_pool]\n"
+        "send_keep_alive_header = true\n"
+        "disabled = 0\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    EXPECT_TRUE(cfg.get_bool("http_pool", "send_keep_alive_header", false));
+    EXPECT_FALSE(cfg.get_bool("http_pool", "disabled", true));
+    EXPECT_TRUE(cfg.get_bool("http_pool", "missing", true));
+
+    std::filesystem::remove_all(base);
+}

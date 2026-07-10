@@ -86,6 +86,9 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
 
     register_upstreams(cfg, app_cfg.http_pool);
 
+    pool_stats_service_ = std::make_unique<PoolStatsService>(ioc_, server_->upstreams());
+    pool_stats_service_->start(app_cfg.http_pool_stats_interval_sec);
+
     reload_service_ = std::make_unique<ReloadService>(
         ioc_, config_base, *security_rules_, server_->upstreams(), app_cfg.http_pool);
     reload_service_->start(app_cfg.reload_interval_sec);
@@ -126,11 +129,13 @@ void Application::request_stop() {
 
 void Application::cleanup() {
     if (reload_service_) reload_service_->stop();
+    if (pool_stats_service_) pool_stats_service_->stop();
     if (snapshot_service_) snapshot_service_->stop();
     if (server_) server_->stop();
 
     signal_exit_.reset();
     reload_service_.reset();
+    pool_stats_service_.reset();
     snapshot_service_.reset();
     server_.reset();
 

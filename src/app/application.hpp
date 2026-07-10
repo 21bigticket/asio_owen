@@ -7,6 +7,7 @@
 #include <asio.hpp>
 
 #include "app_config.hpp"
+#include "pool_stats_service.hpp"
 #include "reload_service.hpp"
 #include "snapshot_service.hpp"
 #include "../common/signal_exit.hpp"
@@ -35,6 +36,7 @@ private:
     std::unique_ptr<SecurityRules> security_rules_;
     std::unique_ptr<ReloadService> reload_service_;
     std::unique_ptr<SnapshotService> snapshot_service_;
+    std::unique_ptr<PoolStatsService> pool_stats_service_;
     std::unique_ptr<SignalExit> signal_exit_;
     std::unique_ptr<asio::steady_timer> drain_timer_;
     std::atomic<bool> stop_requested_{false};

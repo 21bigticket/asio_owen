@@ -25,6 +25,7 @@ public:
         int read_timeout_ms = 30000;
         int request_timeout_ms = 60000;
         int idle_timeout_sec = 60;
+        bool send_keep_alive_header = false;
         const Config& ref() const { return *this; }
     };
 
@@ -417,11 +418,14 @@ private:
         conn.socket.non_blocking(true, ec);
         if (ec) return false;
         char byte = 0;
+        asio::error_code recv_ec;
         size_t n = conn.socket.receive(
-            asio::buffer(&byte, 1), asio::socket_base::message_peek, ec);
-        conn.socket.non_blocking(was_non_blocking, ec);
-        if (!ec) return n > 0;
-        if (ec == asio::error::would_block || ec == asio::error::try_again) return true;
+            asio::buffer(&byte, 1), asio::socket_base::message_peek, recv_ec);
+        asio::error_code restore_ec;
+        conn.socket.non_blocking(was_non_blocking, restore_ec);
+        if (restore_ec) return false;
+        if (!recv_ec) return n > 0;
+        if (recv_ec == asio::error::would_block || recv_ec == asio::error::try_again) return true;
         return false;
     }
 

@@ -19,6 +19,7 @@ struct AppConfig {
     HttpPool::Config http_pool;
     int snapshot_interval_sec = 30;
     int reload_interval_sec = 30;
+    int http_pool_stats_interval_sec = 30;
 };
 
 inline AppConfig app_config_from(const Config& cfg) {
@@ -62,10 +63,12 @@ inline AppConfig app_config_from(const Config& cfg) {
         .connect_timeout_ms = cfg.get_int("http_pool", "connect_timeout_ms", 1000),
         .read_timeout_ms = cfg.get_int("http_pool", "read_timeout_ms", 30000),
         .request_timeout_ms = cfg.get_int("http_pool", "request_timeout_ms", 60000),
-        .idle_timeout_sec = cfg.get_int("http_pool", "idle_timeout_sec", 60)
+        .idle_timeout_sec = cfg.get_int("http_pool", "idle_timeout_sec", 60),
+        .send_keep_alive_header = cfg.get_bool("http_pool", "send_keep_alive_header", false)
     };
 
     app.snapshot_interval_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
     app.reload_interval_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
+    app.http_pool_stats_interval_sec = cfg.get_int("http_pool", "stats_interval_sec", 30);
     return app;
 }

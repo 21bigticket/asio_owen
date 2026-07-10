@@ -58,7 +58,8 @@ inline std::string build_proxy_request(
     const std::string& upstream_path,
     const UpstreamManager::UpstreamConfig& cfg,
     const HttpContext& ctx,
-    const HeaderParseState& request_header_state) {
+    const HeaderParseState& request_header_state,
+    bool send_keep_alive_header = false) {
     std::string forward_req = method + " " + upstream_path + " HTTP/1.1\r\n";
     forward_req += "Host: " + cfg.host + ":" + std::to_string(cfg.port) + "\r\n";
 
@@ -100,6 +101,9 @@ inline std::string build_proxy_request(
         forward_req += k + ": " + v + "\r\n";
     }
 
+    if (send_keep_alive_header) {
+        forward_req += "Connection: keep-alive\r\n";
+    }
     forward_req += "\r\n";
     forward_req += ctx.body;
     return forward_req;

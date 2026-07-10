@@ -100,6 +100,17 @@ public:
         }
     }
 
+    bool get_bool(const std::string& section, const std::string& key, bool def = false) const {
+        auto s = get(section, key);
+        if (s.empty()) return def;
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (s == "true" || s == "1" || s == "yes" || s == "on") return true;
+        if (s == "false" || s == "0" || s == "no" || s == "off") return false;
+        LOG_WARN("Invalid bool config ", section, ".", key, "=", s, ", using default=", def);
+        return def;
+    }
+
     // Get all key-value pairs in a section (preserves insertion order, allows duplicate keys)
     std::vector<std::pair<std::string, std::string>> get_section(const std::string& section) const {
         std::vector<std::pair<std::string, std::string>> result;

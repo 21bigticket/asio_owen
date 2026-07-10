@@ -257,7 +257,8 @@ public:
                                     ", body_size=", ctx.body.size());
 
                                 auto forward_req = build_proxy_request(
-                                    method_str, upstream->upstream_path, cfg, ctx, request_header_state);
+                                    method_str, upstream->upstream_path, cfg, ctx, request_header_state,
+                                    pool->cfg().send_keep_alive_header);
                                 LOG_DEBUG("Proxy upstream request built: upstream_path=",
                                     upstream->upstream_path,
                                     ", bytes=", forward_req.size(),

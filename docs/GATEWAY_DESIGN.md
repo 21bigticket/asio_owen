@@ -62,6 +62,7 @@ HttpServer
 - 上游响应为 HTTP/1.0 时默认不复用，除非显式 `Connection: keep-alive`。
 - 响应没有 `Content-Length` 或 `Transfer-Encoding` 时，按读到 EOF 处理，并标记该上游连接不可复用。
 - `conn->read_buffer` 保存上游响应多读出的 pipeline 字节，连接回池时若该 buffer 超过 64KB 会丢弃该连接。
+- idle 连接再次取出时会用非阻塞 `message_peek` 探活。健康 keep-alive idle socket 没有数据可读时，正确结果是 `would_block`/`try_again`，这表示连接仍可复用，不是 EOF。
 
 因此，网关支持 keep-alive，但不是无条件复用：只在 framing 明确、连接未关闭、读写未超时、buffer 未异常膨胀时复用。
 
@@ -116,7 +117,7 @@ struct HeaderParseState {
 
 `Connection` header 中列出的扩展 token 对应的 header 也会被移除。客户端 `Host` 会被替换为上游 `host:port`。
 
-> `Connection: keep-alive` 不再显式发送（HTTP/1.1 默认 keep-alive），避免触发 dubbo-go 的 h2c 升级检测。
+> 默认不显式发送 `Connection: keep-alive`（HTTP/1.1 默认 keep-alive），避免触发 dubbo-go 的 h2c 升级检测。排查或兼容依赖显式 header 的上游时，可以打开 `[http_pool] send_keep_alive_header = true`。
 
 请求侧如果是 `Transfer-Encoding: chunked`，网关会移除 `Transfer-Encoding` 并写入 `Content-Length`。响应侧：网关接管响应 framing，必要时 de-chunk 并计算 Content-Length。
 
@@ -180,6 +181,30 @@ pool state 通过 `shared_ptr<State>` 持有，因此 shutdown 和 in-flight gua
 
 这些情况下会关闭 socket，并减少 `total` 和 `in_flight`。
 
+### idle probe 语义
+
+`acquire` 从 idle 队列取到连接后，会调用 `is_reusable_idle` 做一次轻量探活，避免复用已经被对端关闭的 stale socket。
+
+探活流程：
+
+1. 暂时把 socket 切到 non-blocking。
+2. 用 `receive(..., message_peek)` 读取 1 字节但不消费。
+3. 恢复原来的 non-blocking 状态。
+4. 按 `receive` 的结果判定是否可复用。
+
+判定规则：
+
+| `message_peek` 结果 | 含义 | 是否复用 |
+|---|---|:---:|
+| `success && n > 0` | socket 上已有预读字节，例如上游 pipeline 响应残留 | 是 |
+| `would_block` / `try_again` | socket 存活，当前没有数据可读，这是正常 idle keep-alive 状态 | 是 |
+| `success && n == 0` | EOF，对端已经关闭或 half-close | 否 |
+| 其他错误 | 连接状态不可确认或已坏 | 否 |
+
+实现上必须保留 `receive` 的 `error_code`。不能用同一个变量再调用 `non_blocking(was_non_blocking, ec)`，否则恢复成功会覆盖 `would_block`，把健康 idle socket 误判为不可复用。2026-07-10 的 `reused=0` 故障就是这个原因，详见 `docs/CONN_REUSE_PROBE_2026-07-10.md`。
+
+验证连接复用时不要只看 RPS 或 TIME_WAIT。优先看 `HttpPool` 的 `reused/created/probe_dropped/released_idle`，必要时用 tshark 按 `tcp.stream` 统计每条上游 TCP 连接承载的 HTTP request 数。修复后抓包确认：约 113 条 TCP stream 承载 109853 个 HTTP 请求，Top stream 单条承载 1047-1116 个请求，与 `HttpPool total≈112-113` 对齐。
+
 ### 关闭流程
 
 1. `running.exchange(false)`，后续 `acquire` 返回 `nullptr`。
@@ -225,6 +250,7 @@ connect_timeout_ms = 1000
 read_timeout_ms = 30000
 request_timeout_ms = 60000
 idle_timeout_sec = 60
+send_keep_alive_header = false
 
 [upstream]
 config = 127.0.0.1:30001
@@ -280,7 +306,8 @@ ctest --test-dir build --output-on-failure
 | 转发 | 上游返回压缩 body，日志中只能看到二进制预览 | 转发时过滤 `Accept-Encoding`，让上游默认返回明文 body |
 | 连接池 | 同一池化连接上的预读字节无限累积 | release 时 `read_buffer > 64KB` 则丢弃连接 |
 | 连接池 | idle 复用连接探活通过后、真正写/读前对端关闭（TOCTOU） | 复用 idle 连接失败时做一次重试；新建连接失败不重试 |
-| 连接池 | keep-alive 连接 `Connection` 头被 hop-by-hop 过滤，上游误用 `Connection: close` | 转发时显式添加 `Connection: keep-alive` |
+| 连接池 | keep-alive 连接 `Connection` 头被 hop-by-hop 过滤，上游误用 `Connection: close` | 通过 `[http_pool] send_keep_alive_header` 可开关地显式添加 `Connection: keep-alive` |
+| 连接池 | idle probe 的 `would_block` 被恢复 non-blocking 的成功结果覆盖，健康 idle socket 被误判不可复用 | `receive` 和恢复 socket 状态使用不同 `error_code`，保留 `would_block` 判定 |
 | 连接池 | 缺少连接池状态统计，异常时不易定位 | acquire/retry/error 路径附带 `pool_stats={...}` |
 | 客户端 | 请求解析失败直接断连 | 返回 `HTTP/1.1 400 Bad Request` + `Connection: close` |
 | 客户端 | `phr_header headers[32]` 在 header 多时解析失败 | 扩大到 `headers[128]` |
@@ -313,10 +340,12 @@ ctest --test-dir build --output-on-failure
 | 初始版 | ~4k | ~64% | — | 无 |
 | 日志降级 + timer 旁路 + header vector | ~13k | ~50% | — | `LOG_DEBUG`，`timeout<=0` 无 timer |
 | idle 探活 + retry | ~14k | ~50% | — | `is_reusable_idle` + `message_peek` + 一次重试 |
-| `Connection: keep-alive` | ~14k | ~4% | — | 转发显式加 `Connection: keep-alive` |
+| `Connection: keep-alive` | ~14k | ~4% | — | 转发可配置显式加 `Connection: keep-alive` |
 | header 解析修复 | ~13k | 0 | ~50% | `pret<0` 返回 400，`headers[128]` |
 | 4xx 来源追踪 | ~6k | 0 | ~50%（实为 plow 用法错误） | `X-Asio-Owen-Status-Source` 日志 |
 | **plow body 修复** | **4,257** | **0** | **0** | `--body=@file` 加 `@` 前缀 |
+
+> `Connection: keep-alive` 行是历史实验阶段记录。当前默认仍是 `send_keep_alive_header = false`；2026-07-10 的 `reused=0` 问题由 idle probe 错误码覆盖导致，不靠显式 keep-alive 头修复。
 
 > plow 的 `--body` 参数如果值是文件路径必须加 `@` 前缀（`--body=@file.json`），否则 body 会是文件名字符串本身导致上游返回 4xx。
 

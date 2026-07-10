@@ -26,6 +26,11 @@ add_executable(test_proxy_framing test_proxy_framing.cpp ${PROJECT_SOURCE_DIR}/p
 target_link_libraries(test_proxy_framing PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_proxy_framing)
 
+# Proxy request forwarding
+add_executable(test_proxy_forwarder test_proxy_forwarder.cpp)
+target_link_libraries(test_proxy_forwarder PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_proxy_forwarder)
+
 # HTTP protocol helpers
 add_executable(test_http_protocol test_http_protocol.cpp)
 target_link_libraries(test_http_protocol PRIVATE gtest_main asio_owen_core)

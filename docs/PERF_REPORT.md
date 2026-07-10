@@ -123,6 +123,69 @@ port = 8081
 | RSS 压测前后 | 117MB 无增长 ✅ |
 | CPU 增长趋势 | 24%→30%（稳定，不再翻倍）✅ |
 
+### 2026-07-10 HttpPool idle probe 修复
+
+本次问题表现为网关路径 RPS 下降到约 1k，`HttpPool` 指标显示：
+
+```text
+reused=0
+created≈released_idle≈probe_dropped
+released_closed=0
+released_bad=0
+```
+
+这表示上游连接完成一次请求后能回到 idle 池，但下一次 `acquire` 时全部被 probe 判定不可复用。
+
+排查结论：
+
+- zebra-config 直连响应为 `HTTP/1.1 200 OK`，没有 `Connection: close`。
+- 请求带或不带 `Connection: keep-alive`，后端响应行为一致。
+- 打开 `[http_pool] send_keep_alive_header = true` 后，`reused` 仍为 0。
+- 根因不是上游关闭连接，也不是请求头；根因是 `is_reusable_idle` 用同一个 `error_code` 接收 `message_peek` 和恢复 non-blocking 状态，导致正常 idle socket 的 `would_block` 被覆盖成 success。
+
+修复后 3 分钟稳态 wrk 参数：
+
+```bash
+wrk -t15 -c50 -d180s --latency -s /tmp/post.lua \
+  http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndKey
+```
+
+修复前后：
+
+| 指标 | 修复前 | 修复后 |
+|:-----|------:|------:|
+| Requests/sec | 987.67 | 1569.90 |
+| 总请求 | 59311 | 282728 |
+| P50 | 39.00ms | 26.44ms |
+| P90 | 99.14ms | 51.33ms |
+| P99 | 200.87ms | 101.38ms |
+| `reused` | 0 | 468825 |
+| `created` | 53573 | 225 |
+| `probe_dropped` | 53465 | 0 |
+
+修复后的 pool stats：
+
+```text
+zebra-config={total=112, idle=68, active=44, in_flight=44,
+reused=468825, created=225, probe_dropped=0,
+released_idle=469006, released_closed=0, released_bad=0}
+```
+
+tcpdump/tshark 进一步确认真实 TCP stream 也恢复复用：
+
+| 指标 | 修复前旧二进制 | 修复后新二进制 |
+|:-----|---------------:|---------------:|
+| 总 TCP stream 数 | 60922 | 113 |
+| 总 HTTP request 数 | 60922 | 109853 |
+| Top stream 承载请求数 | 1 | 1047-1116 |
+| 平均每 stream 请求数 | 1 | ~972 |
+
+也就是说，修复前基本是 1 条 TCP 连接承载 1 个请求；修复后约 113 条 TCP stream 承载 109853 个 HTTP 请求，与 `HttpPool total≈112-113`、`reused` 持续上涨、`probe_dropped=0` 完全一致。
+
+注意：历史短压中 Config Gateway 曾达到 8.8k-11k RPS，因此 9k 短压不是本次修复独有收益。本次修复的关键收益是消除当前回归状态下的每请求建连：`reused` 从 0 恢复为持续增长，`created` 稳定在池容量量级，`probe_dropped` 归零，并由 tcp.stream 统计确认真实 TCP 复用。
+
+详细记录见 `docs/CONN_REUSE_PROBE_2026-07-10.md`。
+
 ### 限流模块资源消耗
 
 | 指标 | 值 |
@@ -230,7 +293,7 @@ port = 8081
 | 网关 | 64KB 上游 header 大小限制 |
 | 网关 | `split_connection_tokens` 精确比较防 smuggling |
 | 网关 | 行式 chunk 状态机（非字符串搜索） |
-| 网关 | Hop-by-hop 头过滤；转发时显式设置上游 `Host` 和 `Connection: keep-alive`，并过滤 `Accept-Encoding` 避免压缩响应影响调试 |
+| 网关 | Hop-by-hop 头过滤；转发时显式设置上游 `Host`，可通过 `[http_pool] send_keep_alive_header` 给上游发送 `Connection: keep-alive`，并过滤 `Accept-Encoding` 避免压缩响应影响调试 |
 | 网关 | `status_text` 端到端保留 |
 | 网关 | HTTP/1.0 default-close 检测 |
 | 网关 | `HEAD`/`204`/`304`/`1xx` 无 body 路径 |

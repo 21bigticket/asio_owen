@@ -1,5 +1,7 @@
 # 连接复用验证报告
 
+> 后续修正（2026-07-10）：该报告基于 ESTAB/TIME_WAIT 做宏观判断，只能说明没有明显 TIME_WAIT 堆积，不能直接证明 `HttpPool` 每次请求都在复用同一批上游连接。2026-07-10 通过 `reused/created/probe_dropped/released_idle` 指标确认过一次 `is_reusable_idle` probe 误判问题，并已修复。详见 `docs/CONN_REUSE_PROBE_2026-07-10.md`。
+
 ## 验证目的
 
 验证去掉 `Connection: keep-alive` 硬编码后，asio_owen 网关到 Go 后端（zebra-config）的 HTTP 连接复用是否正常。

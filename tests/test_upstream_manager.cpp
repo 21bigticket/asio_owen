@@ -35,3 +35,16 @@ TEST(UpstreamManager, IgnoresUnknownService) {
 
     EXPECT_FALSE(manager.route("/config.ConfigService/GetByAppAndKey").has_value());
 }
+
+TEST(UpstreamManager, PoolStatsIncludesServiceNameAndCounters) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    manager.add_upstream("zebra-config", "127.0.0.1", 30001);
+
+    auto stats = manager.pool_stats();
+
+    EXPECT_NE(stats.find("zebra-config={"), std::string::npos);
+    EXPECT_NE(stats.find("total=0"), std::string::npos);
+    EXPECT_NE(stats.find("reused=0"), std::string::npos);
+    EXPECT_NE(stats.find("created=0"), std::string::npos);
+}
