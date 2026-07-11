@@ -64,7 +64,13 @@ inline std::string build_downstream_response(
                 "transfer-encoding", "upgrade"
             };
             add_connection_tokens(ctx.response_headers, filtered);
-            filtered.push_back("content-length");
+            // For responses with a body, filter out the upstream Content-Length
+            // because the body may have been transformed (json_keys_snake_to_camel)
+            // and the upstream CL would be incorrect. We write our own below.
+            // For HEAD responses, preserve upstream CL per RFC 7231.
+            if (!http_response_has_no_body(method, ctx.status_code)) {
+                filtered.push_back("content-length");
+            }
             for (auto& [k, v] : ctx.response_headers) {
                 if (contains_header_name(filtered, k)) continue;
                 resp += k + ": " + v + "\r\n";
@@ -80,6 +86,19 @@ inline std::string build_downstream_response(
     }
 
     bool no_body = http_response_has_no_body(method, ctx.status_code);
+    // For no-body responses (HEAD/204/304), preserve upstream Content-Length
+    // if present (RFC 7231 requires HEAD to match GET). For responses with a
+    // body, the gateway may have transformed it (e.g. json_keys_snake_to_camel),
+    // so we must always write our own Content-Length based on the final body size.
+    bool has_upstream_cl = false;
+    if (proxy_response && no_body) {
+        for (auto& [k, v] : ctx.response_headers) {
+            if (header_iequals(k, "content-length")) {
+                has_upstream_cl = true;
+                break;
+            }
+        }
+    }
     if (!has_content_type && !no_body) {
         resp += "Content-Type: application/json\r\n";
     }
@@ -89,9 +108,12 @@ inline std::string build_downstream_response(
         resp += proxy_response ? "proxy\r\n" : "local\r\n";
     }
 
-    resp += "Content-Length: ";
-    resp += no_body ? "0" : std::to_string(ctx.response_body.size());
-    resp += "\r\n\r\n";
+    if (!has_upstream_cl) {
+        resp += "Content-Length: ";
+        resp += no_body ? "0" : std::to_string(ctx.response_body.size());
+        resp += "\r\n";
+    }
+    resp += "\r\n";
     if (!no_body) resp += ctx.response_body;
     return resp;
 }

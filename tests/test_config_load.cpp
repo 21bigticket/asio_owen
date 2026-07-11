@@ -88,12 +88,42 @@ TEST(ConfigLoad, ParsesMysqlQueryTimeout) {
     auto base = make_temp_config_dir();
     write_file(base / "config.d" / "10-mysql.ini",
         "[mysql]\n"
-        "query_timeout_ms = 2500\n");
+        "query_timeout_ms = 2500\n"
+        "acquire_timeout_ms = 1200\n");
 
     Config cfg;
     ASSERT_TRUE(cfg.load(base));
     auto app = app_config_from(cfg);
     EXPECT_EQ(app.mysql.query_timeout_ms, 2500);
+    EXPECT_EQ(app.mysql.acquire_timeout_ms, 1200);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, ParsesRedisWorkerPoolConfig) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "11-redis.ini",
+        "[redis]\n"
+        "mode = worker\n"
+        "db = 2\n"
+        "min_size = 2\n"
+        "max_size = 9\n"
+        "max_idle_sec = 77\n"
+        "worker_threads = 3\n"
+        "max_creating = 2\n"
+        "acquire_timeout_ms = 456\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.redis.mode, RedisPool::Mode::Worker);
+    EXPECT_EQ(app.redis.db, 2);
+    EXPECT_EQ(app.redis.min_size, 2u);
+    EXPECT_EQ(app.redis.max_size, 9u);
+    EXPECT_EQ(app.redis.max_idle_sec, 77);
+    EXPECT_EQ(app.redis.worker_threads, 3u);
+    EXPECT_EQ(app.redis.max_creating, 2u);
+    EXPECT_EQ(app.redis.acquire_timeout_ms, 456);
 
     std::filesystem::remove_all(base);
 }

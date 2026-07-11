@@ -36,6 +36,11 @@ add_executable(test_http_protocol test_http_protocol.cpp)
 target_link_libraries(test_http_protocol PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_http_protocol)
 
+# JSON response envelope (escape rules)
+add_executable(test_response test_response.cpp)
+target_link_libraries(test_response PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_response)
+
 # HTTP connection pool
 add_executable(test_http_pool test_http_pool.cpp)
 target_link_libraries(test_http_pool PRIVATE gtest_main asio_owen_core)

@@ -47,16 +47,33 @@ inline AppConfig app_config_from(const Config& cfg) {
         .connect_timeout_ms = cfg.get_int("mysql", "connect_timeout_ms", 1000),
         .read_timeout_ms = cfg.get_int("mysql", "read_timeout_ms", 500),
         .query_timeout_ms = cfg.get_int("mysql", "query_timeout_ms", 0),
+        .acquire_timeout_ms = cfg.get_int("mysql", "acquire_timeout_ms", 3000),
         .keepalive_sec = cfg.get_int("mysql", "keepalive_sec", 30),
         .worker_threads = static_cast<size_t>(std::max(1, cfg.get_int("mysql", "worker_threads", 32))),
         .max_creating = static_cast<size_t>(std::max(0, cfg.get_int("mysql", "max_creating", 0)))
     };
 
+    auto redis_mode = cfg.get("redis", "mode", "direct");
+    RedisPool::Mode redis_pool_mode = RedisPool::Mode::Direct;
+    if (redis_mode == "worker" || redis_mode == "WORKER") {
+        redis_pool_mode = RedisPool::Mode::Worker;
+    } else if (redis_mode != "direct" && redis_mode != "DIRECT") {
+        LOG_WARN("invalid redis.mode '", redis_mode, "', using direct");
+    }
+
     app.redis = RedisPool::Config{
         .host = cfg.get("redis", "host", "127.0.0.1"),
         .port = cfg.get_int("redis", "port", 6379),
+        .db = cfg.get_int("redis", "db", 0),
         .connect_timeout_ms = cfg.get_int("redis", "connect_timeout_ms", 1000),
-        .cmd_timeout_ms = cfg.get_int("redis", "cmd_timeout_ms", 1000)
+        .cmd_timeout_ms = cfg.get_int("redis", "cmd_timeout_ms", 1000),
+        .mode = redis_pool_mode,
+        .min_size = static_cast<size_t>(std::max(0, cfg.get_int("redis", "min_size", 4))),
+        .max_size = static_cast<size_t>(std::max(1, cfg.get_int("redis", "max_size", 32))),
+        .max_idle_sec = cfg.get_int("redis", "max_idle_sec", 120),
+        .worker_threads = static_cast<size_t>(std::max(1, cfg.get_int("redis", "worker_threads", 16))),
+        .max_creating = static_cast<size_t>(std::max(0, cfg.get_int("redis", "max_creating", 0))),
+        .acquire_timeout_ms = cfg.get_int("redis", "acquire_timeout_ms", 3000)
     };
 
     app.http_pool = HttpPool::Config{

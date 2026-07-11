@@ -162,7 +162,7 @@ TEST(HttpPool, MaxConcurrentIsGlobalHardLimit) {
     }
 }
 
-TEST(HttpPool, ReusesIdleConnectionWhenProbeWouldBlock) {
+TEST(HttpPool, ReusesIdleConnectionWhenHealthy) {
     asio::io_context ioc;
     tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
     auto held_socket = std::make_shared<std::optional<tcp::socket>>();
@@ -182,10 +182,72 @@ TEST(HttpPool, ReusesIdleConnectionWhenProbeWouldBlock) {
 
     EXPECT_TRUE(reused.load(std::memory_order_relaxed));
     EXPECT_EQ(state->acquire_reused.load(std::memory_order_relaxed), 1u);
-    EXPECT_EQ(state->idle_probe_dropped.load(std::memory_order_relaxed), 0u);
 
     asio::error_code ec;
     if (held_socket->has_value()) {
         (*held_socket)->close(ec);
     }
+}
+
+asio::awaitable<void> accept_two_and_hold(
+    tcp::acceptor& acceptor,
+    std::shared_ptr<std::optional<tcp::socket>> held1,
+    std::shared_ptr<std::optional<tcp::socket>> held2) {
+    auto s1 = co_await acceptor.async_accept(asio::use_awaitable);
+    held1->emplace(std::move(s1));
+    auto s2 = co_await acceptor.async_accept(asio::use_awaitable);
+    held2->emplace(std::move(s2));
+}
+
+asio::awaitable<void> acquire_dirty_release_acquire(
+    HttpPool& pool,
+    int port,
+    std::atomic<bool>& first_reused,
+    std::atomic<bool>& second_reused) {
+    auto first = co_await pool.acquire("127.0.0.1", port);
+    if (!first) co_return;
+    first_reused.store(first->reused_from_idle, std::memory_order_relaxed);
+    first->read_buffer.push_back('x');   // simulate protocol desync residual
+    HttpPool::release(pool.state(), std::move(first));
+
+    for (size_t i = 0; i < HttpPool::kShards - 1; ++i) {
+        HttpPool::State::pick_shard();
+    }
+
+    auto second = co_await pool.acquire("127.0.0.1", port);
+    if (!second) co_return;
+    second_reused.store(second->reused_from_idle, std::memory_order_relaxed);
+    HttpPool::release_bad(pool.state(), std::move(second));
+}
+
+TEST(HttpPool, DropsIdleWithResidualReadBuffer) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held1 = std::make_shared<std::optional<tcp::socket>>();
+    auto held2 = std::make_shared<std::optional<tcp::socket>>();
+
+    HttpPool::Config cfg;
+    cfg.max_size = HttpPool::kShards;
+    cfg.connect_timeout_ms = 1000;
+    HttpPool pool(ioc, cfg);
+    auto state = pool.state();
+
+    std::atomic<bool> first_reused{true};
+    std::atomic<bool> second_reused{true};
+    co_spawn(ioc, accept_two_and_hold(acceptor, held1, held2), asio::detached);
+    co_spawn(ioc, acquire_dirty_release_acquire(
+        pool, acceptor.local_endpoint().port(), first_reused, second_reused),
+        asio::detached);
+
+    ioc.run();
+
+    EXPECT_FALSE(first_reused.load(std::memory_order_relaxed));
+    EXPECT_FALSE(second_reused.load(std::memory_order_relaxed));
+    EXPECT_EQ(state->acquire_reused.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(state->acquire_created.load(std::memory_order_relaxed), 2u);
+    EXPECT_EQ(state->released_closed.load(std::memory_order_relaxed), 1u);
+
+    asio::error_code ec;
+    if (held1->has_value()) (*held1)->close(ec);
+    if (held2->has_value()) (*held2)->close(ec);
 }

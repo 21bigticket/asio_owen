@@ -60,9 +60,13 @@ public:
 
     asio::awaitable<void> start() {
         LOG_INFO("HTTP server listening on port ", acceptor_.local_endpoint().port());
+        int backoff_ms = 0;
+        constexpr int kMaxBackoffMs = 1000;
         while (state_->running) {
+            bool had_error = false;
             try {
                 auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
+                backoff_ms = 0;  // reset on success
                 if (!state_->running) break;
                 auto session = std::make_shared<ClientSession>(state_);
                 co_spawn(ioc_, session->run(std::move(socket)),
@@ -76,6 +80,13 @@ public:
                     });
             } catch (const std::exception& e) {
                 if (state_->running) LOG_ERROR("Accept error: ", e.what());
+                had_error = true;
+            }
+            if (had_error && state_->running) {
+                backoff_ms = backoff_ms == 0 ? 10 : std::min(backoff_ms * 2, kMaxBackoffMs);
+                asio::steady_timer timer(ioc_);
+                timer.expires_after(std::chrono::milliseconds(backoff_ms));
+                co_await timer.async_wait(asio::use_awaitable);
             }
         }
         LOG_INFO("HTTP server stopped");

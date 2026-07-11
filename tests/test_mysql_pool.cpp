@@ -51,24 +51,25 @@ TEST(RedisPoolTest, Placeholder) {
     SUCCEED() << "Integration tests require a real Redis instance";
 }
 
-TEST(MysqlPoolTest, RejectsSqlLongerThanStackBufferBeforeAcquire) {
+TEST(MysqlPoolTest, ExecuteAfterShutdownFailsBeforeAcquire) {
     asio::io_context ioc;
     MysqlPool::Config cfg;
+    cfg.host = "127.0.0.1";
     cfg.min_size = 0;
     cfg.max_size = 1;
     cfg.worker_threads = 1;
     cfg.keepalive_sec = 60;
     MysqlPool pool(ioc, cfg);
+    pool.shutdown();
 
     std::optional<MysqlPool::Result> result;
-    co_spawn(ioc, store_sql_result(pool, std::string(4096, 'x'), result), asio::detached);
+    co_spawn(ioc, store_sql_result(pool, "SELECT 1", result), asio::detached);
 
     ioc.run();
-    pool.shutdown();
 
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result->ok);
-    EXPECT_EQ(result->error, "sql too long");
+    EXPECT_EQ(result->error, "mysql pool stopped");
 
     auto stats = pool.snapshot();
     EXPECT_EQ(stats.query_fail_total, 1u);
@@ -78,6 +79,7 @@ TEST(MysqlPoolTest, RejectsSqlLongerThanStackBufferBeforeAcquire) {
 TEST(MysqlPoolTest, ComputesDefaultMaxCreatingFromPoolAndWorkerSize) {
     asio::io_context ioc;
     MysqlPool::Config cfg;
+    cfg.host = "127.0.0.1";
     cfg.min_size = 0;
     cfg.max_size = 64;
     cfg.worker_threads = 4;

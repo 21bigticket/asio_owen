@@ -11,7 +11,9 @@ struct MysqlConnectionConfig {
     std::string db;
     int connect_timeout_ms = 1000;
     int read_timeout_ms = 500;
+    int query_timeout_ms = 30000;
 };
 
 MYSQL* create_mysql_connection_with_timeout(const MysqlConnectionConfig& cfg);
 int mysql_ping_with_timeout(MYSQL* conn, int read_timeout_ms);
+void ensure_mysql_thread_initialized();

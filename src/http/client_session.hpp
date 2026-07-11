@@ -262,6 +262,12 @@ public:
                                 auto forward_req = build_proxy_request(
                                     method_str, upstream->upstream_path, cfg, ctx, request_header_state,
                                     pool->cfg().send_keep_alive_header);
+                                if (forward_req.empty()) {
+                                    ctx.status_code = 400;
+                                    ctx.response_body = "{\"code\":400,\"msg\":\"invalid header\"}";
+                                    handled = true;
+                                    break;
+                                }
                                 LOG_DEBUG("Proxy upstream request built: upstream_path=",
                                     upstream->upstream_path,
                                     ", bytes=", forward_req.size(),

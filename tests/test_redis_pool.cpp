@@ -127,5 +127,8 @@ TEST(RedisPoolStats, FormatsSnapshotCounters) {
     EXPECT_EQ(snapshot.nil_total, 1u);
     EXPECT_EQ(snapshot.timeout_total, 1u);
     EXPECT_EQ(format_redis_pool_stats(snapshot),
-              "created_total=3, reconnect_total=1, cmd_ok_total=1, cmd_fail_total=1, nil_total=1, timeout_total=1");
+              "created_total=3, reconnect_total=1, cmd_ok_total=1, cmd_fail_total=1, nil_total=1, timeout_total=1"
+              ", connect_ok_total=0, connect_fail_total=0, acquire_wait_total=0, acquire_timeout_total=0"
+              ", acquire_retry_exhausted_total=0, idle_recycled_total=0, ping_fail_total=0"
+              ", total_conn=0, idle_conn=0, creating_conn=0, max_creating=0");
 }

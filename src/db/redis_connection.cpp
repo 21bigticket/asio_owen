@@ -2,6 +2,8 @@
 
 #include <sys/time.h>
 
+#include <string_view>
+
 #include "../common/logger.hpp"
 
 bool redis_tls_owner_matches(
@@ -39,6 +41,19 @@ redisContext* create_redis_connection(
         if (cmd_ms < 100) cmd_ms = 100;
         timeval cmd_tv = {cmd_ms / 1000, (cmd_ms % 1000) * 1000};
         redisSetTimeout(ctx, cmd_tv);
+    }
+
+    if (cfg.db != 0) {
+        redisReply* reply = static_cast<redisReply*>(redisCommand(ctx, "SELECT %d", cfg.db));
+        bool ok = reply &&
+                  reply->type == REDIS_REPLY_STATUS &&
+                  std::string_view(reply->str, reply->len) == "OK";
+        if (reply) freeReplyObject(reply);
+        if (!ok) {
+            LOG_ERROR("Redis select db failed: ", ctx->errstr);
+            redisFree(ctx);
+            return nullptr;
+        }
     }
 
     ++created_total;
