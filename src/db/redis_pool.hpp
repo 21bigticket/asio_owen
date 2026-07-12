@@ -130,15 +130,17 @@ public:
         if (!running_) {
             co_return make_error("redis pool is shutdown");
         }
-
-        if (cfg_.mode == Mode::Worker) {
-            co_return co_await asio::post(
-                [this, args = std::move(args)]() mutable {
-                    return cmd_argv_sync_impl(std::move(args));
-                },
-                *worker_pool_, asio::use_awaitable);
+        if (cfg_.mode == Mode::Direct) {
+            co_return cmd_argv_sync_impl(std::move(args));
         }
 
+        // Worker mode: switch executor only — args stays in the coroutine frame.
+        // Capturing non-POD into a post() lambda triggers GCC 11 coroutine UAF;
+        // see docs/REDIS_POOL_LAMBDA_FIX_2026-07-12.md and docs/SUMMARY_2026-07-12.md.
+        co_await asio::post(*worker_pool_, asio::use_awaitable);
+        if (!running_) {
+            co_return make_error("redis pool is shutdown");
+        }
         co_return cmd_argv_sync_impl(std::move(args));
     }
 
@@ -146,16 +148,16 @@ public:
         if (!running_) {
             co_return make_error("redis pool is shutdown");
         }
-
         std::string key_copy(key);
-        if (cfg_.mode == Mode::Worker) {
-            co_return co_await asio::post(
-                [this, key_copy = std::move(key_copy)] {
-                    return get_sync(key_copy.c_str());
-                },
-                *worker_pool_, asio::use_awaitable);
+        if (cfg_.mode == Mode::Direct) {
+            co_return get_sync(key_copy.c_str());
         }
 
+        // Worker mode: switch executor only — key_copy stays in the coroutine frame.
+        co_await asio::post(*worker_pool_, asio::use_awaitable);
+        if (!running_) {
+            co_return make_error("redis pool is shutdown");
+        }
         co_return get_sync(key_copy.c_str());
     }
 
@@ -478,15 +480,15 @@ private:
         if (!running_) {
             co_return make_error("redis pool is shutdown");
         }
-
-        if (cfg_.mode == Mode::Worker) {
-            co_return co_await asio::post(
-                [this, cmdline = std::move(cmdline)] {
-                    return do_cmd_sync(cmdline.c_str());
-                },
-                *worker_pool_, asio::use_awaitable);
+        if (cfg_.mode == Mode::Direct) {
+            co_return do_cmd_sync(cmdline.c_str());
         }
 
+        // Worker mode: switch executor only — cmdline stays in the coroutine frame.
+        co_await asio::post(*worker_pool_, asio::use_awaitable);
+        if (!running_) {
+            co_return make_error("redis pool is shutdown");
+        }
         co_return do_cmd_sync(cmdline.c_str());
     }
 
