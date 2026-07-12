@@ -44,4 +44,5 @@ redisContext* ensure_redis_tls_connection(
     const RedisPool* owner,
     uint64_t generation,
     const RedisConnectionConfig& cfg,
-    std::atomic<size_t>& created_total);
+    std::atomic<size_t>& created_total,
+    bool* did_reconnect = nullptr);

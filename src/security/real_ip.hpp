@@ -7,25 +7,46 @@
 
 #include "../common/logger.hpp"
 
-// Normalize IPv6-mapped IPv4 (e.g. ::ffff:10.0.0.1 -> 10.0.0.1)
-// Must be defined before get_client_ip which depends on it.
-inline std::string normalize_ip_str(const std::string& ip_str) {
+// Normalized IP: both string form and parsed asio::ip::address.
+// Avoids double-parsing when callers need both forms (e.g. match_cidr).
+struct NormalizedIp {
+    std::string str;
+    asio::ip::address addr;
+    bool parse_ok = false;
+};
+
+inline NormalizedIp normalize_ip(const std::string& ip_str) {
+    NormalizedIp out;
+    out.str = ip_str;
+
     asio::error_code ec;
     auto addr = asio::ip::make_address(ip_str, ec);
-    if (ec) return ip_str;  // parse failed, return as-is
+    if (ec) return out;
 
     if (addr.is_v6()) {
         auto v6 = addr.to_v6();
         if (v6.is_v4_mapped()) {
-            // convert IPv6-mapped IPv4 to IPv4 string
             auto bytes = v6.to_bytes();
             asio::ip::address_v4::bytes_type v4{
                 bytes[12], bytes[13], bytes[14], bytes[15]
             };
-            return asio::ip::make_address_v4(v4).to_string();
+            auto v4_addr = asio::ip::make_address_v4(v4);
+            out.str = v4_addr.to_string();
+            out.addr = v4_addr;
+            out.parse_ok = true;
+            return out;
         }
     }
-    return ip_str;
+
+    out.str = ip_str;
+    out.addr = addr;
+    out.parse_ok = true;
+    return out;
+}
+
+// Backward-compatible thin wrapper.
+inline std::string normalize_ip_str(const std::string& ip_str) {
+    return normalize_ip(ip_str).str;
 }
 
 // Strip port/bracket from IP string for address comparison.

@@ -350,12 +350,10 @@ private:
     }
 
     redisContext* acquire_direct() {
-        const bool need_reconnect = redis_tls_owner_matches(tls_, this, generation_) &&
-                                    tls_.conn &&
-                                    tls_.conn->err != 0;
+        bool did_reconnect = false;
         redisContext* ctx = ensure_redis_tls_connection(
-            tls_, this, generation_, connection_config(), created_total_);
-        if (need_reconnect) {
+            tls_, this, generation_, connection_config(), created_total_, &did_reconnect);
+        if (did_reconnect) {
             stats_.inc_reconnect();
         }
         return ctx;

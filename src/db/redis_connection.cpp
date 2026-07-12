@@ -66,16 +66,20 @@ redisContext* ensure_redis_tls_connection(
     const RedisPool* owner,
     uint64_t generation,
     const RedisConnectionConfig& cfg,
-    std::atomic<size_t>& created_total) {
+    std::atomic<size_t>& created_total,
+    bool* did_reconnect) {
     if (!redis_tls_owner_matches(tls, owner, generation)) {
         reset_redis_tls_owner(tls, owner, generation);
     }
 
+    bool reconnect = false;
     if (!tls.conn) {
         tls.conn.reset(create_redis_connection(cfg, created_total));
     } else if (tls.conn->err != 0) {
         LOG_INFO("Redis connection broken, rebuilding");
         tls.conn.reset(create_redis_connection(cfg, created_total));
+        reconnect = true;
     }
+    if (did_reconnect) *did_reconnect = reconnect;
     return tls.conn.get();
 }

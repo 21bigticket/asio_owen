@@ -37,24 +37,10 @@ public:
         role_paths_ = std::move(new_role_paths);
     }
 
-    bool is_blocked(const std::string& path) const {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (paths_) {
-            for (auto& p : *paths_) {
-                // exact match or path-segment boundary match:
-                // - /api/internal matches /api/internal and /api/internal/
-                // - /api/internal does NOT match /api/internalxxx
-                if (path == p) return true;
-                if (path.find(p) == 0 &&
-                    (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/')) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    // Combined check: returns (blocked, required_role) in one lock instead of two
+    // Combined check: returns (blocked, required_role) in one lock instead of two.
+    // This is the only entry point used by SecurityRules; is_blocked() and
+    // required_role() were removed because they each took the same lock separately
+    // and required two calls to get both pieces of state.
     struct BlockResult {
         bool blocked = false;
         std::string required_role;
@@ -65,6 +51,9 @@ public:
         BlockResult result;
         if (paths_) {
             for (auto& p : *paths_) {
+                // exact match or path-segment boundary match:
+                // - /api/internal matches /api/internal and /api/internal/
+                // - /api/internal does NOT match /api/internalxxx
                 if (path == p) return {true, {}};
                 if (path.find(p) == 0 &&
                     (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/')) {
@@ -84,23 +73,6 @@ public:
             }
         }
         return result;
-    }
-
-    // Return the required role, empty means unrestricted
-    std::string required_role(const std::string& path) const {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (!role_paths_) return {};
-        for (auto& [p, role] : *role_paths_) {
-            // same path-segment boundary logic as is_blocked
-            if (path == p) {
-                return extract_role_from_val(role);
-            }
-            if (path.find(p) == 0 &&
-                (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/')) {
-                return extract_role_from_val(role);
-            }
-        }
-        return {};
     }
 
     // Extract "admin" from "role:admin"

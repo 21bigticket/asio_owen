@@ -251,3 +251,56 @@ TEST(HttpPool, DropsIdleWithResidualReadBuffer) {
     if (held1->has_value()) (*held1)->close(ec);
     if (held2->has_value()) (*held2)->close(ec);
 }
+
+asio::awaitable<void> acquire_backdate_release_acquire(
+    HttpPool& pool,
+    std::shared_ptr<HttpPool::State> state,
+    int port) {
+    auto conn = co_await pool.acquire("127.0.0.1", port);
+    if (!conn) co_return;
+    auto shard_idx = conn->shard_idx;
+    HttpPool::release(state, std::move(conn));
+
+    {
+        auto& shard = state->shards[shard_idx];
+        std::lock_guard lock(shard.mtx);
+        for (auto& idle_conn : shard.idle) {
+            idle_conn.last_used_at = std::chrono::steady_clock::time_point{};
+        }
+    }
+    state->last_global_evict_ms.store(0, std::memory_order_relaxed);
+
+    auto second = co_await pool.acquire("127.0.0.1", port);
+    if (!second) co_return;
+    // global sweep should have evicted the stale idle conn before reuse,
+    // forcing a fresh connect (reused_from_idle == false).
+    EXPECT_FALSE(second->reused_from_idle);
+    HttpPool::release_bad(state, std::move(second));
+}
+
+TEST(HttpPool, ThrottledGlobalEvictSweepsStaleIdleFromShards) {
+    // Regression for P2.3: a throttled global eviction sweep at acquire()
+    // entry should reclaim idle conns from all shards, not just the calling shard.
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+
+    HttpPool::Config cfg;
+    cfg.max_size = HttpPool::kShards;
+    cfg.connect_timeout_ms = 1000;
+    cfg.idle_timeout_sec = 0;
+    HttpPool pool(ioc, cfg);
+    auto state = pool.state();
+
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_backdate_release_acquire(
+        pool, state, acceptor.local_endpoint().port()), asio::detached);
+
+    ioc.run();
+
+    EXPECT_EQ(state->acquire_created.load(std::memory_order_relaxed), 2u);
+    EXPECT_EQ(state->acquire_reused.load(std::memory_order_relaxed), 0u);
+
+    asio::error_code ec;
+    if (held_socket->has_value()) (*held_socket)->close(ec);
+}

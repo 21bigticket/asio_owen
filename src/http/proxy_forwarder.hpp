@@ -74,15 +74,20 @@ inline std::string build_proxy_request(
     add_connection_tokens(ctx.headers, filtered);
 
     bool forwarding_transfer_encoding = false;
+    // Pass 1: scan ALL header values for CR/LF/NUL (request-smuggling defense).
+    // Must complete the full scan before any break, otherwise a TE header followed
+    // by a CR/LF-bearing header would slip through.
     for (auto& [k, v] : ctx.headers) {
-        // Reject headers with CR, LF, or NUL to prevent HTTP request smuggling.
         for (char c : v) {
             if (c == '\r' || c == '\n' || c == '\0') {
                 LOG_WARN("Rejecting request with control char in header ", k,
                     " from path ", ctx.path);
-                return "";  // caller must treat empty request as error
+                return "";
             }
         }
+    }
+    // Pass 2: detect Transfer-Encoding.
+    for (auto& [k, v] : ctx.headers) {
         if (header_iequals(k, "transfer-encoding")) {
             forwarding_transfer_encoding = true;
             break;

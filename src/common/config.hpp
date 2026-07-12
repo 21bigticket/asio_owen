@@ -134,19 +134,6 @@ public:
         return result;
     }
 
-    // Get all values preserving occurrence order (allows duplicate keys)
-    // Used for sections like [auth_whitelist] path = /api/health
-    std::vector<std::string> get_all_values(const std::string& section) const {
-        return get_list(section);
-    }
-
-    // Get all key=value pairs in a section (for [path_blacklist])
-    // /api/internal =       (empty value means no role restriction)
-    // /admin/ = role:admin  (with role restriction)
-    std::vector<std::pair<std::string, std::string>> get_section_raw(const std::string& section) const {
-        return get_section(section);
-    }
-
 private:
     std::unordered_map<std::string, std::string> data_;
     // Ordered entries preserving duplicates and insertion order

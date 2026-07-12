@@ -221,8 +221,21 @@ private:
         return token;
     }
 
-    // Verify RS256 signature using pre-loaded pkey_ (bypasses jwt-cpp PEM parsing)
-    // This works around a macOS OpenSSL 3.x issue where BIO_write + PEM_read_bio_PUBKEY fails.
+    // Verify RS256 signature using pre-loaded pkey_ directly via the EVP API.
+    //
+    // Why not jwt-cpp's built-in RS256 verifier?
+    // jwt-cpp wraps the PEM string in a jwt-cpp::openssl::pem_reader that calls
+    // PEM_read_bio_PUBKEY on every verify() call. On macOS Homebrew OpenSSL 3.x
+    // we observed intermittent BIO_read failures ("no start line") inside that
+    // helper, even with the same PEM that PEM_read_bio_PUBKEY accepts at process
+    // startup. By loading the key once at construction (load_rsa_key) and using
+    // the low-level EVP_Verify* API here, we:
+    //   1. sidestep the broken jwt-cpp PEM hot-path entirely;
+    //   2. catch malformed PEM at startup, not on the first request;
+    //   3. avoid paying PEM parsing cost per request.
+    //
+    // Trade-off: we lose jwt-cpp's algorithm/claims registry, so do_verify
+    // manually checks `alg` header, issuer, exp, and nbf.
     static bool verify_rs256(const std::string& data, const std::string& signature, EVP_PKEY* pkey) {
         auto ctx = EVP_MD_CTX_new();
         if (!ctx) return false;
@@ -270,8 +283,8 @@ private:
                 .leeway(60);
             verifier.verify(decoded);
         } else if (algorithm_ == "RS256") {
-            // Manually verify RS256 signature using pre-loaded pkey_
-            // This bypasses jwt-cpp's PEM loading which fails on macOS OpenSSL 3.x.
+            // Manual RS256 path — see verify_rs256() comment for the macOS
+            // OpenSSL 3.x issue that forces us to bypass jwt-cpp here.
             auto header_b64 = decoded.get_header_base64();
             auto payload_b64 = decoded.get_payload_base64();
             auto sig = decoded.get_signature();

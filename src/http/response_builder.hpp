@@ -19,7 +19,7 @@ inline std::string_view reason_phrase(int status) {
         case 502: return "Bad Gateway";
         case 503: return "Service Unavailable";
         case 504: return "Gateway Timeout";
-        default: return "OK";
+        default: return "";
     }
 }
 
@@ -51,7 +51,18 @@ inline std::string build_downstream_response(
     if (!ctx.response_status_text.empty()) {
         resp += ctx.response_status_text;
     } else {
-        resp += reason_phrase(ctx.status_code);
+        // Unknown status codes (no static reason phrase) fall back to a
+        // per-class generic phrase so the status line stays RFC 7230-compliant.
+        auto rp = reason_phrase(ctx.status_code);
+        if (rp.empty()) {
+            if (ctx.status_code >= 100 && ctx.status_code < 200) rp = "Informational";
+            else if (ctx.status_code >= 200 && ctx.status_code < 300) rp = "OK";
+            else if (ctx.status_code >= 300 && ctx.status_code < 400) rp = "Redirection";
+            else if (ctx.status_code >= 400 && ctx.status_code < 500) rp = "Client Error";
+            else if (ctx.status_code >= 500 && ctx.status_code < 600) rp = "Server Error";
+            else rp = "Unknown";
+        }
+        resp += rp;
     }
     resp += "\r\n";
 

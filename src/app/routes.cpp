@@ -3,6 +3,7 @@
 #include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 
+#include "../db/mysql_result_json.hpp"
 #include "../http/response.hpp"
 
 namespace {
@@ -48,18 +49,15 @@ asio::awaitable<void> api_combo(HttpContext& ctx, AppServices services) {
     } else {
         auto mysql_ret = co_await services.mysql->execute("SELECT 'from_mysql' AS name");
         if (mysql_ret.ok && mysql_ret.json.size() > 2) {
-            auto pos = mysql_ret.json.find(":\"");
-            if (pos != std::string::npos) {
-                auto end = mysql_ret.json.find("\"", pos + 2);
-                if (end != std::string::npos) {
-                    data = mysql_ret.json.substr(pos + 2, end - pos - 2);
-                }
+            auto parsed = extract_first_string_value(mysql_ret.json);
+            if (parsed) {
+                data = std::move(*parsed);
+                auto ex = co_await asio::this_coro::executor;
+                auto redis = services.redis;
+                asio::post(ex, [redis, data] {
+                    set_cache(redis, data);
+                });
             }
-            auto ex = co_await asio::this_coro::executor;
-            auto redis = services.redis;
-            asio::post(ex, [redis, data] {
-                set_cache(redis, data);
-            });
         }
     }
 

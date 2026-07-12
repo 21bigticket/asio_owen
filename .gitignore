@@ -1,6 +1,7 @@
 # Build directories
 build/
 build_asan/
+build-*/
 build_vg/
 cmake-build-debug/
 build_*/

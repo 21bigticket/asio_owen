@@ -75,3 +75,23 @@ gtest_discover_tests(test_mysql_pool)
 add_executable(test_redis_pool test_redis_pool.cpp)
 target_link_libraries(test_redis_pool PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_redis_pool)
+
+# Rate limiter (token bucket + 32-shard LRU + snapshot)
+add_executable(test_rate_limiter test_rate_limiter.cpp)
+target_link_libraries(test_rate_limiter PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_rate_limiter)
+
+# End-to-end client session via real HttpServer + tcp client
+add_executable(test_client_session test_client_session.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)
+target_link_libraries(test_client_session PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_client_session)
+
+# Security chain integration (OPTIONS → real IP → blacklist → rate limit → JWT)
+add_executable(test_security_chain test_security_chain.cpp)
+target_link_libraries(test_security_chain PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_security_chain)
+
+# Redis Direct mode shutdown semantics
+add_executable(test_redis_pool_shutdown test_redis_pool_shutdown.cpp)
+target_link_libraries(test_redis_pool_shutdown PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_redis_pool_shutdown)

@@ -45,11 +45,9 @@ inline std::optional<ParsedCidr> parse_cidr_rule(std::string_view cidr) {
 }
 
 inline bool match_cidr(const std::string& ip, const ParsedCidr& rule) {
-    auto normalized = normalize_ip_str(ip);
-
-    asio::error_code ec;
-    auto addr = asio::ip::make_address(normalized, ec);
-    if (ec) return false;
+    auto normalized = normalize_ip(ip);
+    if (!normalized.parse_ok) return false;
+    auto addr = normalized.addr;
 
     auto addr_v6 = addr.is_v6()
         ? addr.to_v6()

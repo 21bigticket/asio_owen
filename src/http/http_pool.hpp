@@ -66,6 +66,8 @@ public:
         std::atomic<size_t> released_idle{0};
         std::atomic<size_t> released_closed{0};
         std::atomic<size_t> released_bad{0};
+        // Throttle for cross-shard eviction sweep (avoids per-acquire overhead).
+        std::atomic<int64_t> last_global_evict_ms{0};
 
         State(asio::io_context& io, Config c) : ioc(io), cfg(std::move(c)) {}
 
@@ -146,6 +148,24 @@ public:
     asio::awaitable<std::unique_ptr<HttpConn>> acquire(const std::string& host, int port) {
         auto state = state_;
         if (!state->running) co_return nullptr;
+
+        // Throttled global eviction sweep: at most once per second across all callers,
+        // walk all shards and evict stale idle connections. Without this, idle conns
+        // parked in shards that nobody acquires from (e.g. after a traffic shift)
+        // linger until idle_timeout_sec * shard_traffic, leaking fds.
+        {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t last = state->last_global_evict_ms.load(std::memory_order_relaxed);
+            if (now_ms - last >= 1000 &&
+                state->last_global_evict_ms.compare_exchange_strong(
+                    last, now_ms, std::memory_order_relaxed)) {
+                for (auto& s : state->shards) {
+                    std::lock_guard lock(s.mtx);
+                    evict_stale_idle(state, s, state->cfg);
+                }
+            }
+        }
 
         // Reserve in-flight slot once at entry, instead of inside the idle-pop loop.
         // This fixes a bug where max_concurrent check in the while-loop on the first
