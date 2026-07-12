@@ -541,7 +541,7 @@ ctest --test-dir build-san --output-on-failure --timeout 60 -E 'MysqlPool'
 
 ### 12.8 全链路压测
 
-验证环境：Ubuntu 22.04 / GCC 11.4 / 6 核 15GB。
+验证环境：Ubuntu 22.04 / GCC 11.4 / 6 核 15GB。最终验证于 2026-07-12 19:00（VM 重启后冷启动）。
 
 #### 压测工具与方法
 
@@ -552,6 +552,8 @@ ctest --test-dir build-san --output-on-failure --timeout 60 -E 'MysqlPool'
 | `tshark -e tcp.stream` | TCP 流统计 | 按 `tcp.stream` 分组统计每流 HTTP 请求数 |
 | `server.log` | 错误监控 | `grep -i error\|warn\|fatal` |
 | ASan 构建 | 内存安全 | `-fsanitize=address -g -fno-omit-frame-pointer`，运行时 `symbolize=1` |
+| `/proc/<pid>/status` | 运行时内存 | `VmRSS` / `VmSize` / `Threads` |
+| `/proc/<pid>/stack` | 线程栈 | 确认主线程状态 |
 
 **ASan 构建命令：**
 
@@ -564,36 +566,43 @@ cmake -B build_asan -S . \
 ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:log_path=/tmp/asan_crash:symbolize=1" ./build_asan/server
 ```
 
-#### 全量压测结果（30t/100c × 30s × 2 轮）
+#### 全量压测结果（30t/100c x 30s x 2 轮，最终）
 
-| 接口 | RPS (avg) | avg_lat | errors |
-|:-----|:---:|:-------:|:------:|
-| Health | 136k | 0.68ms | 0 |
-| Redis | 28.5k | 3.3ms | 0 |
-| MySQL | 13.5k | 6.8ms | 0 |
-| Config Direct | 17.7k | 5.6ms | 0 |
-| Config Gateway | 12.5k | 7.6ms | 0 |
+| 接口 | RPS (avg) | avg_lat | errors | RPS #1 | RPS #2 |
+|:-----|:---:|:-------:|:------:|------:|------:|
+| Health | **156k** | 0.58ms | 0 | 157,120 | 154,825 |
+| Redis | **42.6k** | 2.12ms | 0 | 42,689 | 42,428 |
+| MySQL | **14.0k** | 6.46ms | 0 | 14,121 | 13,880 |
+| Config Direct | **15.9k** | 6.45ms | 0 | 14,585 | 17,179 |
+| Config Gateway | **12.5k** | 7.63ms | 0 | 12,717 | 12,322 |
+
+> Config Direct 压测目标为上游 gRPC 服务 `127.0.0.1:30001`，不对网关产生流量。
+> Config Gateway 压测目标为网关 `127.0.0.1:8081/zebra-config/...`，经网关代理到同一个上游。
 
 #### 网关转发效率
 
 | 场景 | Direct RPS | Gateway RPS | 损耗 | 说明 |
 |:-----|----------:|-----------:|-----:|:------|
-| 上游慢（gRPC ~6.3k） | 6,275 | 6,285 | ≈ 0% | 上游瓶颈掩盖网关开销 |
-| 上游快（gRPC ~17.7k） | 17,670 | 12,543 | ~29% | 网关真实成本暴露 |
+| 上游慢（gRPC ~6.3k） | 6,275 | 6,285 | ~0% | 上游瓶颈掩盖网关开销 |
+| 上游正常（gRPC ~15.9k） | 15,882 | 12,520 | **~21%** | 最终数据 |
+| 上游快（gRPC ~17.7k） | 17,670 | 12,543 | ~29% | VM 负载较低时上游更快 |
 
-**29% 是网关代理的真实损耗，不是 bug。** 每个请求比直连多：下游 HTTP 解析 → HttpPool acquire → build_proxy_request → 上游读写 → read_proxy_response → json_keys_snake_to_camel → build_downstream_response → HttpPool release。全部跑在同一个 `asio::io_context` 上。
+**21-29% 是网关代理的真实损耗，不是 bug。** 每个请求比直连多：下游 HTTP 解析、HttpPool acquire、build_proxy_request、上游读写、read_proxy_response、json_keys_snake_to_camel、build_downstream_response、HttpPool release。全部跑在同一个 `asio::io_context` 上。单次请求直连只需上游读写这 1 步，网关需要全部 7 步。
 
 #### HTTP 连接复用
 
-| 指标 | 值 | 方法 |
-|:-----|:---:|:------|
-| TCP 流总数 | 46 | `tshark -r pcap -T fields -e tcp.stream` |
-| HTTP 请求总数 | 149,952 | 同上 |
-| 平均每流请求 | 3,260 | 149,952 ÷ 46 |
-| TCP 层复用率 | > 99.9% | — |
-| HttpPool `zebra-config` 复用率 | 99.95% | reused=682,223 ÷ (reused+created) |
+| 层级 | 指标 | 值 | 方法 |
+|:-----|:-----|:---:|:------|
+| TCP 层 | 流总数 | 46 | `tshark -r pcap -T fields -e tcp.stream` |
+| TCP 层 | HTTP 请求总数 | 149,952 | 同上 |
+| TCP 层 | 平均每流请求 | 3,260 | — |
+| TCP 层 | 复用率 | > 99.9% | — |
+| HttpPool | `zebra-config` reused | 753,068 | `pool->stats()` |
+| HttpPool | `zebra-config` created | 93 | 同上 |
+| HttpPool | 复用率 | **99.988%** | 753,068 / (753,068 + 93) |
+| HttpPool | 平均每连接请求 | 8,097 | — |
 
-> ⚠️ 小样本 SYN-ACK 比例不能用来估算复用率。必须用全量 pcap + `tshark -e tcp.stream` 按流统计 HTTP 请求数。
+> 警告：小样本 SYN-ACK 比例不能用来估算复用率。必须用全量 pcap + `tshark -e tcp.stream` 按流统计 HTTP 请求数，或直接读 HttpPool 内置统计。
 
 #### 稳定性
 
@@ -601,8 +610,20 @@ ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:log_path=/tmp/asan_crash:symboliz
 |:-------|:----:|
 | segfault | 0 |
 | server.log error | 0 |
+| server.log warn（非压测） | 3 条（浏览器 `/favicon.ico` 缺 JWT） |
 | coredump | 0 |
 | ASan 错误（最终构建） | 0 |
+
+#### 运行时内存与线程
+
+| 指标 | 值 | 获取方式 |
+|:-----|:---:|:------|
+| VmSize（虚拟内存） | 3.0 GB | `/proc/<pid>/status` |
+| VmRSS（物理内存） | **116 MB** | 同上 |
+| 线程数 | 41 | 同上 |
+| 主线程栈 | `futex_wait` | `/proc/<pid>/stack` |
+
+线程组成：`hardware_concurrency()` 个 io_context 线程 + 32 个 MySQL worker 线程 + 1 个 MySQL maintain 线程 + spdlog 异步线程 + 定时器线程。主线程 `futex_wait` 正常等待 io_context 事件。
 
 #### 关键教训：GCC 11 协程 Lambda Bug
 

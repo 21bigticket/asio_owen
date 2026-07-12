@@ -18,6 +18,7 @@ build_*/
 # Runtime files
 server.log
 *.log
+*.bin
 
 # Security keys (not committed)
 jwt_keys/
