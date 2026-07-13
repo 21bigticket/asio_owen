@@ -31,7 +31,7 @@ class MysqlPool {
 public:
     struct Config {
         std::string host;
-        int port;
+        int port = 3306;
         std::string user;
         std::string pass;
         std::string db;

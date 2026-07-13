@@ -130,18 +130,8 @@ public:
     explicit RateLimiter(Config cfg)
         : shards_(kShards)
     {
-        if (cfg.max_buckets < kShards) {
-            LOG_WARN("rate_limit: max_buckets=", cfg.max_buckets,
-                     " < kShards=", kShards, ", clamping to ", kShards);
-            cfg.max_buckets = kShards;
-        }
-        // Sort path prefixes by length descending for deterministic match order
-        std::sort(cfg.path_prefix_limits.begin(), cfg.path_prefix_limits.end(),
-            [](const auto& a, const auto& b) {
-                return a.first.size() > b.first.size();
-            });
-        cfg_ = std::move(cfg);
-        max_buckets_per_shard_ = cfg_.max_buckets / kShards;
+        cfg_ = normalize_config(std::move(cfg));
+        max_buckets_per_shard_.store(cfg_.max_buckets / kShards, std::memory_order_relaxed);
         load_snapshot();
     }
 
@@ -217,15 +207,8 @@ public:
     // Update rate limit config (hot reload)
     void update_config(Config cfg) {
         std::lock_guard<std::mutex> lock(cfg_mu_);
-        // Sort path prefixes by length descending (longest match first)
-        // The input order from Config::get_section is non-deterministic (unordered_map),
-        // so explicit sorting is required for deterministic first-match-wins behavior.
-        std::sort(cfg.path_prefix_limits.begin(), cfg.path_prefix_limits.end(),
-            [](const auto& a, const auto& b) {
-                return a.first.size() > b.first.size();
-            });
-        cfg_ = std::move(cfg);
-        max_buckets_per_shard_ = cfg_.max_buckets / kShards;
+        cfg_ = normalize_config(std::move(cfg));
+        max_buckets_per_shard_.store(cfg_.max_buckets / kShards, std::memory_order_relaxed);
     }
 
     // Persist snapshot (manual trigger)
@@ -275,9 +258,9 @@ private:
         std::vector<std::unordered_map<std::string, TokenBucket>> shards;
     };
 
-    mutable std::mutex cfg_mu_;  // protects cfg_ and max_buckets_per_shard_
+    mutable std::mutex cfg_mu_;  // protects cfg_
     Config cfg_;
-    size_t max_buckets_per_shard_;
+    std::atomic<size_t> max_buckets_per_shard_{1};
     std::vector<Shard> shards_;
     GlobalBucket global_;
     std::atomic<bool> snapshot_busy_{false};  // prevents persist_snapshot re-entry
@@ -290,6 +273,20 @@ private:
         return shards_[std::hash<std::string>{}(key) % kShards];
     }
 
+    static Config normalize_config(Config cfg) {
+        if (cfg.max_buckets < kShards) {
+            LOG_WARN("rate_limit: max_buckets=", cfg.max_buckets,
+                     " < kShards=", kShards, ", clamping to ", kShards);
+            cfg.max_buckets = kShards;
+        }
+        // Sort path prefixes by length descending for deterministic first-match-wins behavior.
+        std::sort(cfg.path_prefix_limits.begin(), cfg.path_prefix_limits.end(),
+            [](const auto& a, const auto& b) {
+                return a.first.size() > b.first.size();
+            });
+        return cfg;
+    }
+
     void lru_touch(Shard& s, const std::string& key) {
         auto it = s.lru_index.find(key);
         if (it != s.lru_index.end()) {
@@ -300,7 +297,8 @@ private:
     }
 
     void evict_if_needed(Shard& s) {
-        while (s.buckets.size() > max_buckets_per_shard_) {
+        const auto max_buckets = max_buckets_per_shard_.load(std::memory_order_relaxed);
+        while (s.buckets.size() > max_buckets) {
             auto lru_key = s.lru_list.back();
             s.buckets.erase(lru_key);
             s.lru_index.erase(lru_key);

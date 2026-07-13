@@ -24,15 +24,20 @@
 using namespace std::chrono_literals;
 
 struct HttpServerState {
-    explicit HttpServerState(asio::io_context& ioc, int downstream_write_timeout_ms = 30000)
+    explicit HttpServerState(
+        asio::io_context& ioc,
+        int downstream_write_timeout_ms = 30000,
+        int client_header_read_timeout_ms = 10000)
         : upstreams(ioc),
-          downstream_write_timeout_ms(downstream_write_timeout_ms) {}
+          downstream_write_timeout_ms(downstream_write_timeout_ms),
+          client_header_read_timeout_ms(client_header_read_timeout_ms) {}
 
     std::unordered_map<std::string, Handler> routes;
     std::atomic<bool> running{true};
     UpstreamManager upstreams;
     SecurityRules* security_rules = nullptr;
     int downstream_write_timeout_ms = 30000;
+    int client_header_read_timeout_ms = 10000;
 };
 
 class ClientSession {
@@ -41,14 +46,19 @@ public:
         : state_(std::move(state)) {}
 
     asio::awaitable<void> run(asio::ip::tcp::socket socket) {
+        int final_error_status = 0;
+        std::string final_error_reason;
+        std::string final_error_body;
         try {
             char buf[kClientReadBufferSize];
             std::string client_preread;
-            auto client_timeout = 30s;
+            auto client_header_timeout = std::chrono::milliseconds(state_->client_header_read_timeout_ms);
+            auto client_body_timeout = 30s;
 
             while (state_->running) {
                 while (client_preread.find("\r\n\r\n") == std::string::npos) {
-                    auto read = co_await read_with_timeout(socket, buf, sizeof(buf), client_timeout);
+                    auto read = co_await read_with_timeout(
+                        socket, buf, sizeof(buf), client_header_timeout);
                     if (!read.ok()) {
                         if (client_preread.empty()) {
                             LOG_DEBUG("Client read stopped before sending data: status=",
@@ -131,7 +141,8 @@ public:
                     ctx.response_body = "{\"code\":400,\"msg\":\"invalid request framing\"}";
                     handled = true;
                 } else if (request_header_state.is_chunked) {
-                    auto body_result = co_await read_chunked_body(socket, preread, kMaxBodySize, client_timeout);
+                    auto body_result = co_await read_chunked_body(
+                        socket, preread, kMaxBodySize, client_body_timeout);
                     if (!body_result.ok()) {
                         LOG_INFO("Reject invalid chunked body: method=", method_str,
                             ", path=", path_str,
@@ -156,7 +167,7 @@ public:
                 } else if (request_header_state.content_length) {
                     size_t content_length = *request_header_state.content_length;
                     auto body_result = co_await read_content_length_body(
-                        socket, preread, content_length, kMaxBodySize, client_timeout);
+                        socket, preread, content_length, kMaxBodySize, client_body_timeout);
                     if (!body_result.ok()) {
                         LOG_INFO("Reject request body read failed: method=", method_str,
                             ", path=", path_str,
@@ -404,16 +415,18 @@ public:
             }
         } catch (const std::system_error& e) {
             LOG_WARN("Connection system_error: ", e.what());
-            std::string body = "{\"code\":500,\"msg\":\"connection error\"}";
-            auto resp = build_error_response(500, "Internal Server Error", body);
-            asio::error_code ec;
-            asio::write(socket, asio::buffer(resp), ec);
+            final_error_status = 500;
+            final_error_reason = "Internal Server Error";
+            final_error_body = "{\"code\":500,\"msg\":\"connection error\"}";
         } catch (const std::exception& e) {
             LOG_WARN("Connection error: ", e.what());
-            std::string body = "{\"code\":500,\"msg\":\"internal server error\"}";
-            auto resp = build_error_response(500, "Internal Server Error", body);
-            asio::error_code ec;
-            asio::write(socket, asio::buffer(resp), ec);
+            final_error_status = 500;
+            final_error_reason = "Internal Server Error";
+            final_error_body = "{\"code\":500,\"msg\":\"internal server error\"}";
+        }
+
+        if (final_error_status != 0) {
+            co_await write_simple_error(socket, final_error_status, final_error_reason, final_error_body);
         }
     }
 

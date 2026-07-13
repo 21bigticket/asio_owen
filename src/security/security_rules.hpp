@@ -2,6 +2,8 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <functional>
 #include <fstream>
 #include <sstream>
@@ -47,12 +49,14 @@ public:
         // 3. Auth whitelist
         {
             auto items = cfg.get_list("auth_whitelist");
+            normalize_path_items(items);
             auth_whitelist_.reload(items);
         }
 
         // 4. Path blacklist
         {
             auto items = cfg.get_section("path_blacklist");
+            normalize_path_keys(items);
             path_blacklist_.reload(items);
         }
 
@@ -60,7 +64,8 @@ public:
         {
             auto secret = cfg.get("security", "jwt_secret", "");
             auto issuer = cfg.get("security", "jwt_issuer", "asio_owen");
-            auto algorithm = cfg.get("security", "jwt_algorithm", "HS256");
+            auto configured_algorithm = cfg.get("security", "jwt_algorithm", "");
+            auto algorithm = configured_algorithm.empty() ? "HS256" : configured_algorithm;
             auto pub_key = cfg.get("security", "jwt_public_key", "");
             // Try to load public key from file if it's not already a PEM string
             if (!pub_key.empty() && pub_key.find("-----BEGIN") == std::string::npos) {
@@ -92,9 +97,15 @@ public:
                 }
             }
             if (algorithm == "HS256" && secret.empty()) {
+                if (!configured_algorithm.empty()) {
+                    throw std::invalid_argument("JWT HS256 configured without jwt_secret");
+                }
                 jwt_auth_.reset();
                 LOG_WARN("JWT secret not configured, JWT verification disabled");
             } else if (algorithm == "RS256" && pub_key.empty()) {
+                if (!configured_algorithm.empty()) {
+                    throw std::invalid_argument("JWT RS256 configured without jwt_public_key or jwks params");
+                }
                 jwt_auth_.reset();
                 LOG_WARN("JWT public key not configured for RS256, JWT verification disabled");
             } else {
@@ -116,6 +127,7 @@ public:
             // path rate limits
             auto path_items = cfg.get_section("rate_limit_paths");
             for (auto& [key, val] : path_items) {
+                if (!normalize_path_key(key)) continue;
                 auto rule = parse_rate_limit_value(val);
                 if (key.back() == '/') {
                     rate_cfg.path_prefix_limits.emplace_back(key, rule);
@@ -133,7 +145,7 @@ public:
             if (rate_limiter_) {
                 rate_limiter_->update_config(std::move(rate_cfg));
             } else {
-                rate_limiter_ = std::make_unique<RateLimiter>(std::move(rate_cfg));
+                rate_limiter_ = std::make_shared<RateLimiter>(std::move(rate_cfg));
             }
         }
 
@@ -168,20 +180,29 @@ public:
         // Snapshot trusted_proxies_ and jwt_auth_ (fine-grained lock, does not block CPU-heavy operations)
         std::vector<std::string> proxies_copy;
         std::shared_ptr<const JWTAuth> jwt_copy;
+        std::shared_ptr<RateLimiter> rate_limiter_copy;
         bool case_sensitive_copy = false;
         {
             std::lock_guard<std::mutex> lock(rules_mu_);
             proxies_copy = trusted_proxies_;
             jwt_copy = jwt_auth_;
+            rate_limiter_copy = rate_limiter_;
             case_sensitive_copy = case_sensitive_paths_;
         }
 
         // 1. Extract real IP (uses proxies_copy, not holding rules_mu_)
         auto client_ip = get_client_ip(socket, xff_header, proxies_copy);
-        auto normalized_ip = normalize_ip_str(client_ip);
+        auto normalized_ip_result = normalize_ip(client_ip);
+        if (!normalized_ip_result.parse_ok) {
+            return {400, "invalid client ip"};
+        }
+        auto& normalized_ip = normalized_ip_result.str;
 
         // 2. Path normalization (case_sensitive controls whether paths are lowercased)
         auto norm = normalize_path(raw_path, case_sensitive_copy);
+        if (!norm.valid) {
+            return {400, "invalid path"};
+        }
         auto& path = norm.path;
 
         // 3. Extract service name
@@ -193,8 +214,8 @@ public:
         }
 
         // 5. Rate limit check
-        if (rate_limiter_) {
-            auto decision = rate_limiter_->check_all(normalized_ip, path, service);
+        if (rate_limiter_copy) {
+            auto decision = rate_limiter_copy->check_all(normalized_ip, path, service);
             if (!decision.allowed) {
                 return {429, "too many requests", decision.retry_after_ms};
             }
@@ -234,8 +255,14 @@ public:
     }
 
     // Get rate limiter reference (for snapshot timer)
-    RateLimiter& rate_limiter() { return *rate_limiter_; }
-    bool has_rate_limiter() const { return rate_limiter_ != nullptr; }
+    std::shared_ptr<RateLimiter> rate_limiter_snapshot() const {
+        std::lock_guard<std::mutex> lock(rules_mu_);
+        return rate_limiter_;
+    }
+
+    bool has_rate_limiter() const {
+        return rate_limiter_snapshot() != nullptr;
+    }
 
     // Hot reload: reload from Config
     void reload(const Config& cfg) {
@@ -246,12 +273,12 @@ public:
     }
 
 private:
-    mutable std::mutex rules_mu_;  // protects trusted_proxies_ and jwt_auth_ concurrent read/write
+    mutable std::mutex rules_mu_;  // protects shared rule pointers and snapshot fields
     IpBlacklist ip_blacklist_;
     AuthWhitelist auth_whitelist_;
     PathBlacklist path_blacklist_;
     std::shared_ptr<JWTAuth> jwt_auth_;
-    std::unique_ptr<RateLimiter> rate_limiter_;
+    std::shared_ptr<RateLimiter> rate_limiter_;
     std::vector<std::string> trusted_proxies_;
     bool case_sensitive_paths_ = false;
 
@@ -361,5 +388,38 @@ private:
             if (rule.burst == 100.0) rule.burst = rule.rate;  // default burst = rate
         }
         return rule;
+    }
+
+    void normalize_path_items(std::vector<std::string>& items) const {
+        for (auto& item : items) {
+            if (!item.empty() && item.front() == '/') {
+                normalize_path_key(item);
+            } else if (!case_sensitive_paths_) {
+                std::transform(item.begin(), item.end(), item.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            }
+        }
+    }
+
+    void normalize_path_keys(std::vector<std::pair<std::string, std::string>>& items) const {
+        for (auto& [key, _] : items) {
+            normalize_path_key(key);
+        }
+    }
+
+    bool normalize_path_key(std::string& key) const {
+        if (key.empty() || key.front() != '/') {
+            return true;
+        }
+        bool prefix = key.size() > 1 && key.back() == '/';
+        auto norm = normalize_path(key, case_sensitive_paths_);
+        if (!norm.valid) {
+            LOG_WARN("Ignoring invalid security path rule: ", key, ", reason=", norm.error);
+            key.clear();
+            return false;
+        }
+        key = std::move(norm.path);
+        if (prefix && key.back() != '/') key.push_back('/');
+        return true;
     }
 };

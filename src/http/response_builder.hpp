@@ -28,6 +28,20 @@ inline bool http_response_has_no_body(std::string_view method, int status) {
         (status >= 100 && status < 200);
 }
 
+inline bool is_safe_header(const std::string& name, const std::string& value) {
+    for (char c : name) {
+        if (c == '\r' || c == '\n' || c == '\0' || c == ':') {
+            return false;
+        }
+    }
+    for (char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::string build_error_response(
     int status, std::string_view reason, std::string_view body) {
     std::string resp = "HTTP/1.1 ";
@@ -84,12 +98,14 @@ inline std::string build_downstream_response(
             }
             for (auto& [k, v] : ctx.response_headers) {
                 if (contains_header_name(filtered, k)) continue;
+                if (!is_safe_header(k, v)) continue;
                 resp += k + ": " + v + "\r\n";
                 if (header_iequals(k, "content-type")) has_content_type = true;
             }
         } else {
             for (auto& [k, v] : ctx.response_headers) {
                 if (header_iequals(k, "content-length") || is_hop_by_hop_header(k)) continue;
+                if (!is_safe_header(k, v)) continue;
                 resp += k + ": " + v + "\r\n";
                 if (header_iequals(k, "content-type")) has_content_type = true;
             }

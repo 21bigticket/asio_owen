@@ -79,3 +79,17 @@ TEST(ProxyForwarder, RejectsNulInHeaderValue) {
         "POST", "/config.ConfigService/Get", cfg, ctx, request_header_state);
     EXPECT_TRUE(request.empty());
 }
+
+TEST(ProxyForwarder, RejectsControlCharInHeaderName) {
+    UpstreamManager::UpstreamConfig cfg{"127.0.0.1", 30001};
+    HttpContext ctx;
+    ctx.headers = {
+        {"X-Bad\r\nInjected", "value"},
+        {"Content-Type", "application/json"}
+    };
+    HeaderParseState request_header_state;
+
+    auto request = build_proxy_request(
+        "POST", "/config.ConfigService/Get", cfg, ctx, request_header_state);
+    EXPECT_TRUE(request.empty());
+}

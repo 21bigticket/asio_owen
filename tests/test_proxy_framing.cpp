@@ -2,6 +2,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -16,6 +19,21 @@
 namespace {
 
 using tcp = asio::ip::tcp;
+
+Config make_upstream_config(const std::string& name, const std::string& host, int port) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_proxy_framing_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    {
+        std::ofstream out(path);
+        out << "[upstream]\n";
+        out << name << " = " << host << ":" << port << "\n";
+    }
+    Config cfg;
+    cfg.load_file(path);
+    std::filesystem::remove(path);
+    return cfg;
+}
 
 asio::awaitable<bool> read_request_headers(tcp::socket& socket) {
     asio::error_code ec;
@@ -133,8 +151,9 @@ std::string proxy_request_with(SpawnUpstream spawn_upstream, int read_timeout_ms
     pool_cfg.request_timeout_ms = 1000;
 
     HttpServer server(ioc, 0);
-    server.upstreams().add_upstream(
-        "svc", "127.0.0.1", upstream_acceptor.local_endpoint().port(), pool_cfg);
+    auto upstream_cfg = make_upstream_config(
+        "svc", "127.0.0.1", upstream_acceptor.local_endpoint().port());
+    server.upstreams().reload(upstream_cfg, pool_cfg);
 
     spawn_upstream(ioc, upstream_acceptor);
     co_spawn(ioc, server.start(), asio::detached);
@@ -250,8 +269,9 @@ TEST(ProxyFraming, OversizedUpstreamConnectionIsNotReused) {
     pool_cfg.request_timeout_ms = 1000;
 
     HttpServer server(ioc, 0);
-    server.upstreams().add_upstream(
-        "svc", "127.0.0.1", upstream_acceptor.local_endpoint().port(), pool_cfg);
+    auto upstream_cfg = make_upstream_config(
+        "svc", "127.0.0.1", upstream_acceptor.local_endpoint().port());
+    server.upstreams().reload(upstream_cfg, pool_cfg);
     auto route = server.upstreams().route("/svc/test");
     ASSERT_TRUE(route.has_value());
     auto pool_state = route->pool->state();

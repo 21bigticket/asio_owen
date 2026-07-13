@@ -71,7 +71,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     mysql_ = std::make_unique<MysqlPool>(ioc_, app_cfg.mysql);
     redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
     server_ = std::make_unique<HttpServer>(
-        ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms);
+        ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms,
+        app_cfg.client_header_read_timeout_ms);
 
     security_rules_ = std::make_unique<SecurityRules>();
     security_rules_->load_from_config(cfg);
@@ -96,22 +97,7 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
 }
 
 void Application::register_upstreams(const Config& cfg, const HttpPool::Config& http_pool_cfg) {
-    for (auto& [key, val] : cfg.get_section("upstream")) {
-        auto colon = val.find(':');
-        if (colon == std::string::npos) continue;
-
-        auto host = val.substr(0, colon);
-        auto port_str = val.substr(colon + 1);
-        if (port_str.empty()) continue;
-
-        try {
-            int port = std::stoi(port_str);
-            server_->upstreams().add_upstream(key, host, port, http_pool_cfg);
-            LOG_INFO("upstream ", key, " -> ", host, ":", port);
-        } catch (...) {
-            LOG_WARN("upstream ", key, ": invalid port '", port_str, "'");
-        }
-    }
+    server_->upstreams().reload(cfg, http_pool_cfg);
 }
 
 void Application::request_stop() {

@@ -233,16 +233,19 @@ public:
         }
         bool reserved_total = true;
 
-        std::unique_ptr<HttpConn> new_conn;
-        {
+        auto new_conn = std::make_unique<HttpConn>(state->ioc);
+        try {
             shard_idx = start_shard;
             auto& shard = state->shards[shard_idx];
             std::lock_guard lock(shard.mtx);
             ++shard.total;
             ++shard.in_flight;
-            new_conn = std::make_unique<HttpConn>(state->ioc);
             new_conn->shard_idx = shard_idx;
             shard.active.insert(new_conn.get());
+        } catch (...) {
+            if (reserved_total) decrement_counter(state->total_count);
+            if (reserved_in_flight) decrement_counter(state->in_flight_count);
+            throw;
         }
 
         try {

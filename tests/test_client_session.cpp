@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -18,6 +20,21 @@ using tcp = asio::ip::tcp;
 
 constexpr int kServerStartTimeoutMs = 500;
 constexpr int kClientReadTimeoutMs = 2000;
+
+Config make_upstream_config(const std::string& name, const std::string& host, int port) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_client_session_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    {
+        std::ofstream out(path);
+        out << "[upstream]\n";
+        out << name << " = " << host << ":" << port << "\n";
+    }
+    Config cfg;
+    cfg.load_file(path);
+    std::filesystem::remove(path);
+    return cfg;
+}
 
 // Send raw bytes to the server and read everything until EOF/short read.
 // Used for tests that don't depend on Content-Length framing for the response.
@@ -283,7 +300,8 @@ TEST_F(ClientSessionTest, ProxyUpstreamFailureReturns502) {
     pool_cfg.connect_timeout_ms = 100;
     pool_cfg.read_timeout_ms = 200;
     pool_cfg.request_timeout_ms = 200;
-    server().upstreams().add_upstream("dead", "127.0.0.1", 1, pool_cfg);
+    auto upstream_cfg = make_upstream_config("dead", "127.0.0.1", 1);
+    server().upstreams().reload(upstream_cfg, pool_cfg);
     start_server();
 
     auto resp = read_response_with_timeout(port(),

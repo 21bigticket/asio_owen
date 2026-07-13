@@ -79,7 +79,7 @@ inline std::string get_client_ip(
     try {
         direct_ip = socket.remote_endpoint().address().to_string();
     } catch (...) {
-        direct_ip = "unknown";
+        return "";
     }
 
     // Normalize direct IP for comparison (handles IPv6-mapped IPv4 like ::ffff:127.0.0.1)

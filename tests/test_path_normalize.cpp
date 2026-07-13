@@ -14,10 +14,22 @@ TEST(PathNormalize, ResolvesDotSegmentsAndPercentDecode) {
     EXPECT_EQ(normalized.path, "/api/health");
 }
 
-TEST(PathNormalize, PreservesEncodedSlash) {
+TEST(PathNormalize, RejectsEncodedSlash) {
     auto normalized = normalize_path("/api/foo%2Fbar");
 
-    EXPECT_EQ(normalized.path, "/api/foo%2fbar");
+    EXPECT_FALSE(normalized.valid);
+}
+
+TEST(PathNormalize, RejectsEncodedNul) {
+    auto normalized = normalize_path("/api/foo%00bar");
+
+    EXPECT_FALSE(normalized.valid);
+}
+
+TEST(PathNormalize, RejectsDoubleEncodingResidualPercent) {
+    auto normalized = normalize_path("/api/%252e%252e/admin");
+
+    EXPECT_FALSE(normalized.valid);
 }
 
 TEST(PathNormalize, CaseSensitiveModePreservesCase) {

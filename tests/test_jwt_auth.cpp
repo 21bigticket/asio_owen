@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -95,6 +96,16 @@ void write_file(const std::filesystem::path& path, const std::string& content) {
     out << content;
 }
 
+std::unique_ptr<asio::ip::tcp::socket> make_connected_socket(asio::io_context& ioc) {
+    asio::ip::tcp::acceptor acceptor(ioc, {asio::ip::make_address("127.0.0.1"), 0});
+    asio::ip::tcp::socket client(ioc);
+    auto endpoint = acceptor.local_endpoint();
+    client.connect(endpoint);
+    auto server_side = std::make_unique<asio::ip::tcp::socket>(ioc);
+    acceptor.accept(*server_side);
+    return server_side;
+}
+
 }  // namespace
 
 TEST(JWTAuth, RS256AcceptsValidToken) {
@@ -175,11 +186,41 @@ TEST(SecurityRules, RS256DoesNotRequireJwtSecretToEnableVerification) {
     rules.load_from_config(cfg);
 
     asio::io_context ioc;
-    asio::ip::tcp::socket socket(ioc);
-    auto result = rules.check(socket, "GET", "/zebra-config/config.ConfigService/Get",
+    auto socket = make_connected_socket(ioc);
+    auto result = rules.check(*socket, "GET", "/zebra-config/config.ConfigService/Get",
         "", "");
 
     EXPECT_EQ(result.status_code, 401);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, ExplicitHS256WithoutSecretFailsClosed) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_algorithm = HS256\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+
+    SecurityRules rules;
+    EXPECT_THROW(rules.load_from_config(cfg), std::invalid_argument);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, ExplicitRS256WithoutPublicKeyFailsClosed) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_algorithm = RS256\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+
+    SecurityRules rules;
+    EXPECT_THROW(rules.load_from_config(cfg), std::invalid_argument);
 
     std::filesystem::remove_all(base);
 }

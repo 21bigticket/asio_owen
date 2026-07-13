@@ -15,6 +15,7 @@ struct AppConfig {
     std::string log_file = "server.log";
     int server_port = 8080;
     int downstream_write_timeout_ms = 30000;
+    int client_header_read_timeout_ms = 10000;
     MysqlPool::Config mysql;
     RedisPool::Config redis;
     HttpPool::Config http_pool;
@@ -34,6 +35,7 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.log_file = cfg.get("server", "log_file", "server.log");
     app.server_port = cfg.get_int("server", "port", 8080);
     app.downstream_write_timeout_ms = cfg.get_int("server", "downstream_write_timeout_ms", 30000);
+    app.client_header_read_timeout_ms = cfg.get_int("server", "client_header_read_timeout_ms", 10000);
 
     app.mysql = MysqlPool::Config{
         .host = cfg.get("mysql", "host", "127.0.0.1"),

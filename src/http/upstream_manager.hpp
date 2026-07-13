@@ -28,12 +28,6 @@ public:
 
     explicit UpstreamManager(asio::io_context& ioc) : ioc_(ioc) {}
 
-    void add_upstream(const std::string& name, std::string host, int port,
-                      HttpPool::Config pool_cfg = HttpPool::Config{}) {
-        upstreams_[name] = {std::move(host), port};
-        pools_[name] = std::make_shared<HttpPool>(ioc_, std::move(pool_cfg));
-    }
-
     // Route /{service}/..., returns upstream config, shared pool, and path with service prefix stripped
     // example: /zebra-config/xxx -> service=zebra-config
     std::optional<RouteResult> route(const std::string& path) {
@@ -76,7 +70,7 @@ public:
                     LOG_INFO("upstream updated: ", name, " -> ", host, ":", port);
                 }
             } else {
-                add_upstream(name, host, port, pool_cfg);
+                add_upstream_locked(name, host, port, pool_cfg);
                 LOG_INFO("upstream added: ", name, " -> ", host, ":", port);
             }
         }
@@ -114,4 +108,10 @@ private:
     asio::io_context& ioc_;
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
     std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+
+    void add_upstream_locked(const std::string& name, std::string host, int port,
+                             const HttpPool::Config& pool_cfg = HttpPool::Config{}) {
+        upstreams_[name] = {std::move(host), port};
+        pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
+    }
 };

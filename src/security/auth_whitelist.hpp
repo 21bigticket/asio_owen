@@ -51,8 +51,18 @@ public:
     }
 
     bool is_whitelisted(const std::string& path, const std::string& service) const {
-        if (is_path_whitelisted(path)) return true;
-        if (!service.empty() && is_service_whitelisted(service)) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (exact_paths_ && exact_paths_->count(path)) {
+            return true;
+        }
+        if (prefix_paths_) {
+            for (auto& p : *prefix_paths_) {
+                if (path.find(p) == 0) return true;
+            }
+        }
+        if (!service.empty() && services_ && services_->count(service)) {
+            return true;
+        }
         return false;
     }
 

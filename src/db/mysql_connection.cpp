@@ -47,6 +47,20 @@ MYSQL* create_mysql_connection_with_timeout(const MysqlConnectionConfig& cfg) {
 
 int mysql_ping_with_timeout(MYSQL* conn, int read_timeout_ms) {
     ensure_mysql_thread_initialized();
-    (void)read_timeout_ms;
-    return mysql_ping(conn);
+    unsigned int ping_timeout_sec = static_cast<unsigned int>((read_timeout_ms + 999) / 1000);
+    if (ping_timeout_sec < 1) ping_timeout_sec = 1;
+
+    unsigned int old_timeout_sec = 0;
+    bool restore_timeout = mysql_get_option(conn, MYSQL_OPT_READ_TIMEOUT, &old_timeout_sec) == 0;
+
+    if (mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &ping_timeout_sec) != 0) {
+        LOG_WARN("MySQL ping timeout option failed: ", mysql_error(conn));
+    }
+    int rc = mysql_ping(conn);
+
+    if (restore_timeout &&
+        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &old_timeout_sec) != 0) {
+        LOG_WARN("MySQL ping timeout restore failed: ", mysql_error(conn));
+    }
+    return rc;
 }

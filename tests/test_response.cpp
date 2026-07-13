@@ -3,6 +3,7 @@
 #include <string>
 
 #include "http/response.hpp"
+#include "http/response_builder.hpp"
 
 TEST(Response, JsonEscapeHandlesBasicSpecialChars) {
     auto s = resp_err(500, "syntax error near \"WHERE\"");
@@ -49,4 +50,17 @@ TEST(Response, RespOkPassesRawData) {
     // resp_ok is for callers that have already-serialized JSON; verbatim splice.
     auto s = resp_ok("[1,2,3]");
     EXPECT_NE(s.find("\"data\":[1,2,3]"), std::string::npos) << s;
+}
+
+TEST(Response, DownstreamResponseDropsUnsafeHeaderValue) {
+    HttpContext ctx;
+    ctx.status_code = 200;
+    ctx.response_body = "{}";
+    ctx.response_headers.emplace_back("X-Good", "ok");
+    ctx.response_headers.emplace_back("X-Bad", "ok\r\nInjected: yes");
+
+    auto s = build_downstream_response(ctx, "GET", true);
+
+    EXPECT_NE(s.find("X-Good: ok\r\n"), std::string::npos) << s;
+    EXPECT_EQ(s.find("Injected: yes"), std::string::npos) << s;
 }

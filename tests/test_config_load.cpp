@@ -84,6 +84,20 @@ TEST(ConfigLoad, ParsesDownstreamWriteTimeout) {
     std::filesystem::remove_all(base);
 }
 
+TEST(ConfigLoad, ParsesClientHeaderReadTimeout) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "client_header_read_timeout_ms = 4321\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.client_header_read_timeout_ms, 4321);
+
+    std::filesystem::remove_all(base);
+}
+
 TEST(ConfigLoad, ParsesMysqlQueryTimeout) {
     auto base = make_temp_config_dir();
     write_file(base / "config.d" / "10-mysql.ini",

@@ -74,10 +74,16 @@ inline std::string build_proxy_request(
     add_connection_tokens(ctx.headers, filtered);
 
     bool forwarding_transfer_encoding = false;
-    // Pass 1: scan ALL header values for CR/LF/NUL (request-smuggling defense).
+    // Pass 1: scan ALL header names and values for control chars (request-smuggling defense).
     // Must complete the full scan before any break, otherwise a TE header followed
     // by a CR/LF-bearing header would slip through.
     for (auto& [k, v] : ctx.headers) {
+        for (char c : k) {
+            if (c == '\r' || c == '\n' || c == '\0' || c == ':') {
+                LOG_WARN("Rejecting request with invalid header name from path ", ctx.path);
+                return "";
+            }
+        }
         for (char c : v) {
             if (c == '\r' || c == '\n' || c == '\0') {
                 LOG_WARN("Rejecting request with control char in header ", k,

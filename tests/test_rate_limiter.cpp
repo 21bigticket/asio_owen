@@ -309,6 +309,26 @@ TEST(RateLimiter, UpdateConfigTakesEffectImmediately) {
     remove_if_exists(path);
 }
 
+TEST(RateLimiter, UpdateConfigClampsMaxBucketsBelowShardCount) {
+    auto path = make_tmp_snapshot_path("hot_reload_clamp");
+    remove_if_exists(path);
+    {
+        RateLimiter::Config cfg = make_test_config(path);
+        cfg.max_buckets = 64;
+        RateLimiter limiter(std::move(cfg));
+
+        RateLimiter::Config cfg2 = make_test_config(path);
+        cfg2.max_buckets = 1;
+        cfg2.ip_rps = 1.0;
+        cfg2.ip_burst = 1.0;
+        limiter.update_config(std::move(cfg2));
+
+        EXPECT_TRUE(limiter.check("9.9.9.11", 1.0, 1.0).allowed);
+        EXPECT_FALSE(limiter.check("9.9.9.11", 1.0, 1.0).allowed);
+    }
+    remove_if_exists(path);
+}
+
 // ============== Snapshot persistence ==============
 
 TEST(RateLimiter, SnapshotRoundTripPreservesBuckets) {

@@ -7,43 +7,48 @@
 // Normalized path result
 struct NormalizedPath {
     std::string path;   // normalized path (without query string)
+    bool valid = true;
+    std::string error;
 };
 
-// percent-decode, but preserve %2F/%2f as literals (do not decode as path separator)
-inline std::string percent_decode(std::string_view s) {
+inline bool is_hex_char(unsigned char c) {
+    return std::isxdigit(c) != 0;
+}
+
+inline int hex_value(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    return std::tolower(c) - 'a' + 10;
+}
+
+// Percent-decode path bytes. Encoded slash/backslash/NUL and residual percent
+// encodings are rejected so security checks see the same path shape as upstreams.
+inline NormalizedPath percent_decode(std::string_view s) {
     std::string result;
     result.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
         if (s[i] == '%' && i + 2 < s.size()) {
-            // preserve %2F/%2f (do not decode, keep as literal)
-            bool is_slash = (s[i+1] == '2') &&
-                            (s[i+2] == 'f' || s[i+2] == 'F');
-            if (is_slash) {
-                result += s[i];
-                result += s[i+1];
-                result += s[i+2];
-                i += 2;
-                continue;
-            }
-            // normal percent-decode for other sequences
             unsigned char uc1 = static_cast<unsigned char>(s[i+1]);
             unsigned char uc2 = static_cast<unsigned char>(s[i+2]);
-            int hi = std::isxdigit(uc1) ? (std::isdigit(uc1)
-                ? uc1 - '0' : std::tolower(uc1) - 'a' + 10) : -1;
-            int lo = std::isxdigit(uc2) ? (std::isdigit(uc2)
-                ? uc2 - '0' : std::tolower(uc2) - 'a' + 10) : -1;
-            if (hi >= 0 && lo >= 0) {
-                result += static_cast<char>((hi << 4) | lo);
-                i += 2;
-            } else {
-                // invalid percent-encoding (e.g. %GG), preserve original char
-                result += s[i];
+            if (!is_hex_char(uc1) || !is_hex_char(uc2)) {
+                return {"", false, "invalid percent encoding"};
             }
+            char decoded = static_cast<char>((hex_value(uc1) << 4) | hex_value(uc2));
+            if (decoded == '\0' || decoded == '/' || decoded == '\\') {
+                return {"", false, "unsafe encoded path separator or nul"};
+            }
+            result += decoded;
+            i += 2;
         } else {
+            if (s[i] == '\0' || s[i] == '\\') {
+                return {"", false, "unsafe path character"};
+            }
             result += s[i];
         }
     }
-    return result;
+    if (result.find('%') != std::string::npos) {
+        return {"", false, "residual percent encoding"};
+    }
+    return {std::move(result), true, ""};
 }
 
 // Normalize path: percent-decode + resolve dot-segments + collapse slashes + optional lowercase
@@ -58,7 +63,11 @@ inline NormalizedPath normalize_path(std::string_view path_only, bool case_sensi
     }
 
     // 1. percent-decode (%2F preserved as literal)
-    std::string decoded = percent_decode(path_only);
+    auto decoded_result = percent_decode(path_only);
+    if (!decoded_result.valid) {
+        return decoded_result;
+    }
+    std::string& decoded = decoded_result.path;
     if (decoded.empty()) {
         return {"/"};
     }

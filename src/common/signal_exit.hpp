@@ -1,11 +1,16 @@
 #pragma once
 #include <asio.hpp>
+#include <csignal>
 #include <functional>
 #include "logger.hpp"
 
 class SignalExit {
 public:
-    SignalExit(asio::io_context& ioc) : signals_(ioc, SIGINT, SIGTERM) {}
+    SignalExit(asio::io_context& ioc) : signals_(ioc, SIGINT, SIGTERM) {
+#ifdef SIGPIPE
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
+    }
 
     void on_exit(std::function<void()> cb) {
         exit_cb_ = std::move(cb);

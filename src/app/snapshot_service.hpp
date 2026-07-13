@@ -25,8 +25,8 @@ private:
         timer_.expires_after(std::chrono::seconds(interval_sec));
         timer_.async_wait([this, interval_sec](std::error_code ec) {
             if (ec || !running_) return;
-            if (security_rules_.has_rate_limiter()) {
-                security_rules_.rate_limiter().persist_snapshot();
+            if (auto limiter = security_rules_.rate_limiter_snapshot()) {
+                limiter->persist_snapshot();
             }
             if (running_) {
                 schedule(interval_sec);

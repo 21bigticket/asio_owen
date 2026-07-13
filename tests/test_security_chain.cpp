@@ -220,6 +220,29 @@ TEST_F(SecurityChainTest, PathBlacklistBlocksExactMatch) {
     EXPECT_EQ(r.reason, "path blocked");
 }
 
+TEST_F(SecurityChainTest, PathBlacklistNormalizesConfiguredCase) {
+    rules = build_rules("path_block_case",
+        "[security]\n"
+        "case_sensitive_paths = false\n"
+        "[path_blacklist]\n"
+        "/Admin =\n"
+        "[rate_limit]\n"
+        "ip_rps = 10000\n"
+        "ip_burst = 10000\n"
+        "global_rps = 100000\n"
+        "max_buckets = 1024\n");
+
+    auto r = rules->check(*server_side, "GET", "/ADMIN", "", "");
+    EXPECT_EQ(r.status_code, 403);
+    EXPECT_EQ(r.reason, "path blocked");
+}
+
+TEST_F(SecurityChainTest, RejectsUnsafeEncodedPath) {
+    auto r = rules->check(*server_side, "GET", "/api/foo%2F..%2Fadmin", "", "");
+    EXPECT_EQ(r.status_code, 400);
+    EXPECT_EQ(r.reason, "invalid path");
+}
+
 TEST_F(SecurityChainTest, PathBlacklistPrefixMatchesAtSegmentBoundary) {
     rules = build_rules("path_prefix",
         "[security]\n"
