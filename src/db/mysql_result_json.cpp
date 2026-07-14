@@ -32,8 +32,32 @@ void append_json_string(std::string& out, const char* data, unsigned long len) {
                     out += "\\u00";
                     out += kHex[(c >> 4) & 0x0f];
                     out += kHex[c & 0x0f];
-                } else {
+                } else if (c < 0x80) {
                     out += static_cast<char>(c);
+                } else {
+                    // Multibyte: validate the UTF-8 sequence. Valid sequences are
+                    // copied through byte-for-byte (real UTF-8 text is unchanged).
+                    // Invalid bytes (latin1 / raw BLOB columns) would otherwise
+                    // emit malformed UTF-8 and make the whole JSON document
+                    // undecodable, so they are replaced with U+FFFD (�).
+                    int extra;
+                    if ((c & 0xE0) == 0xC0)      extra = 1;  // 110xxxxx
+                    else if ((c & 0xF0) == 0xE0) extra = 2;  // 1110xxxx
+                    else if ((c & 0xF8) == 0xF0) extra = 3;  // 11110xxx
+                    else                         extra = -1; // 10xxxxxx / 0xF8+
+
+                    bool valid = extra > 0 && (i + static_cast<unsigned long>(extra) < len);
+                    for (int k = 1; valid && k <= extra; ++k) {
+                        if ((static_cast<unsigned char>(data[i + k]) & 0xC0) != 0x80) {
+                            valid = false;
+                        }
+                    }
+                    if (valid) {
+                        for (int k = 0; k <= extra; ++k) out += data[i + k];
+                        i += static_cast<unsigned long>(extra);
+                    } else {
+                        out += "\\ufffd";
+                    }
                 }
                 break;
         }

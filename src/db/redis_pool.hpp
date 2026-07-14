@@ -6,7 +6,6 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <cstdarg>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -102,30 +101,12 @@ public:
         return format_redis_pool_stats(snapshot());
     }
 
-    [[deprecated("Use cmd_argv() for commands carrying dynamic arguments")]]
-    asio::awaitable<Reply> cmd(const char* fmt, ...) {
-        va_list ap;
-        va_start(ap, fmt);
-
-        va_list ap_copy;
-        va_copy(ap_copy, ap);
-        int len = vsnprintf(nullptr, 0, fmt, ap_copy);
-        va_end(ap_copy);
-
-        if (len < 0) {
-            va_end(ap);
-            stats_.inc_cmd_fail();
-            return immediate_error("failed to format Redis command");
-        }
-
-        std::vector<char> buffer(static_cast<size_t>(len) + 1);
-        vsnprintf(buffer.data(), buffer.size(), fmt, ap);
-        va_end(ap);
-
-        std::string cmdline(buffer.data(), static_cast<size_t>(len));
-        return do_cmd(std::move(cmdline));
-    }
-
+    // NOTE: the former printf-style cmd(fmt, ...) was removed. It expanded the
+    // format string and then passed the *result* back to redisCommand() as a
+    // second format string, so any '%' in dynamic data was reparsed —
+    // crash / memory corruption / command injection. Use cmd_argv() instead,
+    // which routes every argument through redisCommandArgv() (binary-safe, no
+    // format reparse).
     asio::awaitable<Reply> cmd_argv(std::vector<std::string> args) {
         if (!running_) {
             co_return make_error("redis pool is shutdown");
@@ -458,54 +439,17 @@ private:
         }
 
         ConnectionGuard guard(this, ctx);
-        redisReply* reply = static_cast<redisReply*>(redisCommand(ctx, "GET %s", key));
+        // Route through redisCommandArgv (binary-safe, no format reparse) rather
+        // than redisCommand(ctx, "GET %s", key), whose %s runs strlen() and would
+        // truncate a key containing an embedded NUL.
+        RedisCommandArgv command(std::vector<std::string>{"GET", std::string(key)});
+        redisReply* reply = static_cast<redisReply*>(
+            redisCommandArgv(ctx, command.argc(), command.argv.data(), command.argv_len.data()));
         const int saved_errno = errno;
 
         if (!reply) {
             std::string err = fill_error_if_empty(ctx);
             LOG_WARN("Redis GET failed: ", err);
-            record_command_failure(ctx, saved_errno, err);
-            guard.drop();
-            return make_error(std::move(err));
-        }
-
-        RedisReplyGuard reply_guard(reply);
-        Reply r;
-        parse_redis_reply(reply_guard.get(), r);
-        record_command_result(r);
-        return r;
-    }
-
-    asio::awaitable<Reply> do_cmd(std::string cmdline) {
-        if (!running_) {
-            co_return make_error("redis pool is shutdown");
-        }
-        if (cfg_.mode == Mode::Direct) {
-            co_return do_cmd_sync(cmdline.c_str());
-        }
-
-        // Worker mode: switch executor only — cmdline stays in the coroutine frame.
-        co_await asio::post(*worker_pool_, asio::use_awaitable);
-        if (!running_) {
-            co_return make_error("redis pool is shutdown");
-        }
-        co_return do_cmd_sync(cmdline.c_str());
-    }
-
-    Reply do_cmd_sync(const char* cmdline) {
-        redisContext* ctx = acquire_conn();
-        if (!ctx) {
-            stats_.inc_cmd_fail();
-            return make_error("no available Redis connection");
-        }
-
-        ConnectionGuard guard(this, ctx);
-        redisReply* reply = static_cast<redisReply*>(redisCommand(ctx, cmdline));
-        const int saved_errno = errno;
-
-        if (!reply) {
-            std::string err = fill_error_if_empty(ctx);
-            LOG_WARN("Redis cmd failed: ", err);
             record_command_failure(ctx, saved_errno, err);
             guard.drop();
             return make_error(std::move(err));
@@ -658,10 +602,6 @@ private:
 
     Reply make_error(std::string msg) const {
         return Reply{false, std::move(msg), "", 0};
-    }
-
-    asio::awaitable<Reply> immediate_error(std::string msg) {
-        co_return make_error(std::move(msg));
     }
 
     void record_command_result(const Reply& r) {

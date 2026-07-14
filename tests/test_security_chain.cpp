@@ -93,6 +93,7 @@ protected:
         rules = build_rules("setup",
             "[security]\n"
             "case_sensitive_paths = false\n"
+            "jwt_disabled = true\n"
             "[rate_limit]\n"
             "ip_rps = 10000\n"
             "ip_burst = 10000\n"
@@ -123,6 +124,7 @@ TEST_F(SecurityChainTest, IpBlacklistBlocksLoopback) {
     rules = build_rules("ip_block",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[ip_blacklist]\n"
         "loopback = 127.0.0.0/8\n"
         "[rate_limit]\n"
@@ -141,6 +143,7 @@ TEST_F(SecurityChainTest, IpBlacklistExtractsRealIpFromXff) {
     rules = build_rules("xff_block",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[trusted_proxies]\n"
         "trusted = 127.0.0.1\n"
         "[ip_blacklist]\n"
@@ -207,6 +210,7 @@ TEST_F(SecurityChainTest, PathBlacklistBlocksExactMatch) {
     rules = build_rules("path_block",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[path_blacklist]\n"
         "/api/internal =\n"
         "[rate_limit]\n"
@@ -224,6 +228,7 @@ TEST_F(SecurityChainTest, PathBlacklistNormalizesConfiguredCase) {
     rules = build_rules("path_block_case",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[path_blacklist]\n"
         "/Admin =\n"
         "[rate_limit]\n"
@@ -247,6 +252,7 @@ TEST_F(SecurityChainTest, PathBlacklistPrefixMatchesAtSegmentBoundary) {
     rules = build_rules("path_prefix",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[path_blacklist]\n"
         "/api/internal/ =\n"
         "[rate_limit]\n"

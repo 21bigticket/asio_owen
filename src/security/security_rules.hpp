@@ -24,6 +24,15 @@ class SecurityRules {
 public:
     // Load all rules from Config
     void load_from_config(const Config& cfg) {
+        // Build + validate the JWT config FIRST, into a local. This is the only
+        // step that can throw (fail-closed on missing secret/key). Doing it
+        // before mutating any member state keeps load_from_config atomic on
+        // hot-reload: a bad new config throws here and leaves the existing
+        // blacklists / whitelists / rate limits untouched, rather than applying
+        // half of them and then aborting.
+        bool jwt_disabled = false;
+        auto new_jwt = build_jwt_auth(cfg, jwt_disabled);  // throws on invalid config
+
         // 0. Path case-sensitivity config
         {
             case_sensitive_paths_ = cfg.get("security", "case_sensitive_paths", "false") == "true";
@@ -60,57 +69,10 @@ public:
             path_blacklist_.reload(items);
         }
 
-        // 5. JWT config
-        {
-            auto secret = cfg.get("security", "jwt_secret", "");
-            auto issuer = cfg.get("security", "jwt_issuer", "asio_owen");
-            auto configured_algorithm = cfg.get("security", "jwt_algorithm", "");
-            auto algorithm = configured_algorithm.empty() ? "HS256" : configured_algorithm;
-            auto pub_key = cfg.get("security", "jwt_public_key", "");
-            // Try to load public key from file if it's not already a PEM string
-            if (!pub_key.empty() && pub_key.find("-----BEGIN") == std::string::npos) {
-                std::ifstream key_file(pub_key);
-                if (key_file.is_open()) {
-                    std::stringstream buf;
-                    buf << key_file.rdbuf();
-                    auto loaded = buf.str();
-                    if (loaded.find("-----BEGIN") != std::string::npos) {
-                        pub_key = loaded;
-                    }
-                } else {
-                    LOG_WARN("JWT public key file not found: ", pub_key);
-                    pub_key.clear();
-                }
-            }
-            if (pub_key.empty() && algorithm == "RS256") {
-                // RS256 without explicit pub_key: build from JWKS n/e params
-                auto n = cfg.get("security", "jwt_rsa_n", "");
-                auto e = cfg.get("security", "jwt_rsa_e", "");
-                if (!n.empty() && !e.empty()) {
-                    pub_key = detail::build_rsa_pubkey_from_jwks(n, e);
-                    if (pub_key.empty()) {
-                        LOG_WARN("JWT: failed to build RSA public key from jwks params");
-                    } else {
-                        LOG_INFO("JWT: built RSA public key from jwks params, len=", pub_key.size());
-                        LOG_DEBUG("JWT PEM:\n", pub_key);
-                    }
-                }
-            }
-            if (algorithm == "HS256" && secret.empty()) {
-                if (!configured_algorithm.empty()) {
-                    throw std::invalid_argument("JWT HS256 configured without jwt_secret");
-                }
-                jwt_auth_.reset();
-                LOG_WARN("JWT secret not configured, JWT verification disabled");
-            } else if (algorithm == "RS256" && pub_key.empty()) {
-                if (!configured_algorithm.empty()) {
-                    throw std::invalid_argument("JWT RS256 configured without jwt_public_key or jwks params");
-                }
-                jwt_auth_.reset();
-                LOG_WARN("JWT public key not configured for RS256, JWT verification disabled");
-            } else {
-                jwt_auth_ = std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
-            }
+        // 5. JWT config (already validated/built above; just publish it)
+        jwt_auth_ = std::move(new_jwt);
+        if (jwt_disabled) {
+            LOG_WARN("JWT verification explicitly disabled via security.jwt_disabled=true");
         }
 
         // 6. Rate limit config
@@ -268,11 +230,80 @@ public:
     void reload(const Config& cfg) {
         // Write lock: prevents check() from reading incomplete state
         std::lock_guard<std::mutex> lock(rules_mu_);
-        load_from_config(cfg);
-        LOG_INFO("Security rules hot-reloaded");
+        try {
+            load_from_config(cfg);
+            LOG_INFO("Security rules hot-reloaded");
+        } catch (const std::exception& e) {
+            // load_from_config throws when the new config would disable auth
+            // implicitly (missing jwt_secret / jwt_public_key). At startup that
+            // aborts boot by design; on hot-reload we must NOT terminate a
+            // running server — keep the previously-loaded rules and warn.
+            LOG_ERROR("Security rules hot-reload rejected, keeping previous rules: ", e.what());
+        }
     }
 
 private:
+    // Parse + validate the JWT section into a JWTAuth (or nullptr when auth is
+    // explicitly disabled). Throws std::invalid_argument on a fail-open config
+    // (missing secret/key without jwt_disabled). Pure w.r.t. member state, so
+    // callers can build it before mutating anything.
+    static std::shared_ptr<JWTAuth> build_jwt_auth(const Config& cfg, bool& jwt_disabled_out) {
+        auto secret = cfg.get("security", "jwt_secret", "");
+        auto issuer = cfg.get("security", "jwt_issuer", "asio_owen");
+        auto configured_algorithm = cfg.get("security", "jwt_algorithm", "");
+        auto algorithm = configured_algorithm.empty() ? "HS256" : configured_algorithm;
+        // Disabling authentication must be an explicit, auditable decision.
+        // Previously a missing jwt_secret / jwt_public_key silently disabled JWT
+        // for the whole server (fail-OPEN). Now the only way to run without JWT
+        // is security.jwt_disabled=true.
+        bool jwt_disabled = cfg.get_bool("security", "jwt_disabled", false);
+        jwt_disabled_out = jwt_disabled;
+        auto pub_key = cfg.get("security", "jwt_public_key", "");
+        // Try to load public key from file if it's not already a PEM string
+        if (!pub_key.empty() && pub_key.find("-----BEGIN") == std::string::npos) {
+            std::ifstream key_file(pub_key);
+            if (key_file.is_open()) {
+                std::stringstream buf;
+                buf << key_file.rdbuf();
+                auto loaded = buf.str();
+                if (loaded.find("-----BEGIN") != std::string::npos) {
+                    pub_key = loaded;
+                }
+            } else {
+                LOG_WARN("JWT public key file not found: ", pub_key);
+                pub_key.clear();
+            }
+        }
+        if (pub_key.empty() && algorithm == "RS256") {
+            // RS256 without explicit pub_key: build from JWKS n/e params
+            auto n = cfg.get("security", "jwt_rsa_n", "");
+            auto e = cfg.get("security", "jwt_rsa_e", "");
+            if (!n.empty() && !e.empty()) {
+                pub_key = detail::build_rsa_pubkey_from_jwks(n, e);
+                if (pub_key.empty()) {
+                    LOG_WARN("JWT: failed to build RSA public key from jwks params");
+                } else {
+                    LOG_INFO("JWT: built RSA public key from jwks params, len=", pub_key.size());
+                    LOG_DEBUG("JWT PEM:\n", pub_key);
+                }
+            }
+        }
+        if (jwt_disabled) {
+            return nullptr;
+        }
+        if (algorithm == "HS256" && secret.empty()) {
+            // fail-closed: refuse to start rather than silently allow all traffic
+            throw std::invalid_argument(
+                "JWT HS256 requires jwt_secret; set security.jwt_disabled=true to run without auth");
+        }
+        if (algorithm == "RS256" && pub_key.empty()) {
+            throw std::invalid_argument(
+                "JWT RS256 requires jwt_public_key or jwks params; "
+                "set security.jwt_disabled=true to run without auth");
+        }
+        return std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
+    }
+
     mutable std::mutex rules_mu_;  // protects shared rule pointers and snapshot fields
     IpBlacklist ip_blacklist_;
     AuthWhitelist auth_whitelist_;

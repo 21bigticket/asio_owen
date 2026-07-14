@@ -294,7 +294,7 @@ public:
                 shard.active.erase(conn.get());
             }
             decrement_counter(state->total_count);
-            decrement_counter(state->in_flight_count);
+            release_in_flight(state);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -308,7 +308,7 @@ public:
                 shard.active.erase(conn.get());
             }
             decrement_counter(state->total_count);
-            decrement_counter(state->in_flight_count);
+            release_in_flight(state);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -319,7 +319,7 @@ public:
             shard.idle.push_back(std::move(*conn));
             --shard.in_flight;
         }
-        decrement_counter(state->in_flight_count);
+        release_in_flight(state);
         state->released_idle.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -340,7 +340,7 @@ public:
             shard.active.erase(conn.get());
         }
         decrement_counter(state->total_count);
-        decrement_counter(state->in_flight_count);
+        release_in_flight(state);
         state->released_bad.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -403,6 +403,15 @@ private:
                     cur, cur - 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 return;
             }
+        }
+    }
+
+    // acquire() only increments in_flight_count when max_concurrent > 0
+    // (otherwise the reservation is skipped entirely). Release must mirror that,
+    // or the counter drifts negative-clamped-at-0 and the stat is meaningless.
+    static void release_in_flight(const std::shared_ptr<State>& state) {
+        if (state->cfg.max_concurrent > 0) {
+            decrement_counter(state->in_flight_count);
         }
     }
 

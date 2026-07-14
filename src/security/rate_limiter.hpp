@@ -216,10 +216,19 @@ public:
         // prevent concurrent persist from destructor and timer
         if (snapshot_busy_.exchange(true)) return;
 
+        // Snapshot the path under cfg_mu_. update_config() may rewrite cfg_
+        // (including snapshot_path, a std::string) concurrently from the
+        // reload thread; reading it unlocked is a data race / UB.
+        std::string snapshot_path;
+        {
+            std::lock_guard<std::mutex> lock(cfg_mu_);
+            snapshot_path = cfg_.snapshot_path;
+        }
+
         // Ensure parent directory exists for snapshot file
-        auto parent_end = cfg_.snapshot_path.find_last_of('/');
+        auto parent_end = snapshot_path.find_last_of('/');
         if (parent_end != std::string::npos && parent_end > 0) {
-            auto dir = cfg_.snapshot_path.substr(0, parent_end);
+            auto dir = snapshot_path.substr(0, parent_end);
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             // silent failure -- write_snapshot will log WARN if it fails
@@ -233,9 +242,9 @@ public:
             snap.shards.push_back(shards_[i].buckets);
         }
 
-        auto tmp = cfg_.snapshot_path + ".tmp";
+        auto tmp = snapshot_path + ".tmp";
         if (write_snapshot(tmp, snap)) {
-            if (std::rename(tmp.c_str(), cfg_.snapshot_path.c_str()) != 0) {
+            if (std::rename(tmp.c_str(), snapshot_path.c_str()) != 0) {
                 LOG_WARN("rate_limit: snapshot rename failed");
             }
         }

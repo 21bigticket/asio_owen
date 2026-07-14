@@ -16,6 +16,7 @@ struct AppConfig {
     int server_port = 8080;
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
+    int client_body_read_timeout_ms = 30000;
     MysqlPool::Config mysql;
     RedisPool::Config redis;
     HttpPool::Config http_pool;
@@ -23,6 +24,22 @@ struct AppConfig {
     int reload_interval_sec = 30;
     int http_pool_stats_interval_sec = 30;
 };
+
+// Parse the [http_pool] section into an HttpPool::Config. Factored out so the
+// hot-reload path (ReloadService) can re-read it on every reload instead of
+// being stuck with the value captured at startup.
+inline HttpPool::Config http_pool_config_from(const Config& cfg) {
+    return HttpPool::Config{
+        .max_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_size", 256))),
+        .max_concurrent = static_cast<size_t>(std::max(0, cfg.get_int("http_pool", "max_concurrent", 0))),
+        .max_body_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_body_size", 10 * 1024 * 1024))),
+        .connect_timeout_ms = cfg.get_int("http_pool", "connect_timeout_ms", 1000),
+        .read_timeout_ms = cfg.get_int("http_pool", "read_timeout_ms", 30000),
+        .request_timeout_ms = cfg.get_int("http_pool", "request_timeout_ms", 60000),
+        .idle_timeout_sec = cfg.get_int("http_pool", "idle_timeout_sec", 60),
+        .send_keep_alive_header = cfg.get_bool("http_pool", "send_keep_alive_header", false)
+    };
+}
 
 inline AppConfig app_config_from(const Config& cfg) {
     AppConfig app;
@@ -36,6 +53,7 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.server_port = cfg.get_int("server", "port", 8080);
     app.downstream_write_timeout_ms = cfg.get_int("server", "downstream_write_timeout_ms", 30000);
     app.client_header_read_timeout_ms = cfg.get_int("server", "client_header_read_timeout_ms", 10000);
+    app.client_body_read_timeout_ms = cfg.get_int("server", "client_body_read_timeout_ms", 30000);
 
     app.mysql = MysqlPool::Config{
         .host = cfg.get("mysql", "host", "127.0.0.1"),
@@ -78,16 +96,7 @@ inline AppConfig app_config_from(const Config& cfg) {
         .acquire_timeout_ms = cfg.get_int("redis", "acquire_timeout_ms", 3000)
     };
 
-    app.http_pool = HttpPool::Config{
-        .max_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_size", 256))),
-        .max_concurrent = static_cast<size_t>(std::max(0, cfg.get_int("http_pool", "max_concurrent", 0))),
-        .max_body_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_body_size", 10 * 1024 * 1024))),
-        .connect_timeout_ms = cfg.get_int("http_pool", "connect_timeout_ms", 1000),
-        .read_timeout_ms = cfg.get_int("http_pool", "read_timeout_ms", 30000),
-        .request_timeout_ms = cfg.get_int("http_pool", "request_timeout_ms", 60000),
-        .idle_timeout_sec = cfg.get_int("http_pool", "idle_timeout_sec", 60),
-        .send_keep_alive_header = cfg.get_bool("http_pool", "send_keep_alive_header", false)
-    };
+    app.http_pool = http_pool_config_from(cfg);
 
     app.snapshot_interval_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
     app.reload_interval_sec = cfg.get_int("security", "config_reload_interval_sec", 30);

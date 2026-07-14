@@ -18,6 +18,7 @@
 #include "http_protocol.hpp"
 #include "json_transform.hpp"
 #include "proxy_forwarder.hpp"
+#include "response.hpp"
 #include "response_builder.hpp"
 #include "upstream_manager.hpp"
 
@@ -27,10 +28,12 @@ struct HttpServerState {
     explicit HttpServerState(
         asio::io_context& ioc,
         int downstream_write_timeout_ms = 30000,
-        int client_header_read_timeout_ms = 10000)
+        int client_header_read_timeout_ms = 10000,
+        int client_body_read_timeout_ms = 30000)
         : upstreams(ioc),
           downstream_write_timeout_ms(downstream_write_timeout_ms),
-          client_header_read_timeout_ms(client_header_read_timeout_ms) {}
+          client_header_read_timeout_ms(client_header_read_timeout_ms),
+          client_body_read_timeout_ms(client_body_read_timeout_ms) {}
 
     std::unordered_map<std::string, Handler> routes;
     std::atomic<bool> running{true};
@@ -38,12 +41,21 @@ struct HttpServerState {
     SecurityRules* security_rules = nullptr;
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
+    int client_body_read_timeout_ms = 30000;
 };
 
 class ClientSession {
 public:
     explicit ClientSession(std::shared_ptr<HttpServerState> state)
         : state_(std::move(state)) {}
+
+    // Only these methods are safe to auto-replay on a stale-idle upstream
+    // connection. Replaying POST/PATCH after the request may already have been
+    // delivered would double-submit (RFC 7231 §4.2.2 idempotency).
+    static bool is_idempotent_method(const std::string& m) {
+        return m == "GET" || m == "HEAD" || m == "OPTIONS" ||
+               m == "PUT" || m == "DELETE" || m == "TRACE";
+    }
 
     asio::awaitable<void> run(asio::ip::tcp::socket socket) {
         int final_error_status = 0;
@@ -53,7 +65,7 @@ public:
             char buf[kClientReadBufferSize];
             std::string client_preread;
             auto client_header_timeout = std::chrono::milliseconds(state_->client_header_read_timeout_ms);
-            auto client_body_timeout = 30s;
+            auto client_body_timeout = std::chrono::milliseconds(state_->client_body_read_timeout_ms);
 
             while (state_->running) {
                 while (client_preread.find("\r\n\r\n") == std::string::npos) {
@@ -207,9 +219,10 @@ public:
                         socket, method_str, path_str, xff, auth);
                     if (result.status_code != 0) {
                         ctx.status_code = result.status_code;
-                        ctx.response_body = "{\"code\":"
-                            + std::to_string(result.status_code)
-                            + ",\"msg\":\"" + result.reason + "\"}";
+                        // json_resp escapes reason; a future reason containing
+                        // '"' would otherwise produce malformed JSON (same class
+                        // as the fixed response.hpp C1 bug).
+                        ctx.response_body = json_resp(result.status_code, result.reason);
                         if (result.status_code == 429 && result.retry_after_ms > 0) {
                             int retry_sec = static_cast<int>(
                                 std::ceil(result.retry_after_ms / 1000.0));
@@ -262,7 +275,8 @@ public:
 
                                 ConnGuard guard(pool, std::move(conn_opt));
                                 auto& conn = guard.conn();
-                                bool can_retry_stale_idle = conn.reused_from_idle && attempt == 0;
+                                bool can_retry_stale_idle = conn.reused_from_idle && attempt == 0
+                                                            && is_idempotent_method(method_str);
 
                                 LOG_DEBUG("Proxy request: method=", method_str,
                                     ", path=", path_str,

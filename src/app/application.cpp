@@ -34,6 +34,16 @@ int Application::run(int argc, char* argv[]) {
     LOG_INFO("Server starting...");
     LOG_INFO("Build marker: gateway-debug-20260703-client-close-trace");
 
+    // Declared outside the try so the catch path can join any worker threads
+    // that were already spawned before rethrowing. Otherwise a throw between
+    // spawn and join would run their std::thread destructors on a still-running
+    // io_context -> std::terminate / data race during unwind.
+    std::vector<std::thread> threads;
+    auto join_all = [&threads]() {
+        for (auto& t : threads) {
+            if (t.joinable()) t.join();
+        }
+    };
     try {
         initialize(cfg, app_cfg, config_base);
 
@@ -44,7 +54,6 @@ int Application::run(int argc, char* argv[]) {
             request_stop();
         });
 
-        std::vector<std::thread> threads;
         unsigned int thread_count = std::thread::hardware_concurrency();
         if (thread_count == 0) thread_count = 4;
         for (unsigned int i = 1; i < thread_count; ++i) {
@@ -52,15 +61,14 @@ int Application::run(int argc, char* argv[]) {
         }
         ioc_.run();
 
-        for (auto& t : threads) {
-            if (t.joinable()) t.join();
-        }
+        join_all();
 
         cleanup();
         LOG_INFO("Server exited");
         return 0;
     } catch (...) {
         ioc_.stop();
+        join_all();
         cleanup();
         throw;
     }
@@ -72,7 +80,7 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
     server_ = std::make_unique<HttpServer>(
         ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms,
-        app_cfg.client_header_read_timeout_ms);
+        app_cfg.client_header_read_timeout_ms, app_cfg.client_body_read_timeout_ms);
 
     security_rules_ = std::make_unique<SecurityRules>();
     security_rules_->load_from_config(cfg);
@@ -92,7 +100,7 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     pool_stats_service_->start(app_cfg.http_pool_stats_interval_sec);
 
     reload_service_ = std::make_unique<ReloadService>(
-        ioc_, config_base, *security_rules_, server_->upstreams(), app_cfg.http_pool);
+        ioc_, config_base, *security_rules_, server_->upstreams());
     reload_service_->start(app_cfg.reload_interval_sec);
 }
 

@@ -282,6 +282,10 @@ private:
                 .with_issuer(issuer_)
                 .leeway(60);
             verifier.verify(decoded);
+            // jwt-cpp treats exp as optional, so a token with no exp would be
+            // accepted as permanently valid. Enforce exp explicitly, matching
+            // the RS256 path (verify_registered_claims throws on missing exp).
+            verify_registered_claims(decoded);
         } else if (algorithm_ == "RS256") {
             // Manual RS256 path — see verify_rs256() comment for the macOS
             // OpenSSL 3.x issue that forces us to bypass jwt-cpp here.
