@@ -272,6 +272,7 @@ TEST_F(SecurityChainTest, RateLimitReturns429WhenBurstExhausted) {
     rules = build_rules("rl_tight",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[rate_limit]\n"
         "ip_rps = 1\n"
         "ip_burst = 1\n"
@@ -320,6 +321,7 @@ TEST_F(SecurityChainTest, ReloadUpdatesRulesHot) {
     write_file(base / "config.d" / "00-test.ini",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[rate_limit]\n"
         "ip_rps = 10000\n"
         "ip_burst = 10000\n"
@@ -338,6 +340,7 @@ TEST_F(SecurityChainTest, ReloadUpdatesRulesHot) {
     write_file(base / "config.d" / "00-test.ini",
         "[security]\n"
         "case_sensitive_paths = false\n"
+        "jwt_disabled = true\n"
         "[ip_blacklist]\n"
         "lb = 127.0.0.0/8\n"
         "[rate_limit]\n"

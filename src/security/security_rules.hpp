@@ -248,6 +248,15 @@ private:
     // (missing secret/key without jwt_disabled). Pure w.r.t. member state, so
     // callers can build it before mutating anything.
     static std::shared_ptr<JWTAuth> build_jwt_auth(const Config& cfg, bool& jwt_disabled_out) {
+        // Check jwt_disabled FIRST before any validation, so disabled mode can skip
+        // secret/key requirements entirely (fixes test failures where jwt_disabled=true
+        // but algorithm defaults to HS256 without secret).
+        bool jwt_disabled = cfg.get_bool("security", "jwt_disabled", false);
+        jwt_disabled_out = jwt_disabled;
+        if (jwt_disabled) {
+            return nullptr;
+        }
+
         auto secret = cfg.get("security", "jwt_secret", "");
         auto issuer = cfg.get("security", "jwt_issuer", "asio_owen");
         auto configured_algorithm = cfg.get("security", "jwt_algorithm", "");
@@ -256,8 +265,6 @@ private:
         // Previously a missing jwt_secret / jwt_public_key silently disabled JWT
         // for the whole server (fail-OPEN). Now the only way to run without JWT
         // is security.jwt_disabled=true.
-        bool jwt_disabled = cfg.get_bool("security", "jwt_disabled", false);
-        jwt_disabled_out = jwt_disabled;
         auto pub_key = cfg.get("security", "jwt_public_key", "");
         // Try to load public key from file if it's not already a PEM string
         if (!pub_key.empty() && pub_key.find("-----BEGIN") == std::string::npos) {
@@ -287,9 +294,6 @@ private:
                     LOG_DEBUG("JWT PEM:\n", pub_key);
                 }
             }
-        }
-        if (jwt_disabled) {
-            return nullptr;
         }
         if (algorithm == "HS256" && secret.empty()) {
             // fail-closed: refuse to start rather than silently allow all traffic

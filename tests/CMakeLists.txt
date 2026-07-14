@@ -46,6 +46,11 @@ add_executable(test_http_pool test_http_pool.cpp)
 target_link_libraries(test_http_pool PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_http_pool)
 
+# 安全漏洞修复回归测试 (VULN-1 in_flight 统计, VULN-2 非幂等重试)
+add_executable(test_vuln_fixes test_vuln_fixes.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)
+target_link_libraries(test_vuln_fixes PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_vuln_fixes)
+
 # 配置目录加载
 add_executable(test_config_load test_config_load.cpp)
 target_link_libraries(test_config_load PRIVATE gtest_main asio_owen_core)

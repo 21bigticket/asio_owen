@@ -52,9 +52,11 @@ public:
     // Only these methods are safe to auto-replay on a stale-idle upstream
     // connection. Replaying POST/PATCH after the request may already have been
     // delivered would double-submit (RFC 7231 §4.2.2 idempotency).
+    // VULN-2 fix: Only truly idempotent methods (safe to retry on stale connections).
+    // PUT and DELETE are theoretically idempotent but often have side effects in practice
+    // (e.g., counters, audit logs), so we exclude them from automatic retry.
     static bool is_idempotent_method(const std::string& m) {
-        return m == "GET" || m == "HEAD" || m == "OPTIONS" ||
-               m == "PUT" || m == "DELETE" || m == "TRACE";
+        return m == "GET" || m == "HEAD" || m == "OPTIONS" || m == "TRACE";
     }
 
     asio::awaitable<void> run(asio::ip::tcp::socket socket) {

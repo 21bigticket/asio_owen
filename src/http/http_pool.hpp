@@ -170,12 +170,18 @@ public:
         // Reserve in-flight slot once at entry, instead of inside the idle-pop loop.
         // This fixes a bug where max_concurrent check in the while-loop on the first
         // shard would return nullptr even if other shards have available idle connections.
+        // VULN-1 fix: Always maintain in_flight_count for monitoring, regardless of max_concurrent.
         bool reserved_in_flight = false;
         if (state->cfg.max_concurrent > 0) {
+            // Throttling enabled: check limit
             if (!try_increment_counter(state->in_flight_count, state->cfg.max_concurrent)) {
                 LOG_WARN("HttpPool: max_concurrent reached");
                 co_return nullptr;
             }
+            reserved_in_flight = true;
+        } else {
+            // Throttling disabled: still maintain stats for monitoring
+            state->in_flight_count.fetch_add(1, std::memory_order_relaxed);
             reserved_in_flight = true;
         }
 
@@ -406,13 +412,10 @@ private:
         }
     }
 
-    // acquire() only increments in_flight_count when max_concurrent > 0
-    // (otherwise the reservation is skipped entirely). Release must mirror that,
-    // or the counter drifts negative-clamped-at-0 and the stat is meaningless.
+    // VULN-1 fix: Always decrement in_flight_count to match acquire(),
+    // ensuring accurate monitoring stats regardless of throttling configuration.
     static void release_in_flight(const std::shared_ptr<State>& state) {
-        if (state->cfg.max_concurrent > 0) {
-            decrement_counter(state->in_flight_count);
-        }
+        decrement_counter(state->in_flight_count);
     }
 
     asio::awaitable<std::optional<asio::ip::tcp::resolver::results_type>> resolve_with_timeout(
