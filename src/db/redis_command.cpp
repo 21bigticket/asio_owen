@@ -1,6 +1,9 @@
 #include "redis_command.hpp"
 
-RedisCommandArgv::RedisCommandArgv(const std::vector<std::string>& args) {
+// Copy the caller's strings into our own storage, then point argv at them.
+// The caller may pass a temporary; copying here keeps the data alive for as
+// long as this object lives.
+RedisCommandArgv::RedisCommandArgv(const std::vector<std::string>& in) : args(in) {
     argv.reserve(args.size());
     argv_len.reserve(args.size());
     for (const auto& arg : args) {
