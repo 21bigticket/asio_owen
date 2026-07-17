@@ -3,6 +3,7 @@
 #include <hiredis/hiredis.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -158,31 +159,48 @@ private:
             return make_error("empty Redis command");
         }
 
-        redisContext* ctx = acquire_conn();
-        if (!ctx) {
-            stats_.inc_cmd_fail();
-            return make_error("no available Redis connection");
+        // A stale idle connection (server-closed while pooled) now surfaces as a
+        // null reply instead of being caught by a per-acquire probe. For read-only
+        // idempotent commands we drop it and retry once on a fresh connection so the
+        // failure stays invisible to callers. Non-idempotent commands are NEVER
+        // auto-retried: the first attempt may already have reached Redis, so a
+        // replay could double-apply.
+        const bool retryable = is_readonly_idempotent(args.front());
+        const int max_attempts = retryable ? 2 : 1;
+
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            redisContext* ctx = acquire_conn();
+            if (!ctx) {
+                stats_.inc_cmd_fail();
+                return make_error("no available Redis connection");
+            }
+
+            ConnectionGuard guard(this, ctx);
+            RedisCommandArgv command(args);
+            redisReply* reply = static_cast<redisReply*>(
+                redisCommandArgv(ctx, command.argc(), command.argv.data(), command.argv_len.data()));
+
+            const int saved_errno = errno;
+            if (!reply) {
+                std::string err = fill_error_if_empty(ctx);
+                record_command_failure(ctx, saved_errno, err);
+                guard.drop();
+                if (retryable && attempt + 1 < max_attempts && running_) {
+                    stats_.inc_reconnect();
+                    LOG_WARN("Redis cmd_argv failed (", err, "), retrying once on a fresh connection");
+                    continue;
+                }
+                LOG_WARN("Redis cmd_argv failed: ", err);
+                return make_error(std::move(err));
+            }
+
+            RedisReplyGuard reply_guard(reply);
+            Reply r;
+            parse_redis_reply(reply_guard.get(), r);
+            record_command_result(r);
+            return r;
         }
-
-        ConnectionGuard guard(this, ctx);
-        RedisCommandArgv command(args);
-        redisReply* reply = static_cast<redisReply*>(
-            redisCommandArgv(ctx, command.argc(), command.argv.data(), command.argv_len.data()));
-
-        const int saved_errno = errno;
-        if (!reply) {
-            std::string err = fill_error_if_empty(ctx);
-            LOG_WARN("Redis cmd_argv failed: ", err);
-            record_command_failure(ctx, saved_errno, err);
-            guard.drop();
-            return make_error(std::move(err));
-        }
-
-        RedisReplyGuard reply_guard(reply);
-        Reply r;
-        parse_redis_reply(reply_guard.get(), r);
-        record_command_result(r);
-        return r;
+        return make_error("redis retry exhausted");  // unreachable: loop always returns
     }
 
     struct RedisReplyGuard {
@@ -355,12 +373,14 @@ private:
                     if (!idle_pool_.empty()) {
                         auto* ctx = idle_pool_.front().ctx;
                         idle_pool_.pop_front();
-                        lock.unlock();
-                        if (reset_worker_connection(ctx)) {
-                            return ctx;
-                        }
-                        drop_bad_connection(ctx);
-                        break;
+                        // No per-acquire SELECT/PING probe: db is fixed (switching
+                        // requires a restart) and set once at connect time, so the
+                        // connection's db state never drifts. Liveness is covered by
+                        // the maintain-loop PING and by command-level retry on
+                        // failure (see cmd_argv_sync_impl). This removes one Redis
+                        // round-trip per command — the main worker-mode throughput
+                        // cost vs direct mode.
+                        return ctx;
                     }
                     if (total_ < cfg_.max_size && creating_ < max_creating_limit_) {
                         ++total_;
@@ -406,13 +426,6 @@ private:
         cv_.notify_one();
     }
 
-    bool reset_worker_connection(redisContext* ctx) {
-        RedisReplyGuard reply_guard(static_cast<redisReply*>(redisCommand(ctx, "SELECT %d", cfg_.db)));
-        return reply_guard &&
-               reply_guard.get()->type == REDIS_REPLY_STATUS &&
-               std::string_view(reply_guard.get()->str, reply_guard.get()->len) == "OK";
-    }
-
     void drop_bad_connection(redisContext* ctx) {
         if (!ctx) return;
 
@@ -432,34 +445,31 @@ private:
     }
 
     Reply get_sync(const char* key) {
-        redisContext* ctx = acquire_conn();
-        if (!ctx) {
-            stats_.inc_cmd_fail();
-            return make_error("no available Redis connection");
+        // Delegate to the argv path so GET shares the single retry-on-failure
+        // implementation. Passing {"GET", key} through redisCommandArgv is
+        // binary-safe (no "GET %s" strlen truncation on embedded NULs).
+        return cmd_argv_sync_impl(std::vector<std::string>{"GET", std::string(key)});
+    }
+
+    // Whitelist of read-only, side-effect-free commands that are safe to replay
+    // on a fresh connection after a connection-level failure. Deliberately
+    // conservative: anything that mutates state (SET/EXPIRE/INCR/GETDEL/GETEX/...)
+    // is excluded, because the first attempt may already have executed on Redis.
+    // Case-insensitive match on the command verb.
+    static bool is_readonly_idempotent(const std::string& verb) {
+        static const std::vector<std::string> kReadOnly = {
+            "GET", "MGET", "STRLEN", "EXISTS", "TTL", "PTTL", "TYPE",
+            "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS",
+            "LLEN", "LRANGE", "LINDEX", "SCARD", "SISMEMBER", "SMEMBERS",
+            "ZCARD", "ZSCORE", "ZRANGE", "ZRANK",
+        };
+        std::string upper;
+        upper.reserve(verb.size());
+        for (unsigned char c : verb) upper.push_back(static_cast<char>(std::toupper(c)));
+        for (const auto& cmd : kReadOnly) {
+            if (upper == cmd) return true;
         }
-
-        ConnectionGuard guard(this, ctx);
-        // Route through redisCommandArgv (binary-safe, no format reparse) rather
-        // than redisCommand(ctx, "GET %s", key), whose %s runs strlen() and would
-        // truncate a key containing an embedded NUL.
-        RedisCommandArgv command(std::vector<std::string>{"GET", std::string(key)});
-        redisReply* reply = static_cast<redisReply*>(
-            redisCommandArgv(ctx, command.argc(), command.argv.data(), command.argv_len.data()));
-        const int saved_errno = errno;
-
-        if (!reply) {
-            std::string err = fill_error_if_empty(ctx);
-            LOG_WARN("Redis GET failed: ", err);
-            record_command_failure(ctx, saved_errno, err);
-            guard.drop();
-            return make_error(std::move(err));
-        }
-
-        RedisReplyGuard reply_guard(reply);
-        Reply r;
-        parse_redis_reply(reply_guard.get(), r);
-        record_command_result(r);
-        return r;
+        return false;
     }
 
     void maintain_loop() {
