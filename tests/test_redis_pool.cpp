@@ -94,6 +94,19 @@ TEST(RedisCommandArgv, PreservesArgumentBoundariesAndLengths) {
     EXPECT_EQ(std::string(command.argv[2], command.argv_len[2]), std::string("a\0b", 3));
 }
 
+TEST(RedisCommandArgv, OwnsDataFromTemporaryVector) {
+    // Regression for the intermittent "ERR unknown command ``" UAF: the caller
+    // (get_sync) passes a temporary vector whose strings die at the end of the
+    // full expression. If RedisCommandArgv only stored const char* into the
+    // caller's storage, argv would dangle here. Run under ASAN to catch a
+    // regression — without a sanitizer the freed memory may read back intact.
+    RedisCommandArgv command(std::vector<std::string>{"GET", std::string("k\0ey", 4)});
+
+    ASSERT_EQ(command.argc(), 2);
+    EXPECT_EQ(std::string(command.argv[0], command.argv_len[0]), "GET");
+    EXPECT_EQ(std::string(command.argv[1], command.argv_len[1]), std::string("k\0ey", 4));
+}
+
 TEST(RedisTlsOwner, RequiresMatchingOwnerAndGeneration) {
     auto* owner_a = reinterpret_cast<const RedisPool*>(static_cast<uintptr_t>(0x1000));
     auto* owner_b = reinterpret_cast<const RedisPool*>(static_cast<uintptr_t>(0x2000));
