@@ -100,3 +100,8 @@ gtest_discover_tests(test_security_chain)
 add_executable(test_redis_pool_shutdown test_redis_pool_shutdown.cpp)
 target_link_libraries(test_redis_pool_shutdown PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_redis_pool_shutdown)
+
+# CORS policy (resolve_origin, preflight, header injection, config loading)
+add_executable(test_cors test_cors.cpp)
+target_link_libraries(test_cors PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_cors)

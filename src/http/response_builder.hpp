@@ -42,6 +42,19 @@ inline bool is_safe_header(const std::string& name, const std::string& value) {
     return true;
 }
 
+// The status line reason phrase may be echoed from an upstream response; unlike
+// header values it is not covered by is_safe_header. Reject CR/LF/NUL so a
+// hostile upstream cannot smuggle headers via the reason phrase (a bare LF is
+// tolerated by some clients and would otherwise split the response).
+inline bool is_safe_reason_phrase(const std::string& phrase) {
+    for (char c : phrase) {
+        if (c == '\r' || c == '\n' || c == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::string build_error_response(
     int status, std::string_view reason, std::string_view body) {
     std::string resp = "HTTP/1.1 ";
@@ -62,7 +75,8 @@ inline std::string build_downstream_response(
     std::string resp = "HTTP/1.1 ";
     resp += std::to_string(ctx.status_code);
     resp += " ";
-    if (!ctx.response_status_text.empty()) {
+    if (!ctx.response_status_text.empty() &&
+        is_safe_reason_phrase(ctx.response_status_text)) {
         resp += ctx.response_status_text;
     } else {
         // Unknown status codes (no static reason phrase) fall back to a

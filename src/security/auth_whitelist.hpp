@@ -16,7 +16,12 @@ public:
         for (auto& item : items) {
             if (item.empty()) continue;
             if (item[0] == '/') {
-                if (item.back() == '/') {
+                // A bare "/" must NOT be treated as a prefix: is_whitelisted
+                // uses path.find(prefix) == 0, so "/" would match every path and
+                // turn the whitelist into a catch-all that bypasses JWT for the
+                // whole site. Classify it as exact instead (the root path is
+                // 404'd earlier anyway); only real prefixes like "/foo/" prefix.
+                if (item.size() > 1 && item.back() == '/') {
                     new_prefixes->push_back(item);
                 } else {
                     new_exact->insert(item);

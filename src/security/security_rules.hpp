@@ -18,6 +18,7 @@
 #include "path_blacklist.hpp"
 #include "jwt_auth.hpp"
 #include "rate_limiter.hpp"
+#include "../http/cors.hpp"
 
 // Security rules: holds all security module instances, exposes a unified check() interface
 class SecurityRules {
@@ -111,6 +112,9 @@ public:
             }
         }
 
+        // 7. CORS policy (absent/empty [cors] section -> disabled default)
+        cors_policy_ = std::make_shared<const CorsPolicy>(load_cors_policy(cfg));
+
         LOG_INFO("Security rules loaded");
     }
 
@@ -129,11 +133,6 @@ public:
         const std::string& xff_header,
         const std::string& auth_header) const
     {
-        // 0. OPTIONS always allowed (CORS preflight)
-        if (method == "OPTIONS") {
-            return {0, ""};
-        }
-
         // Root path returns 404 directly, skip auth chain
         if (raw_path.empty() || raw_path == "/") {
             return {404, "not found"};
@@ -183,6 +182,13 @@ public:
             }
         }
 
+        // 5.5 CORS preflight bypasses authentication (browsers send preflight
+        // without Authorization), but only AFTER the IP blacklist + rate limit
+        // above, so OPTIONS cannot be used to slip past those controls.
+        if (method == "OPTIONS") {
+            return {0, ""};
+        }
+
         // 6. Auth whitelist
         bool is_whitelisted = auth_whitelist_.is_whitelisted(path, service);
 
@@ -224,6 +230,12 @@ public:
 
     bool has_rate_limiter() const {
         return rate_limiter_snapshot() != nullptr;
+    }
+
+    // Snapshot the current CORS policy (cheap shared_ptr copy under lock).
+    std::shared_ptr<const CorsPolicy> cors_policy() const {
+        std::lock_guard<std::mutex> lock(rules_mu_);
+        return cors_policy_;
     }
 
     // Hot reload: reload from Config
@@ -316,6 +328,7 @@ private:
     std::shared_ptr<RateLimiter> rate_limiter_;
     std::vector<std::string> trusted_proxies_;
     bool case_sensitive_paths_ = false;
+    std::shared_ptr<const CorsPolicy> cors_policy_ = std::make_shared<const CorsPolicy>();
 
     // Check if JWT claims contain the specified role
     static bool has_role(const JWTClaims& claims, const std::string& role) {

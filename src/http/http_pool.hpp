@@ -136,7 +136,7 @@ public:
         shard.active.erase(conn);
     }
 
-    static void untrack_active(const std::shared_ptr<State>& state, HttpConn* conn) {
+    static void untrack_active(const std::shared_ptr<State>& state, HttpConn* conn) noexcept {
         if (!conn) return;
         auto& shard = state->shards[conn->shard_idx];
         std::lock_guard lock(shard.mtx);
@@ -239,15 +239,20 @@ public:
         }
         bool reserved_total = true;
 
-        auto new_conn = std::make_unique<HttpConn>(state->ioc);
+        std::unique_ptr<HttpConn> new_conn;
         try {
+            // make_unique is inside the try so an OOM here also rolls back the
+            // global counters. The shard counters are bumped only AFTER a
+            // successful active.insert(), so if insert throws they were never
+            // touched and the catch only has to undo the global reservations.
+            new_conn = std::make_unique<HttpConn>(state->ioc);
             shard_idx = start_shard;
             auto& shard = state->shards[shard_idx];
             std::lock_guard lock(shard.mtx);
-            ++shard.total;
-            ++shard.in_flight;
             new_conn->shard_idx = shard_idx;
             shard.active.insert(new_conn.get());
+            ++shard.total;
+            ++shard.in_flight;
         } catch (...) {
             if (reserved_total) decrement_counter(state->total_count);
             if (reserved_in_flight) decrement_counter(state->in_flight_count);
@@ -286,7 +291,7 @@ public:
         release(state_, std::make_unique<HttpConn>(std::move(conn)));
     }
 
-    static void release(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) {
+    static void release(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) noexcept {
         auto shard_idx = conn->shard_idx;
         auto& shard = state->shards[shard_idx];
 
@@ -319,21 +324,39 @@ public:
             return;
         }
         conn->last_used_at = std::chrono::steady_clock::now();
+        bool pooled = false;
         {
             std::lock_guard lock(shard.mtx);
             shard.active.erase(conn.get());
-            shard.idle.push_back(std::move(*conn));
+            try {
+                // Growing the idle deque can throw bad_alloc. release runs from
+                // ~ConnGuard (a noexcept destructor), so we must not propagate:
+                // on failure we drop the connection instead of pooling it. *conn
+                // is untouched because deque::push_back gives the strong
+                // exception guarantee.
+                shard.idle.push_back(std::move(*conn));
+                pooled = true;
+            } catch (...) {
+            }
             --shard.in_flight;
+            if (!pooled) --shard.total;
         }
         release_in_flight(state);
-        state->released_idle.fetch_add(1, std::memory_order_relaxed);
+        if (pooled) {
+            state->released_idle.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            asio::error_code ec;
+            conn->socket.close(ec);
+            decrement_counter(state->total_count);
+            state->released_closed.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void release_bad(HttpConn conn) {
         release_bad(state_, std::make_unique<HttpConn>(std::move(conn)));
     }
 
-    static void release_bad(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) {
+    static void release_bad(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) noexcept {
         auto shard_idx = conn->shard_idx;
         auto& shard = state->shards[shard_idx];
         asio::error_code ec;

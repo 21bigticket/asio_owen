@@ -12,6 +12,7 @@
 #include "../../picohttpparser.h"
 #include "../common/logger.hpp"
 #include "../security/security_rules.hpp"
+#include "cors.hpp"
 #include "http_body_reader.hpp"
 #include "http_context.hpp"
 #include "http_io.hpp"
@@ -248,6 +249,24 @@ public:
                     }
                 }
 
+                std::shared_ptr<const CorsPolicy> cors_policy;
+                if (state_->security_rules) {
+                    cors_policy = state_->security_rules->cors_policy();
+                }
+
+                // CORS preflight: when enabled and this is a genuine preflight
+                // (OPTIONS carrying Access-Control-Request-Method), answer 204
+                // locally instead of forwarding it upstream.
+                bool was_preflight = false;
+                if (!handled && cors_policy && cors_policy->enabled
+                        && method_str == "OPTIONS"
+                        && !ctx.get_header("Access-Control-Request-Method").empty()) {
+                    if (build_preflight_response(ctx, *cors_policy)) {
+                        handled = true;
+                        was_preflight = true;
+                    }
+                }
+
                 auto it = state_->routes.find(path_str);
                 if (!handled && it != state_->routes.end()) {
                     co_await it->second(ctx);
@@ -402,6 +421,14 @@ public:
                         ", proxy_response=", proxy_response,
                         ", response_body_size=", ctx.response_body.size(),
                         ", body_preview=", sanitize_body_preview(ctx.response_body));
+                }
+
+                // Inject CORS headers on the actual response. A locally-built
+                // preflight already carries its own complete header set, so we
+                // skip it there; a business 204 (from upstream or a local route)
+                // still needs the headers or the browser rejects the response.
+                if (cors_policy && cors_policy->enabled && !was_preflight) {
+                    apply_cors_headers(ctx, *cors_policy);
                 }
 
                 auto resp = build_downstream_response(ctx, method_str, proxy_response);

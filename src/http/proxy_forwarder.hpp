@@ -39,7 +39,11 @@ struct ConnGuard {
     ConnGuard(ConnGuard&&) = delete;
     ConnGuard& operator=(ConnGuard&&) = delete;
 
-    ~ConnGuard() {
+    // Release runs from a destructor, so it must never throw. HttpPool::release
+    // / release_bad are noexcept and drop (rather than pool) the connection when
+    // they hit OOM, keeping the pool counters balanced without terminating the
+    // process on the hot request-completion path.
+    ~ConnGuard() noexcept {
         if (!conn_) return;
         HttpPool::untrack_active(pool_state_, conn_.get());
         if (good_) {
