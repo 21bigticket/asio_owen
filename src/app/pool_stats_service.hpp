@@ -26,6 +26,7 @@ private:
         timer_.expires_after(std::chrono::seconds(interval_sec));
         timer_.async_wait([this, interval_sec](std::error_code ec) {
             if (ec || !running_) return;
+            upstreams_.evict_stale();
             LOG_INFO("HttpPool stats: ", upstreams_.pool_stats());
             if (running_) {
                 schedule(interval_sec);

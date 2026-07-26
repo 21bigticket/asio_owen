@@ -304,3 +304,52 @@ TEST(HttpPool, ThrottledGlobalEvictSweepsStaleIdleFromShards) {
     asio::error_code ec;
     if (held_socket->has_value()) (*held_socket)->close(ec);
 }
+
+asio::awaitable<void> acquire_release_backdate_idle(
+    HttpPool& pool,
+    std::shared_ptr<HttpPool::State> state,
+    int port,
+    std::atomic<bool>& released_idle) {
+    auto conn = co_await pool.acquire("127.0.0.1", port);
+    if (!conn) co_return;
+    auto shard_idx = conn->shard_idx;
+    HttpPool::release(state, std::move(conn));
+
+    {
+        auto& shard = state->shards[shard_idx];
+        std::lock_guard lock(shard.mtx);
+        for (auto& idle_conn : shard.idle) {
+            idle_conn.last_used_at = std::chrono::steady_clock::time_point{};
+        }
+    }
+    released_idle.store(true, std::memory_order_relaxed);
+}
+
+TEST(HttpPool, EvictStaleReclaimsIdleWithoutAcquire) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+
+    HttpPool::Config cfg;
+    cfg.max_size = HttpPool::kShards;
+    cfg.connect_timeout_ms = 1000;
+    cfg.idle_timeout_sec = 0;
+    HttpPool pool(ioc, cfg);
+    auto state = pool.state();
+
+    std::atomic<bool> released_idle{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_release_backdate_idle(
+        pool, state, acceptor.local_endpoint().port(), released_idle), asio::detached);
+
+    ioc.run();
+
+    ASSERT_TRUE(released_idle.load(std::memory_order_relaxed));
+    EXPECT_EQ(state->total_count.load(std::memory_order_relaxed), 1u);
+
+    EXPECT_EQ(pool.evict_stale(), 0u);
+    EXPECT_EQ(state->total_count.load(std::memory_order_relaxed), 0u);
+
+    asio::error_code ec;
+    if (held_socket->has_value()) (*held_socket)->close(ec);
+}

@@ -315,7 +315,7 @@ private:
         std::vector<MYSQL*> to_close;
         {
             std::lock_guard lock(mtx_);
-            while (!idle_pool_.empty()) {
+            while (!idle_pool_.empty() && total_ > cfg_.min_size) {
                 auto age = std::chrono::duration_cast<std::chrono::seconds>(
                     now - idle_pool_.front().last_used_at).count();
                 if (age < cfg_.max_idle_sec)

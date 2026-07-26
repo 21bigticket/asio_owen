@@ -103,6 +103,13 @@ public:
         return oss.str();
     }
 
+    void evict_stale() {
+        std::shared_lock lock(mtx_);
+        for (const auto& [_, pool] : pools_) {
+            pool->evict_stale();
+        }
+    }
+
 private:
     mutable std::shared_mutex mtx_;
     asio::io_context& ioc_;
