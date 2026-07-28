@@ -247,7 +247,8 @@ stats_interval_sec = 30
 
 ## 当前性能、复用与内存基线
 
-最新总体验证来自 2026-07-13 VM Release 构建巡检，详见
+最新总体验证来自 2026-07-28 Ubuntu/GCC 11.4 运行验证，详见
+`docs/PERF_VALIDATION_2026-07-28.md`。7 月 13 日 Release 巡检详见
 `docs/CODE_REVIEW_FIXES_2026-07-13.md`。历史 `PERF_REPORT.md`、
 `PERF_ANALYSIS.md`、`CONN_REUSE_*` 记录的是不同阶段的压测和排查快照，
 不能直接当成当前实现。

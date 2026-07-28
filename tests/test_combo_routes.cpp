@@ -31,10 +31,6 @@ public:
         co_return query_result;
     }
 
-    asio::awaitable<void> set_cache(std::string data) override {
-        cache = std::move(data);
-        co_return;
-    }
 };
 
 void run_combo(asio::io_context& ioc, HttpContext& ctx, AppServices services) {
@@ -73,7 +69,7 @@ TEST(ComboRoute, Returns504AndReleasesPermitAfterLateQueryCompletion) {
     EXPECT_TRUE(limiter->try_acquire().has_value());
 }
 
-TEST(ComboRoute, ReturnsMysqlValueAndSchedulesCacheWrite) {
+TEST(ComboRoute, ReturnsMysqlValueWhenCacheWriteIsUnavailableInUnitTest) {
     asio::io_context ioc;
     auto limiter = std::make_shared<ComboQueryLimiter>(1);
     auto backend = std::make_shared<FakeComboBackend>();
@@ -82,5 +78,5 @@ TEST(ComboRoute, ReturnsMysqlValueAndSchedulesCacheWrite) {
 
     EXPECT_EQ(ctx.status_code, 200);
     EXPECT_NE(ctx.response_body.find("from_mysql"), std::string::npos);
-    EXPECT_EQ(backend->cache, "from_mysql");
+    EXPECT_TRUE(backend->cache.empty());
 }

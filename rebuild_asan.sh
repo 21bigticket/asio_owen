@@ -12,7 +12,7 @@ cd "$ROOT"
 
 echo "=== [1/6] 停止旧服务 ==="
 sudo systemctl stop asio-owen.service 2>/dev/null || true
-#sudo systemctl stop asio-owen-asan.service 2>/dev/null || true
+sudo systemctl stop asio-owen-asan.service 2>/dev/null || true
 sleep 2
 
 echo "=== [2/6] 删除旧构建 ==="

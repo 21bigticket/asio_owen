@@ -10,7 +10,6 @@ public:
     virtual ~ComboBackend() = default;
     virtual asio::awaitable<std::string> get_cache() = 0;
     virtual asio::awaitable<MysqlPool::Result> query() = 0;
-    virtual asio::awaitable<void> set_cache(std::string data) = 0;
 };
 
 struct AppServices {
