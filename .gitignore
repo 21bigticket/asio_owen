@@ -19,6 +19,7 @@ build_*/
 server.log
 *.log
 *.bin
+logs/
 
 # Security keys (not committed)
 jwt_keys/

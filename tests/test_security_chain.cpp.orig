@@ -70,7 +70,6 @@ std::unique_ptr<tcp::socket> make_connected_pair(
 std::unique_ptr<SecurityRules> build_rules(const std::string& tag, const std::string& config_body) {
     auto base = make_temp_config_dir(tag);
     write_file(base / "config.d" / "00-test.ini", config_body);
-    write_file(base / "config.d" / "99-test-snapshot.ini", "[rate_limit]\nsnapshot_path = " + (base / "rate_limit.bin").string() + "\n");
 
     auto cfg = std::make_unique<Config>();
     if (!cfg->load(base)) {
@@ -115,23 +114,6 @@ protected:
 TEST_F(SecurityChainTest, OptionsPreflightAlwaysAllowed) {
     auto r = rules->check(*server_side, "OPTIONS", "/api/anything", "", "");
     EXPECT_EQ(r.status_code, 0);
-}
-
-TEST_F(SecurityChainTest, CorsFastPathReflectsCurrentSnapshot) {
-    EXPECT_FALSE(rules->cors_enabled_fast());
-
-    rules = build_rules("cors_enabled",
-        "[security]\n"
-        "jwt_disabled = true\n"
-        "[cors]\n"
-        "enabled = true\n"
-        "allowed_origins = https://example.test\n");
-
-    ASSERT_TRUE(rules->cors_enabled_fast());
-    auto policy = rules->cors_policy();
-    ASSERT_NE(policy, nullptr);
-    EXPECT_TRUE(policy->enabled);
-    EXPECT_TRUE(policy->allowed_origins.contains("https://example.test"));
 }
 
 TEST_F(SecurityChainTest, RootPathReturns404) {
@@ -377,69 +359,6 @@ TEST_F(SecurityChainTest, ReloadUpdatesRulesHot) {
     // Now blocked.
     auto r = rules_local.check(*server_side, "GET", "/api/x", "", "");
     EXPECT_EQ(r.status_code, 403);
-
-    std::filesystem::remove_all(base);
-}
-
-// Consecutive reloads on the same thread must invalidate TLS cache
-TEST_F(SecurityChainTest, ConsecutiveReloadsInvalidateTLSCache) {
-    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    auto base = std::filesystem::temp_directory_path() /
-        ("asio_owen_test_consecutive_reload_" + std::to_string(now));
-    std::filesystem::create_directories(base / "config.d");
-
-    // Initial config: allow all
-    write_file(base / "config.d" / "00-test.ini",
-        "[security]\n"
-        "case_sensitive_paths = false\n"
-        "jwt_disabled = true\n"
-        "[rate_limit]\n"
-        "ip_rps = 10000\n"
-        "ip_burst = 10000\n"
-        "global_rps = 100000\n"
-        "max_buckets = 1024\n");
-    write_file(base / "config.d" / "99-test-snapshot.ini",
-        "[rate_limit]\nsnapshot_path = " + (base / "rate_limit.bin").string() + "\n");
-
-    Config cfg1;
-    ASSERT_TRUE(cfg1.load(base));
-    SecurityRules rules_local;
-    rules_local.load_from_config(cfg1);
-
-    // Initially allowed.
-    EXPECT_EQ(rules_local.check(*server_side, "GET", "/api/test", "", "").status_code, 0);
-
-    // First reload: add IP blacklist
-    write_file(base / "config.d" / "01-ip.ini",
-        "[ip_blacklist]\n"
-        "lb = 127.0.0.0/8\n");
-
-    Config cfg2;
-    ASSERT_TRUE(cfg2.load(base));
-    rules_local.reload(cfg2);
-
-    // Should be blocked by IP blacklist
-    auto r2 = rules_local.check(*server_side, "GET", "/api/test", "", "");
-    EXPECT_EQ(r2.status_code, 403);
-    EXPECT_EQ(r2.reason, "ip blocked");
-
-    // Second reload: remove IP blacklist, add path blacklist
-    std::filesystem::remove(base / "config.d" / "01-ip.ini");
-    write_file(base / "config.d" / "02-path.ini",
-        "[path_blacklist]\n"
-        "/api/test =\n");  // empty value means blocked
-
-    Config cfg3;
-    ASSERT_TRUE(cfg3.load(base));
-    rules_local.reload(cfg3);
-
-    // Should be blocked by path blacklist (not IP)
-    auto r3 = rules_local.check(*server_side, "GET", "/api/test", "", "");
-    EXPECT_EQ(r3.status_code, 403);
-    EXPECT_EQ(r3.reason, "path blocked");
-
-    // Different path should be allowed
-    EXPECT_EQ(rules_local.check(*server_side, "GET", "/api/other", "", "").status_code, 0);
 
     std::filesystem::remove_all(base);
 }

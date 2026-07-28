@@ -32,7 +32,6 @@ int Application::run(int argc, char* argv[]) {
     Logger::instance().init(app_cfg.log_file, app_cfg.log_level);
 
     LOG_INFO("Server starting...");
-    LOG_INFO("Build marker: gateway-debug-20260703-client-close-trace");
 
     // Declared outside the try so the catch path can join any worker threads
     // that were already spawned before rethrowing. Otherwise a throw between
@@ -47,7 +46,17 @@ int Application::run(int argc, char* argv[]) {
     try {
         initialize(cfg, app_cfg, config_base);
 
-        co_spawn(ioc_, server_->start(), asio::detached);
+        co_spawn(server_->executor(), server_->start(), [this](std::exception_ptr ep) {
+            if (!ep) return;
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                LOG_ERROR("HTTP accept loop failed: ", e.what());
+            } catch (...) {
+                LOG_ERROR("HTTP accept loop failed with an unknown exception");
+            }
+            request_stop();
+        });
 
         signal_exit_ = std::make_unique<SignalExit>(ioc_);
         signal_exit_->on_exit([this]() {
@@ -78,6 +87,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
                              const std::filesystem::path& config_base) {
     mysql_ = std::make_unique<MysqlPool>(ioc_, app_cfg.mysql);
     redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
+    combo_query_limiter_ = std::make_shared<ComboQueryLimiter>(
+        app_cfg.combo_max_in_flight_queries);
     server_ = std::make_unique<HttpServer>(
         ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms,
         app_cfg.client_header_read_timeout_ms, app_cfg.client_body_read_timeout_ms);
@@ -91,7 +102,10 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
 
     register_routes(*server_, AppServices{
         .mysql = mysql_.get(),
-        .redis = redis_.get()
+        .redis = redis_.get(),
+        .combo_query_limiter = combo_query_limiter_,
+        .combo_backend = make_pool_combo_backend(mysql_.get(), redis_.get()),
+        .combo_deadline_ms = app_cfg.combo_deadline_ms
     });
 
     register_upstreams(cfg, app_cfg.http_pool);
@@ -138,6 +152,7 @@ void Application::cleanup() {
     if (redis_) redis_->shutdown();
     redis_.reset();
     mysql_.reset();
+    combo_query_limiter_.reset();
     drain_timer_.reset();
     security_rules_.reset();
 }

@@ -42,7 +42,7 @@ The two pools use **deliberately different async strategies** — this is the co
 
 ### Cross-thread SQL passing — do not regress
 
-`MysqlPool::execute` (`src/db/mysql_pool.hpp:54`) deliberately copies the SQL into a `char sql_buf[4096]` stack array and captures **that** in the `asio::post` lambda, not the `std::string`. The earlier code that captured `std::string` by value caused `double free` crashes under load — see PERF_REPORT.md "根因分析". When modifying this code, never let a `std::string` cross the `asio::post` boundary into the worker pool.
+`MysqlPool::execute` switches to its dedicated worker executor with `co_await asio::post(..., use_awaitable)` before using the coroutine-frame SQL string. Do not reintroduce a lambda that captures non-POD request data across the executor boundary.
 
 ### Logging
 
@@ -52,7 +52,7 @@ The two pools use **deliberately different async strategies** — this is the co
 
 - `Application` owns `MysqlPool`, `RedisPool`, `HttpServer`, `SecurityRules`, `ReloadService`, and `SnapshotService`.
 - `SignalExit` listens on `SIGINT`/`SIGTERM` and asks `Application` to stop accepting, then a drain timer stops the `io_context`. Add new subsystems to `Application::cleanup()` with explicit shutdown ordering.
-- `with_timeout` (`src/common/timeout.hpp`) is a template that races a child coroutine against a `steady_timer` and returns `std::optional<T>` — used by the `/api/combo` handler for cache-then-DB fallback.
+- `/api/combo` returns a 504 after its configurable `server.combo_deadline_ms` soft deadline (default 500ms) on MySQL fallback. The synchronous MySQL operation is not cancelled; it retains one of `server.combo_max_in_flight_queries` fallback-query permits (default 8) until it completes, then returns its connection normally. Do not document this deadline as cancellation.
 
 ## Configuration
 
@@ -60,4 +60,4 @@ Configuration is split across `config.d/*.ini` files (loaded in sorted order, la
 
 ## Known runtime endpoints
 
-`/api/health`, `/api/redis`, `/api/mysql`, `/api/combo` (Redis cache → MySQL fallback with 500ms timeout and detached cache-fill write-back), plus gateway routes `/{service}/...` configured by `[upstream]`.
+`/api/health`, `/api/redis`, `/api/mysql`, `/api/combo` (Redis cache → MySQL fallback with configurable soft deadline/in-flight cap and detached cache-fill write-back), plus gateway routes `/{service}/...` configured by `[upstream]`.

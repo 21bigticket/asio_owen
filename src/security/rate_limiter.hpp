@@ -127,16 +127,17 @@ public:
         std::unordered_map<std::string, RateLimitRule> service_limits;
     };
 
-    explicit RateLimiter(Config cfg)
-        : shards_(kShards)
+    explicit RateLimiter(Config cfg, bool load_persisted_snapshot = true,
+                         bool persist_on_destroy = true)
+        : shards_(kShards), persist_on_destroy_(persist_on_destroy)
     {
         cfg_ = normalize_config(std::move(cfg));
         max_buckets_per_shard_.store(cfg_.max_buckets / kShards, std::memory_order_relaxed);
-        load_snapshot();
+        if (load_persisted_snapshot) load_snapshot();
     }
 
     ~RateLimiter() {
-        persist_snapshot();
+        if (persist_on_destroy_) persist_snapshot();
     }
 
     // Single-key rate limit (IP dimension)
@@ -154,13 +155,17 @@ public:
     // Path-dimension rate limit
     Decision check_path(const std::string& path) {
         std::lock_guard<std::mutex> lock(cfg_mu_);
+        return check_path(path, cfg_);
+    }
+
+    Decision check_path(const std::string& path, const Config& cfg) {
         // exact match first
-        auto it = cfg_.path_limits.find(path);
-        if (it != cfg_.path_limits.end()) {
+        auto it = cfg.path_limits.find(path);
+        if (it != cfg.path_limits.end()) {
             return check("path:" + path, it->second.rate, it->second.burst);
         }
         // prefix match: path starts with configured prefix
-        for (auto& [prefix, rule] : cfg_.path_prefix_limits) {
+        for (auto& [prefix, rule] : cfg.path_prefix_limits) {
             if (path.starts_with(prefix)) {
                 return check("path:" + prefix, rule.rate, rule.burst);
             }
@@ -171,8 +176,12 @@ public:
     // Service-dimension rate limit
     Decision check_service(const std::string& service) {
         std::lock_guard<std::mutex> lock(cfg_mu_);
-        auto it = cfg_.service_limits.find(service);
-        if (it == cfg_.service_limits.end()) return {true, 0};
+        return check_service(service, cfg_);
+    }
+
+    Decision check_service(const std::string& service, const Config& cfg) {
+        auto it = cfg.service_limits.find(service);
+        if (it == cfg.service_limits.end()) return {true, 0};
         return check("svc:" + service, it->second.rate, it->second.burst);
     }
 
@@ -204,17 +213,47 @@ public:
         return {false, max_retry};
     }
 
+    Decision check_all(const std::string& ip, const std::string& path,
+                       const std::string& service, const Config& cfg) {
+        auto ip_d = check(ip, cfg.ip_rps, cfg.ip_burst);
+        auto path_d = check_path(path, cfg);
+        auto svc_d = check_service(service, cfg);
+        auto global_d = check_global(global_, cfg.global_rps, cfg.global_rps);
+        if (ip_d.allowed && path_d.allowed && svc_d.allowed && global_d.allowed) {
+            return {true, 0};
+        }
+        return {false, std::max({ip_d.retry_after_ms, path_d.retry_after_ms,
+            svc_d.retry_after_ms, global_d.retry_after_ms})};
+    }
+
     // Update rate limit config (hot reload)
     void update_config(Config cfg) {
+        publish_config(prepare_config(std::move(cfg)));
+    }
+
+    static Config prepare_config(Config cfg) {
+        return normalize_config(std::move(cfg));
+    }
+
+    void publish_config(Config normalized) noexcept {
         std::lock_guard<std::mutex> lock(cfg_mu_);
-        cfg_ = normalize_config(std::move(cfg));
+        std::swap(cfg_, normalized);
         max_buckets_per_shard_.store(cfg_.max_buckets / kShards, std::memory_order_relaxed);
+    }
+
+    Config config_snapshot() const {
+        std::lock_guard<std::mutex> lock(cfg_mu_);
+        return cfg_;
     }
 
     // Persist snapshot (manual trigger)
     void persist_snapshot() {
         // prevent concurrent persist from destructor and timer
         if (snapshot_busy_.exchange(true)) return;
+        struct SnapshotBusyReset {
+            std::atomic<bool>& flag;
+            ~SnapshotBusyReset() { flag.store(false); }
+        } reset{snapshot_busy_};
 
         // Snapshot the path under cfg_mu_. update_config() may rewrite cfg_
         // (including snapshot_path, a std::string) concurrently from the
@@ -249,7 +288,6 @@ public:
             }
         }
 
-        snapshot_busy_.store(false);
     }
 
     // persist_worker is driven by steady_timer in main.cpp
@@ -273,6 +311,7 @@ private:
     std::vector<Shard> shards_;
     GlobalBucket global_;
     std::atomic<bool> snapshot_busy_{false};  // prevents persist_snapshot re-entry
+    bool persist_on_destroy_ = true;
 
     Shard& shard(const std::string& key) {
         return shards_[std::hash<std::string>{}(key) % kShards];
@@ -366,8 +405,20 @@ private:
 
         // write body
         ofs.write(body.data(), body.size());
-
+        if (!ofs) {
+            LOG_WARN("rate_limit: snapshot write failed: ", path);
+            return false;
+        }
+        ofs.flush();
+        if (!ofs) {
+            LOG_WARN("rate_limit: snapshot flush failed: ", path);
+            return false;
+        }
         ofs.close();
+        if (ofs.fail()) {
+            LOG_WARN("rate_limit: snapshot close failed: ", path);
+            return false;
+        }
         return true;
     }
 

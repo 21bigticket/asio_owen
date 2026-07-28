@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <random>
+
+#include "security/auth_whitelist.hpp"
 #include "security/ip_blacklist.hpp"
+#include "security/path_blacklist.hpp"
 #include "security/real_ip.hpp"
 
 TEST(IpBlacklist, IPv4Cidr8MatchesOnlyExpectedRange) {
@@ -85,4 +89,29 @@ TEST(MatchCidr, HandlesIPv6Rule) {
     ASSERT_TRUE(rule.has_value());
     EXPECT_TRUE(match_cidr("2001:db8::1", *rule));
     EXPECT_FALSE(match_cidr("2001:db9::1", *rule));
+}
+
+TEST(SecurityRuleValues, HandleDeterministicFuzzInputsWithoutInvalidAccess) {
+    std::minstd_rand rng(0xC1D2);
+    constexpr std::string_view alphabet = "/:.%ABCxyz012";
+    std::vector<std::string> items;
+    std::vector<std::pair<std::string, std::string>> path_items;
+    for (int i = 0; i < 500; ++i) {
+        std::string value;
+        for (int j = 0; j < 24; ++j) value += alphabet[rng() % alphabet.size()];
+        items.push_back(value);
+        path_items.emplace_back("/" + value, i % 2 == 0 ? "" : "role:admin");
+    }
+
+    IpBlacklist blacklist;
+    AuthWhitelist whitelist;
+    PathBlacklist paths;
+    blacklist.reload(items);
+    whitelist.reload(items);
+    paths.reload(path_items);
+    for (const auto& value : items) {
+        EXPECT_NO_THROW(blacklist.is_blocked(value));
+        EXPECT_NO_THROW(whitelist.is_whitelisted("/" + value, value));
+        EXPECT_NO_THROW(paths.check("/" + value));
+    }
 }

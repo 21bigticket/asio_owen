@@ -6,6 +6,7 @@
 #include <cctype>
 #include <functional>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <asio.hpp>
 
@@ -23,6 +24,8 @@
 // Security rules: holds all security module instances, exposes a unified check() interface
 class SecurityRules {
 public:
+    SecurityRules() = default;
+
     // Load all rules from Config
     void load_from_config(const Config& cfg) {
         // Build + validate the JWT config FIRST, into a local. This is the only
@@ -34,15 +37,14 @@ public:
         bool jwt_disabled = false;
         auto new_jwt = build_jwt_auth(cfg, jwt_disabled);  // throws on invalid config
 
-        // 0. Path case-sensitivity config
-        {
-            case_sensitive_paths_ = cfg.get("security", "case_sensitive_paths", "false") == "true";
-        }
+        auto next = std::make_shared<SecuritySnapshot>();
+        next->case_sensitive_paths = cfg.get("security", "case_sensitive_paths", "false") == "true";
 
         // 1. IP blacklist
         {
             auto items = cfg.get_list("ip_blacklist");
-            ip_blacklist_.reload(items);
+            next->ip_blacklist = std::make_shared<IpBlacklist>();
+            next->ip_blacklist->reload(items);
         }
 
         // 2. Trusted proxies (pre-normalized at load time to avoid per-request normalize_ip_str calls)
@@ -53,25 +55,27 @@ public:
             for (auto& ip : items) {
                 normalized.push_back(normalize_ip_str(ip));
             }
-            trusted_proxies_ = std::move(normalized);
+            next->trusted_proxies = std::move(normalized);
         }
 
         // 3. Auth whitelist
         {
             auto items = cfg.get_list("auth_whitelist");
-            normalize_path_items(items);
-            auth_whitelist_.reload(items);
+            normalize_path_items(items, next->case_sensitive_paths);
+            next->auth_whitelist = std::make_shared<AuthWhitelist>();
+            next->auth_whitelist->reload(items);
         }
 
         // 4. Path blacklist
         {
             auto items = cfg.get_section("path_blacklist");
-            normalize_path_keys(items);
-            path_blacklist_.reload(items);
+            normalize_path_keys(items, next->case_sensitive_paths);
+            next->path_blacklist = std::make_shared<PathBlacklist>();
+            next->path_blacklist->reload(items);
         }
 
         // 5. JWT config (already validated/built above; just publish it)
-        jwt_auth_ = std::move(new_jwt);
+        next->jwt_auth = std::move(new_jwt);
         if (jwt_disabled) {
             LOG_WARN("JWT verification explicitly disabled via security.jwt_disabled=true");
         }
@@ -90,7 +94,7 @@ public:
             // path rate limits
             auto path_items = cfg.get_section("rate_limit_paths");
             for (auto& [key, val] : path_items) {
-                if (!normalize_path_key(key)) continue;
+                if (!normalize_path_key(key, next->case_sensitive_paths)) continue;
                 auto rule = parse_rate_limit_value(val);
                 if (key.back() == '/') {
                     rate_cfg.path_prefix_limits.emplace_back(key, rule);
@@ -105,15 +109,20 @@ public:
                 rate_cfg.service_limits[key] = parse_rate_limit_value(val);
             }
 
-            if (rate_limiter_) {
-                rate_limiter_->update_config(std::move(rate_cfg));
-            } else {
-                rate_limiter_ = std::make_shared<RateLimiter>(std::move(rate_cfg));
-            }
+            next->rate_limiter = std::make_shared<RateLimiter>(std::move(rate_cfg),
+                !staging_, !staging_);
+            next->rate_policy = std::make_shared<RateLimiter::Config>(
+                next->rate_limiter->config_snapshot());
         }
 
         // 7. CORS policy (absent/empty [cors] section -> disabled default)
-        cors_policy_ = std::make_shared<const CorsPolicy>(load_cors_policy(cfg));
+        next->cors_policy = std::make_shared<const CorsPolicy>(load_cors_policy(cfg));
+
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mu_);
+            snapshot_ = std::shared_ptr<const SecuritySnapshot>(std::move(next));
+            generation_.store(next_generation(), std::memory_order_release);
+        }
 
         LOG_INFO("Security rules loaded");
     }
@@ -138,21 +147,11 @@ public:
             return {404, "not found"};
         }
 
-        // Snapshot trusted_proxies_ and jwt_auth_ (fine-grained lock, does not block CPU-heavy operations)
-        std::vector<std::string> proxies_copy;
-        std::shared_ptr<const JWTAuth> jwt_copy;
-        std::shared_ptr<RateLimiter> rate_limiter_copy;
-        bool case_sensitive_copy = false;
-        {
-            std::lock_guard<std::mutex> lock(rules_mu_);
-            proxies_copy = trusted_proxies_;
-            jwt_copy = jwt_auth_;
-            rate_limiter_copy = rate_limiter_;
-            case_sensitive_copy = case_sensitive_paths_;
-        }
+        auto snapshot = snapshot_fast();
+        if (!snapshot) return {500, "security rules unavailable"};
 
-        // 1. Extract real IP (uses proxies_copy, not holding rules_mu_)
-        auto client_ip = get_client_ip(socket, xff_header, proxies_copy);
+        // 1. Extract real IP from the immutable snapshot.
+        auto client_ip = get_client_ip(socket, xff_header, snapshot->trusted_proxies);
         auto normalized_ip_result = normalize_ip(client_ip);
         if (!normalized_ip_result.parse_ok) {
             return {400, "invalid client ip"};
@@ -160,7 +159,7 @@ public:
         auto& normalized_ip = normalized_ip_result.str;
 
         // 2. Path normalization (case_sensitive controls whether paths are lowercased)
-        auto norm = normalize_path(raw_path, case_sensitive_copy);
+        auto norm = normalize_path(raw_path, snapshot->case_sensitive_paths);
         if (!norm.valid) {
             return {400, "invalid path"};
         }
@@ -170,13 +169,13 @@ public:
         auto service = extract_service(path);
 
         // 4. IP blacklist check
-        if (ip_blacklist_.is_blocked(normalized_ip)) {
+        if (snapshot->ip_blacklist->is_blocked(normalized_ip)) {
             return {403, "ip blocked"};
         }
 
         // 5. Rate limit check
-        if (rate_limiter_copy) {
-            auto decision = rate_limiter_copy->check_all(normalized_ip, path, service);
+        if (snapshot->rate_limiter && snapshot->rate_policy) {
+            auto decision = snapshot->rate_limiter->check_all(normalized_ip, path, service, *snapshot->rate_policy);
             if (!decision.allowed) {
                 return {429, "too many requests", decision.retry_after_ms};
             }
@@ -190,20 +189,20 @@ public:
         }
 
         // 6. Auth whitelist
-        bool is_whitelisted = auth_whitelist_.is_whitelisted(path, service);
+        bool is_whitelisted = snapshot->auth_whitelist->is_whitelisted(path, service);
 
         // 7. JWT verification (non-whitelisted paths, using jwt_copy without lock)
         // If jwt_copy == nullptr, JWT is disabled — skip verification.
         std::optional<JWTClaims> claims;
-        if (!is_whitelisted && jwt_copy) {
-            claims = jwt_copy->verify(auth_header);
+        if (!is_whitelisted && snapshot->jwt_auth) {
+            claims = snapshot->jwt_auth->verify(auth_header);
             if (!claims) {
                 return {401, "invalid jwt"};
             }
         }
 
         // 8. Path blacklist (single lock for both blocked + role check)
-        auto path_result = path_blacklist_.check(path);
+        auto path_result = snapshot->path_blacklist->check(path);
         if (path_result.blocked) {
             return {403, "path blocked"};
         }
@@ -224,26 +223,46 @@ public:
 
     // Get rate limiter reference (for snapshot timer)
     std::shared_ptr<RateLimiter> rate_limiter_snapshot() const {
-        std::lock_guard<std::mutex> lock(rules_mu_);
-        return rate_limiter_;
+        auto snapshot = snapshot_copy();
+        return snapshot ? snapshot->rate_limiter : nullptr;
     }
 
     bool has_rate_limiter() const {
         return rate_limiter_snapshot() != nullptr;
     }
 
-    // Snapshot the current CORS policy (cheap shared_ptr copy under lock).
+    // Most requests run with CORS disabled. Keep that check on the TLS-backed
+    // snapshot path so it does not reintroduce per-request locking.
+    bool cors_enabled_fast() const {
+        auto snapshot = snapshot_fast();
+        return snapshot && snapshot->cors_policy && snapshot->cors_policy->enabled;
+    }
+
+    // Retain the policy across coroutine suspension when CORS is enabled.
+    // snapshot_fast() keeps the source snapshot alive while this shared_ptr is copied.
     std::shared_ptr<const CorsPolicy> cors_policy() const {
-        std::lock_guard<std::mutex> lock(rules_mu_);
-        return cors_policy_;
+        auto snapshot = snapshot_fast();
+        return snapshot ? snapshot->cors_policy : nullptr;
     }
 
     // Hot reload: reload from Config
     void reload(const Config& cfg) {
-        // Write lock: prevents check() from reading incomplete state
-        std::lock_guard<std::mutex> lock(rules_mu_);
         try {
-            load_from_config(cfg);
+            SecurityRules next(true);
+            next.load_from_config(cfg);
+            auto next_snapshot = next.snapshot_copy();
+            auto current_snapshot = snapshot_copy();
+            if (current_snapshot && current_snapshot->rate_limiter) {
+                current_snapshot->rate_limiter->publish_config(*next_snapshot->rate_policy);
+                auto mutable_next = std::make_shared<SecuritySnapshot>(*next_snapshot);
+                mutable_next->rate_limiter = current_snapshot->rate_limiter;
+                next_snapshot = std::move(mutable_next);
+            }
+            {
+                std::lock_guard<std::mutex> lock(snapshot_mu_);
+                snapshot_ = std::move(next_snapshot);
+                generation_.store(next_generation(), std::memory_order_release);
+            }
             LOG_INFO("Security rules hot-reloaded");
         } catch (const std::exception& e) {
             // load_from_config throws when the new config would disable auth
@@ -255,6 +274,27 @@ public:
     }
 
 private:
+    struct SecuritySnapshot {
+        bool case_sensitive_paths = false;
+        std::vector<std::string> trusted_proxies;
+        std::shared_ptr<IpBlacklist> ip_blacklist = std::make_shared<IpBlacklist>();
+        std::shared_ptr<AuthWhitelist> auth_whitelist = std::make_shared<AuthWhitelist>();
+        std::shared_ptr<PathBlacklist> path_blacklist = std::make_shared<PathBlacklist>();
+        std::shared_ptr<JWTAuth> jwt_auth;
+        std::shared_ptr<RateLimiter> rate_limiter;
+        std::shared_ptr<const RateLimiter::Config> rate_policy;
+        std::shared_ptr<const CorsPolicy> cors_policy = std::make_shared<const CorsPolicy>();
+    };
+
+    explicit SecurityRules(bool staging) : staging_(staging) {}
+
+    // Global monotonic generation counter for snapshot versioning.
+    // Both load_from_config() and reload() call this to ensure unique generations.
+    static uint64_t next_generation() {
+        static std::atomic<uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Parse + validate the JWT section into a JWTAuth (or nullptr when auth is
     // explicitly disabled). Throws std::invalid_argument on a fail-open config
     // (missing secret/key without jwt_disabled). Pure w.r.t. member state, so
@@ -320,15 +360,35 @@ private:
         return std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
     }
 
-    mutable std::mutex rules_mu_;  // protects shared rule pointers and snapshot fields
-    IpBlacklist ip_blacklist_;
-    AuthWhitelist auth_whitelist_;
-    PathBlacklist path_blacklist_;
-    std::shared_ptr<JWTAuth> jwt_auth_;
-    std::shared_ptr<RateLimiter> rate_limiter_;
-    std::vector<std::string> trusted_proxies_;
-    bool case_sensitive_paths_ = false;
-    std::shared_ptr<const CorsPolicy> cors_policy_ = std::make_shared<const CorsPolicy>();
+    const SecuritySnapshot* snapshot_fast() const {
+        // TLS cache eliminates per-request refcount contention.
+        // Key: (owner pointer, generation). Each snapshot publish gets unique generation.
+        struct TLSCache {
+            const SecurityRules* owner = nullptr;
+            uint64_t generation = 0;
+            std::shared_ptr<const SecuritySnapshot> holder;
+        };
+        thread_local TLSCache tls_cache;
+
+        auto current_gen = generation_.load(std::memory_order_acquire);
+        if (tls_cache.owner != this || tls_cache.generation != current_gen) {
+            std::lock_guard<std::mutex> lock(snapshot_mu_);
+            tls_cache.holder = snapshot_;
+            tls_cache.owner = this;
+            tls_cache.generation = current_gen;
+        }
+        return tls_cache.holder.get();  // no refcount operation
+    }
+
+    std::shared_ptr<const SecuritySnapshot> snapshot_copy() const {
+        std::lock_guard<std::mutex> lock(snapshot_mu_);
+        return snapshot_;
+    }
+
+    mutable std::mutex snapshot_mu_;
+    std::shared_ptr<const SecuritySnapshot> snapshot_;
+    std::atomic<uint64_t> generation_{0};
+    bool staging_ = false;
 
     // Check if JWT claims contain the specified role
     static bool has_role(const JWTClaims& claims, const std::string& role) {
@@ -438,29 +498,30 @@ private:
         return rule;
     }
 
-    void normalize_path_items(std::vector<std::string>& items) const {
+    static void normalize_path_items(std::vector<std::string>& items, bool case_sensitive_paths) {
         for (auto& item : items) {
             if (!item.empty() && item.front() == '/') {
-                normalize_path_key(item);
-            } else if (!case_sensitive_paths_) {
+                normalize_path_key(item, case_sensitive_paths);
+            } else if (!case_sensitive_paths) {
                 std::transform(item.begin(), item.end(), item.begin(),
                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             }
         }
     }
 
-    void normalize_path_keys(std::vector<std::pair<std::string, std::string>>& items) const {
+    static void normalize_path_keys(std::vector<std::pair<std::string, std::string>>& items,
+                                    bool case_sensitive_paths) {
         for (auto& [key, _] : items) {
-            normalize_path_key(key);
+            normalize_path_key(key, case_sensitive_paths);
         }
     }
 
-    bool normalize_path_key(std::string& key) const {
+    static bool normalize_path_key(std::string& key, bool case_sensitive_paths) {
         if (key.empty() || key.front() != '/') {
             return true;
         }
         bool prefix = key.size() > 1 && key.back() == '/';
-        auto norm = normalize_path(key, case_sensitive_paths_);
+        auto norm = normalize_path(key, case_sensitive_paths);
         if (!norm.valid) {
             LOG_WARN("Ignoring invalid security path rule: ", key, ", reason=", norm.error);
             key.clear();

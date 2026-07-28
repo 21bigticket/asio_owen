@@ -78,3 +78,35 @@ TEST(UpstreamManager, PoolStatsIncludesServiceNameAndCounters) {
     EXPECT_NE(stats.find("reused=0"), std::string::npos);
     EXPECT_NE(stats.find("created=0"), std::string::npos);
 }
+
+TEST(UpstreamManager, ReloadReusesUnchangedPoolAndReplacesChangedPool) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto initial = make_upstream_config("zebra-config", "127.0.0.1", 30001);
+    manager.reload(initial, HttpPool::Config{});
+    auto before = manager.route("/zebra-config/path");
+    ASSERT_TRUE(before.has_value());
+
+    manager.reload(initial, HttpPool::Config{});
+    auto unchanged = manager.route("/zebra-config/path");
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(unchanged->pool, before->pool);
+
+    auto changed = make_upstream_config("zebra-config", "127.0.0.1", 30002);
+    manager.reload(changed, HttpPool::Config{});
+    auto after = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->config.port, 30002);
+    EXPECT_NE(after->pool, before->pool);
+}
+
+TEST(UpstreamManager, ReloadPublishesRemovalAsPartOfWholeMapReplacement) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    load_upstream(manager, "zebra-config", "127.0.0.1", 30001);
+
+    Config empty;
+    manager.reload(empty, HttpPool::Config{});
+
+    EXPECT_FALSE(manager.route("/zebra-config/path").has_value());
+}

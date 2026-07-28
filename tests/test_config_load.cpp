@@ -98,6 +98,38 @@ TEST(ConfigLoad, ParsesClientHeaderReadTimeout) {
     std::filesystem::remove_all(base);
 }
 
+TEST(ConfigLoad, ParsesComboDeadlineAndInFlightLimit) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "combo_deadline_ms = 250\n"
+        "combo_max_in_flight_queries = 12\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.combo_deadline_ms, 250);
+    EXPECT_EQ(app.combo_max_in_flight_queries, 12u);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, ClampsInvalidComboLimits) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "combo_deadline_ms = 0\n"
+        "combo_max_in_flight_queries = 0\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    auto app = app_config_from(cfg);
+    EXPECT_EQ(app.combo_deadline_ms, 1);
+    EXPECT_EQ(app.combo_max_in_flight_queries, 1u);
+
+    std::filesystem::remove_all(base);
+}
+
 TEST(ConfigLoad, ParsesMysqlQueryTimeout) {
     auto base = make_temp_config_dir();
     write_file(base / "config.d" / "10-mysql.ini",

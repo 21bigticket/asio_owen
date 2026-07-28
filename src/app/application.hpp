@@ -7,6 +7,7 @@
 #include <asio.hpp>
 
 #include "app_config.hpp"
+#include "combo_query_limiter.hpp"
 #include "pool_stats_service.hpp"
 #include "reload_service.hpp"
 #include "snapshot_service.hpp"
@@ -32,6 +33,7 @@ private:
     asio::io_context ioc_;
     std::unique_ptr<MysqlPool> mysql_;
     std::unique_ptr<RedisPool> redis_;
+    std::shared_ptr<ComboQueryLimiter> combo_query_limiter_;
     std::unique_ptr<HttpServer> server_;
     std::unique_ptr<SecurityRules> security_rules_;
     std::unique_ptr<ReloadService> reload_service_;

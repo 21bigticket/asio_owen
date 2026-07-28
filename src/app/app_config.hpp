@@ -17,6 +17,8 @@ struct AppConfig {
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
     int client_body_read_timeout_ms = 30000;
+    int combo_deadline_ms = 500;
+    size_t combo_max_in_flight_queries = 8;
     MysqlPool::Config mysql;
     RedisPool::Config redis;
     HttpPool::Config http_pool;
@@ -54,6 +56,9 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.downstream_write_timeout_ms = cfg.get_int("server", "downstream_write_timeout_ms", 30000);
     app.client_header_read_timeout_ms = cfg.get_int("server", "client_header_read_timeout_ms", 10000);
     app.client_body_read_timeout_ms = cfg.get_int("server", "client_body_read_timeout_ms", 30000);
+    app.combo_deadline_ms = std::max(1, cfg.get_int("server", "combo_deadline_ms", 500));
+    app.combo_max_in_flight_queries = static_cast<size_t>(std::max(
+        1, cfg.get_int("server", "combo_max_in_flight_queries", 8)));
 
     app.mysql = MysqlPool::Config{
         .host = cfg.get("mysql", "host", "127.0.0.1"),

@@ -122,20 +122,6 @@ public:
         }
     }
 
-    void track_active(HttpConn* conn) {
-        if (!conn) return;
-        auto& shard = state_->shards[conn->shard_idx];
-        std::lock_guard lock(shard.mtx);
-        shard.active.insert(conn);
-    }
-
-    void untrack_active(HttpConn* conn) {
-        if (!conn) return;
-        auto& shard = state_->shards[conn->shard_idx];
-        std::lock_guard lock(shard.mtx);
-        shard.active.erase(conn);
-    }
-
     static void untrack_active(const std::shared_ptr<State>& state, HttpConn* conn) noexcept {
         if (!conn) return;
         auto& shard = state->shards[conn->shard_idx];
@@ -287,10 +273,6 @@ public:
         }
     }
 
-    void release(HttpConn conn) {
-        release(state_, std::make_unique<HttpConn>(std::move(conn)));
-    }
-
     static void release(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) noexcept {
         auto shard_idx = conn->shard_idx;
         auto& shard = state->shards[shard_idx];
@@ -350,10 +332,6 @@ public:
             decrement_counter(state->total_count);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
         }
-    }
-
-    void release_bad(HttpConn conn) {
-        release_bad(state_, std::make_unique<HttpConn>(std::move(conn)));
     }
 
     static void release_bad(const std::shared_ptr<State>& state, std::unique_ptr<HttpConn> conn) noexcept {

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <random>
+
 #include "security/path_normalize.hpp"
 
 TEST(PathNormalize, StripsQueryStringBeforeMatching) {
@@ -36,4 +38,19 @@ TEST(PathNormalize, CaseSensitiveModePreservesCase) {
     auto normalized = normalize_path("/API/Health", true);
 
     EXPECT_EQ(normalized.path, "/API/Health");
+}
+
+TEST(PathNormalize, ValidOutputIsIdempotentAcrossDeterministicFuzzInputs) {
+    std::minstd_rand rng(0x5EED);
+    constexpr std::string_view alphabet = "/.%?ABCxyz012";
+    for (int i = 0; i < 2000; ++i) {
+        std::string raw = "/";
+        for (int j = 0; j < 32; ++j) raw += alphabet[rng() % alphabet.size()];
+
+        auto once = normalize_path(raw);
+        if (!once.valid) continue;
+        auto twice = normalize_path(once.path);
+        ASSERT_TRUE(twice.valid) << raw;
+        EXPECT_EQ(twice.path, once.path) << raw;
+    }
 }

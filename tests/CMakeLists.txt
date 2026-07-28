@@ -36,6 +36,11 @@ add_executable(test_http_protocol test_http_protocol.cpp)
 target_link_libraries(test_http_protocol PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_http_protocol)
 
+# Reusable downstream deadline state machine
+add_executable(test_http_io test_http_io.cpp)
+target_link_libraries(test_http_io PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_http_io)
+
 # JSON response envelope (escape rules)
 add_executable(test_response test_response.cpp)
 target_link_libraries(test_response PRIVATE gtest_main asio_owen_core)
@@ -85,6 +90,16 @@ gtest_discover_tests(test_redis_pool)
 add_executable(test_rate_limiter test_rate_limiter.cpp)
 target_link_libraries(test_rate_limiter PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_rate_limiter)
+
+# /api/combo soft-deadline permit accounting
+add_executable(test_combo_query_limiter test_combo_query_limiter.cpp)
+target_link_libraries(test_combo_query_limiter PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_combo_query_limiter)
+
+# /api/combo response status and cache-fallback flow without external services
+add_executable(test_combo_routes test_combo_routes.cpp ${PROJECT_SOURCE_DIR}/src/app/routes.cpp)
+target_link_libraries(test_combo_routes PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_combo_routes)
 
 # End-to-end client session via real HttpServer + tcp client
 add_executable(test_client_session test_client_session.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)

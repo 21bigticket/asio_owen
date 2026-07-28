@@ -37,13 +37,26 @@ inline BodyReadStatus body_status_from_io(const IoResult& result) {
     return BodyReadStatus::SysError;
 }
 
+inline asio::awaitable<IoResult> read_body_some(
+    asio::ip::tcp::socket& sock,
+    char* buf,
+    size_t size,
+    std::chrono::milliseconds timeout,
+    OperationDeadline* deadline) {
+    if (deadline) {
+        co_return co_await read_with_timeout(sock, buf, size, timeout, *deadline);
+    }
+    co_return co_await read_with_timeout(sock, buf, size, timeout);
+}
+
 inline asio::awaitable<std::optional<std::string>> consume_line(
     asio::ip::tcp::socket& sock,
     std::string& buffer,
     std::chrono::milliseconds timeout,
     asio::error_code* out_ec = nullptr,
     BodyReadStatus* out_status = nullptr,
-    size_t max_line_size = kMaxChunkControlLineSize) {
+    size_t max_line_size = kMaxChunkControlLineSize,
+    OperationDeadline* deadline = nullptr) {
     while (true) {
         auto pos = buffer.find("\r\n");
         if (pos != std::string::npos) {
@@ -56,7 +69,7 @@ inline asio::awaitable<std::optional<std::string>> consume_line(
             co_return std::nullopt;
         }
         char tmp[kHttpIoBufferSize];
-        auto read = co_await read_with_timeout(sock, tmp, sizeof(tmp), timeout);
+        auto read = co_await read_body_some(sock, tmp, sizeof(tmp), timeout, deadline);
         if (!read.ok()) {
             if (out_ec) *out_ec = read.ec;
             if (out_status) *out_status = body_status_from_io(read);
@@ -72,7 +85,8 @@ inline asio::awaitable<BodyReadStatus> consume_exact(
     std::string& out,
     size_t len,
     std::chrono::milliseconds timeout,
-    asio::error_code* out_ec = nullptr) {
+    asio::error_code* out_ec = nullptr,
+    OperationDeadline* deadline = nullptr) {
     while (len > 0) {
         if (!buffer.empty()) {
             size_t take = std::min(len, buffer.size());
@@ -82,7 +96,7 @@ inline asio::awaitable<BodyReadStatus> consume_exact(
             continue;
         }
         char tmp[kHttpIoBufferSize];
-        auto read = co_await read_with_timeout(sock, tmp, sizeof(tmp), timeout);
+        auto read = co_await read_body_some(sock, tmp, sizeof(tmp), timeout, deadline);
         if (!read.ok()) {
             if (out_ec) *out_ec = read.ec;
             co_return body_status_from_io(read);
@@ -97,7 +111,8 @@ inline asio::awaitable<BodyReadResult> read_content_length_body(
     std::string& preread,
     size_t content_length,
     size_t max_body_size,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    OperationDeadline* deadline = nullptr) {
     BodyReadResult result;
     if (content_length > max_body_size) {
         // Do not drain an oversized body. The caller must stop reusing this
@@ -116,7 +131,8 @@ inline asio::awaitable<BodyReadResult> read_content_length_body(
     preread.clear();
     size_t remaining = content_length - result.body.size();
     asio::error_code ec;
-    auto status = co_await consume_exact(sock, preread, result.body, remaining, timeout, &ec);
+    auto status = co_await consume_exact(
+        sock, preread, result.body, remaining, timeout, &ec, deadline);
     if (status != BodyReadStatus::Success) {
         result.status = status;
         result.ec = ec;
@@ -130,12 +146,14 @@ inline asio::awaitable<BodyReadResult> read_chunked_body(
     asio::ip::tcp::socket& sock,
     std::string& preread,
     size_t max_body_size,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    OperationDeadline* deadline = nullptr) {
     BodyReadResult result;
     while (true) {
         asio::error_code ec;
         BodyReadStatus line_status = BodyReadStatus::Success;
-        auto line = co_await consume_line(sock, preread, timeout, &ec, &line_status);
+        auto line = co_await consume_line(
+            sock, preread, timeout, &ec, &line_status, kMaxChunkControlLineSize, deadline);
         if (!line) {
             result.status = line_status;
             result.ec = ec;
@@ -150,7 +168,8 @@ inline asio::awaitable<BodyReadResult> read_chunked_body(
 
         if (*chunk_size == 0) {
             while (true) {
-                auto trailer = co_await consume_line(sock, preread, timeout, &ec, &line_status);
+                auto trailer = co_await consume_line(
+                    sock, preread, timeout, &ec, &line_status, kMaxChunkControlLineSize, deadline);
                 if (!trailer) {
                     result.status = line_status;
                     result.ec = ec;
@@ -170,7 +189,8 @@ inline asio::awaitable<BodyReadResult> read_chunked_body(
         }
 
         std::string tmp;
-        auto status = co_await consume_exact(sock, preread, tmp, *chunk_size + 2, timeout, &ec);
+        auto status = co_await consume_exact(
+            sock, preread, tmp, *chunk_size + 2, timeout, &ec, deadline);
         if (status != BodyReadStatus::Success) {
             result.status = status;
             result.ec = ec;

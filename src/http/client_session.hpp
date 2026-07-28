@@ -67,13 +67,15 @@ public:
         try {
             char buf[kClientReadBufferSize];
             std::string client_preread;
+            auto executor = co_await asio::this_coro::executor;
+            OperationDeadline client_deadline(executor);
             auto client_header_timeout = std::chrono::milliseconds(state_->client_header_read_timeout_ms);
             auto client_body_timeout = std::chrono::milliseconds(state_->client_body_read_timeout_ms);
 
             while (state_->running) {
                 while (client_preread.find("\r\n\r\n") == std::string::npos) {
                     auto read = co_await read_with_timeout(
-                        socket, buf, sizeof(buf), client_header_timeout);
+                        socket, buf, sizeof(buf), client_header_timeout, client_deadline);
                     if (!read.ok()) {
                         if (client_preread.empty()) {
                             LOG_DEBUG("Client read stopped before sending data: status=",
@@ -157,7 +159,7 @@ public:
                     handled = true;
                 } else if (request_header_state.is_chunked) {
                     auto body_result = co_await read_chunked_body(
-                        socket, preread, kMaxBodySize, client_body_timeout);
+                        socket, preread, kMaxBodySize, client_body_timeout, &client_deadline);
                     if (!body_result.ok()) {
                         LOG_INFO("Reject invalid chunked body: method=", method_str,
                             ", path=", path_str,
@@ -182,7 +184,8 @@ public:
                 } else if (request_header_state.content_length) {
                     size_t content_length = *request_header_state.content_length;
                     auto body_result = co_await read_content_length_body(
-                        socket, preread, content_length, kMaxBodySize, client_body_timeout);
+                        socket, preread, content_length, kMaxBodySize, client_body_timeout,
+                        &client_deadline);
                     if (!body_result.ok()) {
                         LOG_INFO("Reject request body read failed: method=", method_str,
                             ", path=", path_str,
@@ -250,7 +253,7 @@ public:
                 }
 
                 std::shared_ptr<const CorsPolicy> cors_policy;
-                if (state_->security_rules) {
+                if (state_->security_rules && state_->security_rules->cors_enabled_fast()) {
                     cors_policy = state_->security_rules->cors_policy();
                 }
 
@@ -434,7 +437,7 @@ public:
                 auto resp = build_downstream_response(ctx, method_str, proxy_response);
 
                 auto write_result = co_await write_with_timeout(socket, resp,
-                    std::chrono::milliseconds(state_->downstream_write_timeout_ms));
+                    std::chrono::milliseconds(state_->downstream_write_timeout_ms), client_deadline);
                 if (!write_result.ok()) {
                     LOG_WARN("Client response write failed: method=", method_str,
                         ", path=", path_str,

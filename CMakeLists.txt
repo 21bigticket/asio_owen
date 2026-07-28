@@ -4,6 +4,17 @@ if(POLICY CMP0135)
 endif()
 project(asio_owen LANGUAGES C CXX)
 
+set(ASIO_OWEN_SANITIZER "" CACHE STRING "Optional sanitizer: address or thread")
+if(ASIO_OWEN_SANITIZER STREQUAL "address")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+elseif(ASIO_OWEN_SANITIZER STREQUAL "thread")
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
+elseif(NOT ASIO_OWEN_SANITIZER STREQUAL "")
+    message(FATAL_ERROR "ASIO_OWEN_SANITIZER must be address or thread")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
@@ -202,6 +213,7 @@ add_executable(server
         picohttpparser.c
 )
 target_link_libraries(server PRIVATE asio_owen_core)
+target_compile_options(server PRIVATE $<$<CONFIG:Release>:-g>)
 
 # 复制 config.d/ 目录（如果存在），排除本地覆盖文件
 if(EXISTS ${PROJECT_SOURCE_DIR}/config.d)

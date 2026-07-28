@@ -120,11 +120,11 @@ done
 void start_reload_timer() {
     // 定时器在 io_context 线程触发,只 post 任务到 thread pool
     reload_timer_.expires_after(std::chrono::seconds(30));
-    reload_timer_.async_wait([this](boost::system::error_code ec) {
+    reload_timer_.async_wait([this](std::error_code ec) {
         if (ec) return;
         
         // 重 I/O 操作扔到线程池
-        boost::asio::post(thread_pool_, [this] {
+        asio::post(thread_pool_, [this] {
             auto fingerprint = read_config_fingerprint();  // stat() 在这里跑,不卡 io_context
             if (fingerprint != last_fingerprint_) {
                 reload_config();

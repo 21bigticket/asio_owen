@@ -30,6 +30,18 @@ struct JWTClaims {
 
 namespace detail {
 
+struct BioFreeAll {
+    void operator()(BIO* bio) const { BIO_free_all(bio); }
+};
+
+struct BioFree {
+    void operator()(BIO* bio) const { BIO_free(bio); }
+};
+
+struct MdCtxFree {
+    void operator()(EVP_MD_CTX* ctx) const { EVP_MD_CTX_free(ctx); }
+};
+
 // Build PEM-encoded RSA public key from JWKS base64url n (modulus) and e (exponent)
 // Returns empty string on failure.
 inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const std::string& e_b64url) {
@@ -45,15 +57,21 @@ inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const
         while (b64.size() % 4) b64 += '=';
         
         auto len = b64.size();
-        auto bio = BIO_new_mem_buf(b64.data(), static_cast<int>(len));
-        if (!bio) return {};
-        auto b64_bio = BIO_new(BIO_f_base64());
-        BIO_push(b64_bio, bio);
-        BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL);
+        BIO* input = BIO_new_mem_buf(b64.data(), static_cast<int>(len));
+        if (!input) return {};
+        std::unique_ptr<BIO, BioFreeAll> b64_bio(BIO_new(BIO_f_base64()));
+        if (!b64_bio) {
+            BIO_free(input);
+            return {};
+        }
+        if (!BIO_push(b64_bio.get(), input)) {
+            BIO_free(input);
+            return {};
+        }
+        BIO_set_flags(b64_bio.get(), BIO_FLAGS_BASE64_NO_NL);
         
         std::vector<unsigned char> out(len);
-        int dec_len = BIO_read(b64_bio, out.data(), static_cast<int>(len));
-        BIO_free_all(b64_bio);
+        int dec_len = BIO_read(b64_bio.get(), out.data(), static_cast<int>(len));
         if (dec_len <= 0) return {};
         out.resize(dec_len);
         return out;
@@ -101,19 +119,16 @@ inline std::string build_rsa_pubkey_from_jwks(const std::string& n_b64url, const
     struct EVP_PKEY_Deleter { void operator()(EVP_PKEY* p) const { EVP_PKEY_free(p); } };
     std::unique_ptr<EVP_PKEY, EVP_PKEY_Deleter> pkey(raw_pkey);
     
-    auto mem_bio = BIO_new(BIO_s_mem());
+    std::unique_ptr<BIO, BioFree> mem_bio(BIO_new(BIO_s_mem()));
     if (!mem_bio) return {};
     
-    if (PEM_write_bio_PUBKEY(mem_bio, pkey.get()) != 1) {
-        BIO_free(mem_bio);
+    if (PEM_write_bio_PUBKEY(mem_bio.get(), pkey.get()) != 1) {
         return {};
     }
     
     char* pem_data = nullptr;
-    long pem_len = BIO_get_mem_data(mem_bio, &pem_data);
+    long pem_len = BIO_get_mem_data(mem_bio.get(), &pem_data);
     std::string pem(pem_data, static_cast<size_t>(pem_len));
-    
-    BIO_free(mem_bio);
     return pem;
 }
 
@@ -177,12 +192,12 @@ private:
 
     // Load RSA public key from PEM string at construction time
     void load_rsa_key() {
-        auto bio = BIO_new_mem_buf(public_key_.data(), static_cast<int>(public_key_.size()));
+        std::unique_ptr<BIO, detail::BioFree> bio(
+            BIO_new_mem_buf(public_key_.data(), static_cast<int>(public_key_.size())));
         if (!bio) {
             throw std::runtime_error("JWT: failed to create BIO for RSA public key");
         }
-        EVP_PKEY* raw = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
-        BIO_free(bio);
+        EVP_PKEY* raw = PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
         if (!raw) {
             throw std::runtime_error("JWT: failed to parse RSA public key PEM");
         }
@@ -237,16 +252,15 @@ private:
     // Trade-off: we lose jwt-cpp's algorithm/claims registry, so do_verify
     // manually checks `alg` header, issuer, exp, and nbf.
     static bool verify_rs256(const std::string& data, const std::string& signature, EVP_PKEY* pkey) {
-        auto ctx = EVP_MD_CTX_new();
+        std::unique_ptr<EVP_MD_CTX, detail::MdCtxFree> ctx(EVP_MD_CTX_new());
         if (!ctx) return false;
         bool ok = false;
-        if (EVP_VerifyInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
-            EVP_VerifyUpdate(ctx, data.data(), data.size()) == 1 &&
-            EVP_VerifyFinal(ctx, reinterpret_cast<const unsigned char*>(signature.data()),
+        if (EVP_VerifyInit_ex(ctx.get(), EVP_sha256(), nullptr) == 1 &&
+            EVP_VerifyUpdate(ctx.get(), data.data(), data.size()) == 1 &&
+            EVP_VerifyFinal(ctx.get(), reinterpret_cast<const unsigned char*>(signature.data()),
                            static_cast<unsigned int>(signature.size()), pkey) == 1) {
             ok = true;
         }
-        EVP_MD_CTX_free(ctx);
         return ok;
     }
 

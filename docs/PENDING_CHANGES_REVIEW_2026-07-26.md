@@ -1,6 +1,6 @@
 # 未提交改动代码审查 — 2026-07-26
 
-> 审查范围：截至 2026-07-26 工作树中相对 `HEAD`（`d948077 v2-shell`）的全部未提交改动。
+> 审查范围：截至 2026-07-26 工作树中相对 `HEAD`（`88b0460 v2-shell`）的全部未提交改动。
 > 改动性质：`PERF_ISSUES_TRIAGE_2026-07-21.md` 中三处性能修复的实现 + bench 脚本增强 + 两篇排查文档。
 > 审查方式：静态逐行审查（未重新执行压测）；对每个"看似可疑"的点都回查了被调用方源码。
 >
@@ -215,7 +215,7 @@ config.d 目录被删除期间，`current_fingerprint` 恒为 nullopt → `confi
 
 **O-2. `read_config_fingerprint()` 的 stat 仍在 io_context 线程同步执行**
 
-`TROUBLESHOOTING_LATENCY_SPIKES.md` §2.3 建议"把 `stat()` 挪到 thread pool"。本修复未做该迁移，但相比修改前（`Config::load` 在 io_context 线程**读全部文件内容 + getline parse**），现在只做几次 `file_size`/`last_write_time`（本质 stat）、**不读文件内容**，开销从 O(文件数 × 文件大小) 降到 O(文件数)。对 config.d 中几个 ini 文件，stat 是微秒级，可忽略。属合理工程取舍，未必要为几个 stat 引入跨线程 post 的复杂度。仅在 config.d 文件数未来大幅增长时才需要 revisit。
+`TROUBLESHOOTING_LATENCY_SPIKES.md` §2.3 建议"把 `stat()` 挪到 thread pool"。本修复未做该迁移，但相比修改前（`Config::load` 在 io_context 线程**读全部文件内容 + getline parse**），现在只做几次 `file_size`/`last_write_time`（本质 stat）、**不读文件内容**，开销从 O(文件数 × 文件大小) 降到 O(文件数)。对当前只有少量 ini 文件的部署，这通常是合理工程取舍；但本审查未测量文件系统调用耗时，不能把它断言为可忽略。若延迟尖刺仍与 reload tick 对齐，或 config.d 文件数显著增长，应先采样 `stat()` 延迟，再决定是否迁移到 worker pool。
 
 **O-3. bench 脚本依赖 Linux 专属工具（`pidstat`/`nproc`）**
 
@@ -244,10 +244,10 @@ triage 报告 §问题#1 末尾已自注此项为"非 bug"。对常规运维足�
 - 运行时验证分两层：压测基线 + 8 分钟稳态日志；并补了 2026-07-22 的高水位回收测试（此前唯一缺口）。
 - 结论克制严谨：明确区分"消除可复现病态尖刺（max 270→63ms）" vs "环境级偶发长尾（health 164ms）"，不把后者归给本次 fix；明确"吞吐噪声大，不下吞吐结论"。这种不夸大、不乱归因的写法值得保持。
 
-**`TROUBLESHOOTING_LATENCY_SPIKES.md`** — ✅（一处小不一致）
+**`TROUBLESHOOTING_LATENCY_SPIKES.md`** — ✅
 - 排查流程图清晰，"环境抖动 / 冷启动 / 周期性阻塞 / 资源饱和"四分类实用。
 - §7"何时需要修代码"的 4 条判定标准（warm 后仍复现 + 时间戳与定时任务对齐 + 系统监控正常 + 超 SLA）非常务实，能避免误改代码。
-- **小不一致**：§2.3 示例代码（第 123 行）用了 `boost::asio::post` 和 `boost::system::error_code`，但本项目是 standalone ASIO（无 Boost，见 `CLAUDE.md`）。仅是示例伪代码，不影响实际，但严格说会对读者产生误导，建议改为 `asio::post` / `std::error_code`。
+- standalone ASIO 示例已与项目对齐，使用 `asio::post` / `std::error_code`。
 
 ---
 
@@ -264,7 +264,7 @@ triage 报告 §问题#1 末尾已自注此项为"非 bug"。对常规运维足�
 
 1. **可直接提交**：`src/` 下五处改动 + `tests/test_http_pool.cpp`（核心修复 + 回归测试，已验证）。
 2. **建议提交前修掉**：`bench/bench_full.sh:50` 的 `pgrep` 优先级（一行改动，见 §4 修法）。
-3. **可选改进**（不阻塞提交）：O-1（reload 日志噪音）、O-3（bench 工具检查）、troubleshooting 文档的 `boost::` → `asio::` 修正。
+3. **可选改进**（不阻塞提交）：O-1（reload 日志噪音）、O-3（bench 工具检查）。
 4. **文档**：两篇均可随代码一并提交。
 
 ### 提交信息建议（参考 `~/.claude/rules/git-workflow.md`）
@@ -326,21 +326,21 @@ perf(app,db,http): eliminate periodic hot-path stalls and idle-conn leaks
 
 ### 7.3 更新后 6 维度评分表（含加权计算）
 
-| 维度 | 权重 | 07-19 基线 | 本轮(07-26) | 变动 | 加权(本轮) |
+| 维度 | 权重 | 07-19 基线 | 当前 HEAD | 变动 | 加权(当前) |
 |------|------|-----------|------------|------|-----------|
 | 架构设计 | 20% | 8.0 | **8.0** | — | 1.600 |
-| 内存安全 / RAII | 20% | 7.5 | **7.5** | — | 1.500 |
+| 内存安全 / RAII | 20% | 7.5 | **8.0** | +0.5 | 1.600 |
 | 并发正确性 | 15% | 7.5 | **7.6** | +0.1 | 1.140 |
-| 异常安全 / 健壮性 | 15% | 6.5 | **6.5** | — | 0.975 |
-| 性能工程 | 15% | 8.5 | **8.7** | +0.2 | 1.305 |
+| 异常安全 / 健壮性 | 15% | 6.5 | **6.7** | +0.2 | 1.005 |
+| 性能工程 | 15% | 8.5 | **8.6** | +0.1 | 1.290 |
 | 工程纪律 | 15% | 7.0 | **7.2** | +0.2 | 1.080 |
-| **合计** | 100% | **7.54 ≈ 7.5** | **7.600 ≈ 7.6** | **+0.06 ≈ +0.1** | — |
+| **合计** | 100% | **7.540 ≈ 7.5** | **7.715 ≈ 7.7** | **+0.175（展示分 +0.2）** | — |
 
 加权计算过程（透明可复算）：
 ```
-8.0×0.20 + 7.5×0.20 + 7.6×0.15 + 6.5×0.15 + 8.7×0.15 + 7.2×0.15
-= 1.600 + 1.500 + 1.140 + 0.975 + 1.305 + 1.080
-= 7.600
+8.0×0.20 + 8.0×0.20 + 7.6×0.15 + 6.7×0.15 + 8.6×0.15 + 7.2×0.15
+= 1.600 + 1.600 + 1.140 + 1.005 + 1.290 + 1.080
+= 7.715
 ```
 
 ### 7.4 分维度详评（对标 07-19 §3 格式：撑分 / 扣分 / 动作）
@@ -356,16 +356,13 @@ fingerprint 短路（`reload_service.hpp:69` `read_config_fingerprint`）是"配
 
 **07-19 列的架构扣分项（关停 fragile / 无统一 strand / `State::~State` 与 `shutdown` 职责重叠）本轮均未触及**，故无加分空间。
 
-#### 7.4.2 内存安全 / RAII —— 7.5 → **7.5**（不变）
+#### 7.4.2 内存安全 / RAII —— 7.5 → **8.0**（+0.5）
 
-**为什么不变**：本轮未改任何 RAII 结构：
-- `mysql_pool.hpp:318` 只改 while 条件（加 `total_ > min_size`），连接归还/销毁仍走原有 `ConnectionGuard` RAII。
-- `evict_stale` 路径的 socket close 用 `asio::error_code` 重载（`http_pool.hpp:503` `shard.idle.front().socket.close(ec)`），不抛异常，无新增内存安全问题。
-- 锁层级验证无死锁（见本 review §2.3 核实点 A），无 use-after-free 风险。
+**已完成的关键修复（`d948077`，在本轮性能提交之前）**：
+- P1-1 已修：`ConnGuard::~ConnGuard()` 明确 `noexcept`；`HttpPool::release/release_bad` 同样 `noexcept`，`idle.push_back` 的 OOM 会关闭连接并回滚计数，而非从析构函数传播异常导致 `terminate`。
+- P1-2 已修：`HttpPool::acquire()` 把 `make_unique<HttpConn>` 放入回滚保护的 `try` 内；分配或 `active.insert` 抛异常时，`total_count` 和 `in_flight_count` 都会撤销预留。
 
-**07-19 列的 RAII 扣分项（P1-1 `~ConnGuard` noexcept+可抛→terminate、P1-2 `make_unique` 在 try 外 OOM 泄漏、SEC-P3-1/2 jwt_auth 的 `EVP_MD_CTX`/`BIO` 未 RAII、SEC-P3-4 裸指针 `security_rules`）本轮均未触及**。→ 维持 7.5。
-
-> 附带观察：#2 的 min_size 保护让暖连接不再被周期性 close/rebuild，间接减少了 `mysql_close`+重连循环里的边界状态，但这是健壮性的边缘改善，不构成 RAII 维度提分。
+**仍扣分**：`jwt_auth` 的 `EVP_MD_CTX`/`BIO` 尚未 RAII 化，`security_rules` 仍有依赖生命周期不变量的裸指针。两项 P1 消除后，RAII 主干可从 7.5 提至 8.0；本轮 #2/#3 没有引入新的资源所有权风险。
 
 #### 7.4.3 并发正确性 —— 7.5 → **7.6**（+0.1）
 
@@ -379,39 +376,30 @@ fingerprint 短路（`reload_service.hpp:69` `read_config_fingerprint`）是"配
 
 综合：+0.1，到 7.6。
 
-#### 7.4.4 异常安全 / 健壮性 —— 6.5 → **6.5**（不变，仍是最弱项）
+#### 7.4.4 异常安全 / 健壮性 —— 6.5 → **6.7**（+0.2，仍是最弱项）
 
-**为什么不变 —— 本轮三处修复全部绕开异常路径**：
-- #1：`Config::load` 失败时 `last_config_fingerprint_` 不更新（`reload_service.hpp:52` 仅 load 成功才 `std::move`），语义正确但属原有 try/catch 框架，未改异常处理。
-- #2：`mysql_pool.hpp:318` 纯 while 条件改动，无异常路径变化。
-- #3：`evict_stale` 全程 `error_code` 重载，不抛。
+**改善来源**：上节两项 P1 修复同时消除了异常安全问题：析构路径不再因连接池扩容 OOM 而 `terminate`，`HttpConn` 分配失败也不会永久泄漏池计数。#1/#2/#3 本身未扩大异常边界。
 
-**07-18/07-19 列的异常安全扣分项（本轮均未修，逐一确认仍存）**：
-- 07-18 P2 #2：`rate_limiter.hpp:217` `snapshot_busy_` exchange/store 间无 RAII，深拷贝抛 bad_alloc → 标志卡 true → `~RateLimiter` 析构时 stack-unwinding 再抛 → `std::terminate`。
-- 07-18 P2 #3：`rate_limiter.hpp:371` `write_snapshot` 不查 failbit → 截断文件原子覆盖好快照 → 重启限流状态全丢且不可恢复。
+**仍存的异常安全扣分项**：
 - 07-18 P2 #4：`upstream_manager.hpp:114` `add_upstream_locked` `make_shared` 抛异常留两 map 不一致 → `route().at()` 抛 `out_of_range` → 500，且不可自愈。
-- 07-19 P1-1：`~ConnGuard` 隐式 noexcept 调可抛 `release`（push_back bad_alloc）→ terminate。
-- 07-19 P1-2：`acquire` 里 `make_unique<HttpConn>` 在 try 外 → OOM 时全局计数器永久泄漏。
-- 07-19 APP-P2-1：`co_spawn(detached)` 的 `start()` 协程异常 → `std::terminate`（同文件其他协程都有兜底，唯独这个没有）。
-- 07-19 APP-P2-3：`timer_.cancel()` 无 ec 重载 → 可抛 system_error 致 cleanup 部分跳过。
 
-→ 异常安全仍是 6.5。**这也是本轮总分只动 +0.1 的根本原因**（见 §7.5）。
+**后续已完成（不重新估算本节历史分数）**：`RateLimiter::persist_snapshot()` 已用 RAII 恢复 busy 标志并检查 write/flush/close；accept loop 的 detached 协程已有异常完成处理器。剩余分数上限主要受 upstream reload 异常原子性和更广泛的关停路径审计限制。
 
-#### 7.4.5 性能工程 —— 8.5 → **8.7**（+0.2，最强项继续加固）
+#### 7.4.5 性能工程 —— 8.5 → **8.6**（+0.1，最强项继续加固）
 
-**撑分（本轮新增，三项均有压测验证）**：
+**撑分（本轮新增，有运行时记录佐证）**：
 - **消除 `rules_mu_` 周期性写锁 stall**（#1）：MySQL 压测的可复现病态尖刺 `max=270.58ms / stdev=12.11ms` → 修复后两轮收敛到 `max=63.78ms / 73.40ms`、`stdev≈1.5/1.9ms`（triage 报告附录 A）。吞吐持平，符合"消 stall 不增吞吐"预期。
 - **消除暖连接 churn**（#2）：稳态 `total=8, idle=8` 长期静止，无修复前每 30s 的 `recycled→added` 空转（triage 报告附录 B）。
 - **HttpPool idle 不再依赖流量回收**（#3）：停流量后 `zebra-config` 从 `total=93, idle=93` 在 ≥`idle_timeout_sec` 内回落至 `total=0`（2026-07-22 补测）；fd 不再累积。
 
-**一个需说明的校准点**：07-19 评估时（07-19）**尚未发现**这三处隐患（它们是 07-21 triage 才定位的）。也就是说 07-19 给性能工程的 8.5，是在"不知道有 reload 锁 stall / mysql churn / http pool idle 泄漏"的前提下打的。严格讲，若 07-19 当时发现这三处，性能工程应只有 ~8.2-8.3。本轮修复后，实际性能水位 = "修正 07-19 盲区" + "三项优化落实" → 略高于原 8.5。给 8.7 是"修正盲区 + 净改善"的合并结果，不是单纯在 8.5 上叠 +0.2。
+**评分校准**：07-19 评估未覆盖这三处问题，它的 8.5 不应被事后反推为 8.2-8.3；那会把未知缺陷的假设混入增量评分。本轮代码和运行日志表明三个确定的资源/周期性工作问题已得到缓解，因此给 +0.1。由于本审查未独立复跑压测，且现有数据只有两轮短压测、没有 p95/p99 分位数或受控环境的重复样本，不把一次 `max`/stdev 收敛当作足以支撑 +0.2 的定量性能结论。
 
-**07-19 §3.5 列的性能扣分项（本轮未修，仍存）**：
-- APP-P3-2：`log_warn/log_error` 无 `should_log` 短路，级别过滤时仍拼字符串。
+**07-19 §3.5 列的性能扣分项（仍存）**：
 - `trusted_proxies_` 每请求全量 `std::vector<std::string>` 拷贝（`security_rules.hpp:147` 的快照拷贝，与 #1 同源，但 #1 只减了写侧频率，没改读侧的 per-request copy）。
-- `/api/combo` 无真超时（CLAUDE.md 宣称的 500ms `with_timeout` 实际不存在）。
 
-→ 性能工程 8.5 → 8.7。要再往上必须修上面三个扣分项，不是继续叠 perf 优化。
+**后续已完成（不将软 deadline 误记为查询取消）**：logger 所有级别入口均在格式化前检查 `should_log()`；`/api/combo` 的 MySQL fallback 有 500ms soft deadline 和最多 8 个 in-flight permit。deadline 返回 504，但不取消同步 MySQL；worker completion 才释放 permit。
+
+→ 性能工程 8.5 → 8.6。要再往上必须修上面三个扣分项，并用受控、多轮基准确认收益。
 
 #### 7.4.6 工程纪律 —— 7.0 → **7.2**（+0.2）
 
@@ -421,21 +409,21 @@ fingerprint 短路（`reload_service.hpp:69` `read_config_fingerprint`）是"配
 - **文档质量**：`PERF_ISSUES_TRIAGE_2026-07-21.md` 根因定位到行 + 双 agent 压测验证 + 2026-07-22 高水位回收补测；`TROUBLESHOOTING_LATENCY_SPIKES.md` 给出"何时需要修代码"的 4 条判定标准。文档意识强（07-19 已点名这是项目优点之一）。
 
 **为什么只 +0.2**：
-- 07-19 §3.6 明确列的 dead code（HTTP-P2-2 `release/release_bad`、HTTP-P3-2 成员版 `track_active/untrack_active`、DB-P3-1 `acquire_worker`、DB-P3-2 `RedisReplyGuard` move）**本轮均未清**。
-- 07-19 §3.6 列的**文档漂移 4 处**（`timeout.hpp`/`with_timeout` 不存在、`/api/combo` 500ms fallback 不存在、`char sql_buf[4096]` 已废弃、`gateway-debug-20260703` 调试 marker 残留）**本轮均未修**。
-- 本轮甚至**新增了一处小漂移**：`TROUBLESHOOTING_LATENCY_SPIKES.md:123` 示例用了 `boost::asio::post`（本项目是 standalone ASIO，无 Boost）——见本 review §5。
+- HTTP-P2-2 `release/release_bad` 与 HTTP-P3-2 成员版 `track_active/untrack_active` 已删除；`RedisPool::acquire_worker` 经回查仍是 worker 模式入口，不是 dead code。`RedisReplyGuard` move 语义仍可在后续 API 收口时简化。
+- 07-19 列的文档漂移中，`gateway-debug-20260703` 调试 marker 已删除；`/api/combo` soft deadline 的语义已在 `CLAUDE.md` 和 `DB_POOL_DESIGN.md` 对齐。其余历史文档仍应随代码演进复核。
+- 本轮新增文档已与 standalone ASIO 接口对齐；既有四处文档漂移仍未处理。
 
-→ 工程纪律 7.0 → 7.2。系统性的"改代码必更文档""定期 dead code 扫描""CI 上 sanitizers"流程未建立（07-19 §3.6 根因分析指出的流程问题），单次清理不足以大幅提分。
+**后续已完成（不回填本节历史分数）**：`.github/workflows/sanitizers.yml` 在 push/PR 上运行 ASan 与 TSan，构建并执行不依赖 socket 或外部数据库的测试集。它为并发状态机和内存边界提供持续验证，但尚不能替代完整集成环境的 sanitizer 覆盖。
 
-### 7.5 关键解读 —— 为什么这轮做了三件事，总分只动 +0.1
+### 7.5 关键解读 —— 为什么当前 HEAD 为 7.7，而性能提交本身只贡献有限
 
-这轮 perf 修复质量很高（无 P0/P1 bug、压测验证、回归测试齐全），但在 07-19 打分框架里位移很小。三个结构性原因，全部印证 07-19 报告 §7 的核心论断（"瓶颈不是能力，是流程"）：
+当前 HEAD 相比 07-19 基线的总提升为 +0.175：其中 `d948077` 已完成的两项 P1 资源/异常安全修复贡献了主要增量，本轮性能提交的直接量化贡献是并发 +0.1、性能 +0.1、工程纪律 +0.2。后者质量很高（逻辑核实、运行记录、回归测试齐全），但在 07-19 的权重模型里位移有限。三个结构性原因，仍印证 07-19 报告 §7 的核心论断（"瓶颈不是能力，是流程"）：
 
-1. **最弱项异常安全（6.5，权重 15%）完全没动**。07-19 明确说"从 7.5 冲 8.5 最大的杠杆是异常安全""如果只能做一件事：先把异常安全从 6.5 拉到 8.0，ROI 最高"。本轮三处修复都绕开了异常路径，等于没碰最大杠杆。
-2. **两个高权重维度（架构 20%、内存 20%）本轮没碰**。这轮是 perf + 卫生优化，不是架构调整或 RAII 加固，40% 权重的维度纹丝不动。
-3. **性能虽是强项且本轮重点，但权重只有 15%、基数已高（8.5）**，边际增益对总分的贡献 = 0.2 × 15% = 0.03。
+1. **异常安全仍是最弱项（6.7，权重 15%）**。两项 P1 已修，但 `RateLimiter`、detached 协程和关停路径的异常处理仍未系统化；从 6.7 拉到 8.0 仍是最高杠杆。
+2. **架构设计（20%）本轮未触及**。本轮是性能与代码卫生优化，不是生命周期或并发模型的架构调整。
+3. **性能虽是强项且本轮重点，但权重只有 15%、基数已高（8.5）**，本轮 +0.1 的直接加权贡献仅为 0.015。
 
-**这轮改动的真实价值不在"涨分"，而在**：
+**本轮性能改动的真实价值不只在"涨分"，还在**：
 - **巩固最强项**（性能工程，消除三个被压测证实的隐患）；
 - **顺带还一笔 dead code 债**（evict_stale 转正）；
 - **建立可复现的 perf 排查方法论**（两篇文档 + bench 脚本的进程级监控）。
@@ -446,32 +434,32 @@ fingerprint 短路（`reload_service.hpp:69` `read_config_fingerprint`）是"配
 
 | 阶段 | 目标分 | 关键动作 | 对应维度提升 |
 |------|--------|---------|-------------|
-| 本轮后现状 | **7.6** | — | — |
-| → §6.1 | **~7.9-8.0** | 修 P1-1 + P1-2（http_pool try 边界 + `~ConnGuard` try/catch）；清文档漂移 4 处；删 dead code（HTTP-P2-2 等）；`timer_.cancel(ec)` 三处 | 异常 6.5→7.0、纪律 7.2→7.5 |
-| → §6.2 | **~8.4** | detached 协程统一异常兜底（APP-P2-1）；reload 两阶段原子化（SEC-P2-1）；acceptor 上 strand（APP-P2-2）；补 jwt_auth RAII（SEC-P3-1/2）；`/api/combo` 错误响应+真超时；logger 短路加固 | 异常 7.0→8.0、并发 7.6→8.0 |
+| 本轮后现状 | **7.7** | 未四舍五入为 7.715 | — |
+| → §6.1 | **~7.8** | 已完成 `persist_snapshot()` RAII/完整写入检查；继续清理文档漂移与剩余 API 卫生项 | 异常 6.7→7.0、纪律 7.2→7.5 |
+| → §6.2 | **~8.2** | 已完成 acceptor strand、detached 异常兜底、SecurityRules 两阶段 reload、jwt_auth RAII，及 `/api/combo` soft deadline + in-flight permit；剩余工作是补跨层回归测试和审计其他异常边界 | 内存 8.0→8.5、异常 7.0→8.0、并发 7.6→8.0、纪律 7.5→8.0 |
 | → §6.3 | **~9.0** | TSan/ASan 进 CI；异常安全全链路审计；显式生命周期管理替代隐式不变量；统一 strand 策略；fuzz 测试；错误处理统一框架；关停流程重写 | 全维度系统性提升 |
 
-**最大杠杆仍是 §6.1 的异常安全项**（P1-1/P1-2 + APP-P2-1/3），把 6.5 拉到 7.0-8.0，单点即可推综合分 +0.3~0.5，远高于本轮三处 perf 修复的 +0.1。
+**最大杠杆仍是 §6.1/§6.2 的异常安全项**（snapshot RAII、APP-P2-1/3）。异常安全从 6.7 提到 7.0 或 8.0，对综合分的直接贡献分别为 +0.045 和 +0.195；再叠加内存安全、并发和工程纪律的配套改进，路线图才可到约 7.8 / 8.2。它仍明显高于本轮三处性能修复的直接加权贡献。
 
 ### 7.7 评分快照（对标 07-19 §8，扩展为本轮增量列）
 
 | 维度 | 07-19 基线 | 本轮(07-26) | 修完 §6.1 | 修完 §6.2 | 冲刺 §6.3 |
 |------|-----------|------------|----------|----------|----------|
 | 架构设计 | 8.0 | **8.0** | 8.0 | 8.0 | 9.0 |
-| 内存安全 / RAII | 7.5 | **7.5** | 8.0 | 8.5 | 9.0 |
+| 内存安全 / RAII | 7.5 | **8.0** | 8.0 | 8.5 | 9.0 |
 | 并发正确性 | 7.5 | **7.6** | 7.6 | 8.0 | 9.0 |
-| 异常安全 / 健壮性 | 6.5 | **6.5** | 7.0 | 8.0 | 9.0 |
-| 性能工程 | 8.5 | **8.7** | 8.7 | 8.7 | 9.0 |
+| 异常安全 / 健壮性 | 6.5 | **6.7** | 7.0 | 8.0 | 9.0 |
+| 性能工程 | 8.5 | **8.6** | 8.6 | 8.6 | 9.0 |
 | 工程纪律 | 7.0 | **7.2** | 7.5 | 8.0 | 9.0 |
-| **综合** | **7.5** | **7.6** | **~7.9** | **~8.4** | **~9.0** |
+| **综合** | **7.5** | **7.7** | **~7.8** | **~8.2** | **~9.0** |
 
 ### 7.8 本评分对齐的边界声明（诚实边界）
 
-1. **本轮审查未重新执行压测**。性能工程维度的 +0.2 依据来自 triage 报告中双 agent 的压测日志（MySQL max 270→63ms、稳态 8/8 无 churn、zebra-config 93→0 回收），本审查只做了静态核实，未独立复跑。
+1. **本轮审查未重新执行压测**。性能工程维度的 +0.1 依据来自 triage 报告中的运行记录（MySQL max 270→63ms、稳态 8/8 无 churn、zebra-config 93→0 回收）；本审查只做了静态核实，未独立复跑。现有记录可证明功能性改善，但不足以单独量化整体尾延迟收益。
 2. **维度得分的 ±0.1/0.2 是判断性估值，非精确测量**。07-19 本身也是"判断性打分 + 档位锚点"方法论，本轮沿用同一粒度，不假装比基准更精确。
-3. **本轮改动范围外的扣分项（07-18 P2 #1-#10、07-19 P1-1/P1-2/APP-P2-x/SEC-P2-x 等）均默认"仍存"**，除非有后续 commit 明确修复。本节在"仍存"判断上逐条做了确认（见各维度"扣分"段），但未对全部条目重新读码——凡未在本轮 diff 中出现的，按"未改动"处理。
+3. **除已按 `d948077` 复核并上调的 P1-1/P1-2 外，范围外的扣分项（07-18 P2 #1-#10、07-19 APP-P2-x/SEC-P2-x 等）默认仍存**，除非有后续 commit 明确修复。本节对已引用的条目做了当前源码核实；未重新全仓审计的条目按"未改动"处理。
 4. **若后续把方向2（`SecurityRules` 上 `shared_mutex` 或 shared_ptr 换指针）也做了**，并发正确性可从 7.6 再上 0.2-0.3（机制级修复，非频率缓解），那是独立于本轮的下一步。
 
 ---
 
-*审查者：Claude Code / 2026-07-26（静态逐行审查，回查 http_pool/config/upstream_manager 源码核实调用契约）。未重新执行压测；运行时验证以 triage 报告中双 agent 压测日志为准。评分对齐（§7）以 `docs/DESIGN_ASSESSMENT_CLAUDE_2026-07-19.md` 为基准，方法论沿用其 6 维度加权模型。*
+*审查者：Claude Code / 2026-07-26（静态逐行审查，回查 http_pool/config/upstream_manager 源码核实调用契约）。未重新执行压测；运行时验证以 triage 报告中的历史运行记录为准。评分对齐（§7）以 `docs/DESIGN_ASSESSMENT_CLAUDE_2026-07-19.md` 为基准，方法论沿用其 6 维度加权模型，并纳入当前 HEAD 中 `d948077` 和 `88b0460` 的相关修复。*

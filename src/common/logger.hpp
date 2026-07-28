@@ -86,16 +86,20 @@ void log_info_impl(const Args&... args) {
 
 template <typename... Args>
 void log_warn_impl(const Args&... args) {
-    std::ostringstream oss;
-    log_to_stream(oss, args...);
-    Logger::instance().get()->warn(oss.str());
+    if (Logger::instance().get()->should_log(spdlog::level::warn)) {
+        std::ostringstream oss;
+        log_to_stream(oss, args...);
+        Logger::instance().get()->warn(oss.str());
+    }
 }
 
 template <typename... Args>
 void log_error_impl(const Args&... args) {
-    std::ostringstream oss;
-    log_to_stream(oss, args...);
-    Logger::instance().get()->error(oss.str());
+    if (Logger::instance().get()->should_log(spdlog::level::err)) {
+        std::ostringstream oss;
+        log_to_stream(oss, args...);
+        Logger::instance().get()->error(oss.str());
+    }
 }
 
 template <typename... Args>

@@ -1,0 +1,25 @@
+name: Sanitizers
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhiredis-dev libmysqlclient-dev pkg-config
+      - name: Configure
+        run: cmake -B build-${{ matrix.sanitizer }} -S . -DASIO_OWEN_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build sanitizer test targets
+        run: cmake --build build-${{ matrix.sanitizer }} --target test_combo_query_limiter test_combo_routes test_rate_limiter test_config_load test_path_normalize test_ip_blacklist test_cors -j 2
+      - name: Run service-free tests
+        run: >-
+          ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
+          -R '^(ComboQueryLimiter|ComboQueryDeadline|ComboRoute|RateLimiter|ConfigLoad|PathNormalize|IpBlacklist|NormalizeIp|MatchCidr|SecurityRuleValues|CorsPolicy|ApplyHeaders|Preflight|LoadCorsPolicy)'

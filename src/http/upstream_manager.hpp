@@ -1,7 +1,6 @@
 #pragma once
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <optional>
 #include <memory>
 #include <shared_mutex>
@@ -45,11 +44,17 @@ public:
     // Hot-reload upstream config from [upstream] section.
     // Old pool is kept alive by in-flight requests holding shared_ptr references.
     void reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
-        std::unique_lock lock(mtx_);
         auto new_upstreams = cfg.get_section("upstream");
+        std::unordered_map<std::string, UpstreamConfig> current_upstreams;
+        std::unordered_map<std::string, std::shared_ptr<HttpPool>> current_pools;
+        {
+            std::shared_lock lock(mtx_);
+            current_upstreams = upstreams_;
+            current_pools = pools_;
+        }
 
-        std::unordered_set<std::string> kept;
-
+        std::unordered_map<std::string, UpstreamConfig> prepared_upstreams;
+        std::unordered_map<std::string, std::shared_ptr<HttpPool>> prepared_pools;
         for (auto& [name, val] : new_upstreams) {
             auto colon = val.find(':');
             if (colon == std::string::npos) continue;
@@ -59,34 +64,22 @@ public:
             if (port_str.empty()) continue;
             int port = 0;
             try { port = std::stoi(port_str); } catch (...) { continue; }
-            kept.insert(name);
-
-            auto it = upstreams_.find(name);
-            if (it != upstreams_.end()) {
-                if (it->second.host != host || it->second.port != port) {
-                    // Replace pool: old one lives until last shared_ptr goes out of scope
-                    pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
-                    it->second = {std::move(host), port};
-                    LOG_INFO("upstream updated: ", name, " -> ", host, ":", port);
-                }
+            auto current = current_upstreams.find(name);
+            if (current != current_upstreams.end() &&
+                current->second.host == host && current->second.port == port) {
+                prepared_pools.emplace(name, current_pools.at(name));
             } else {
-                add_upstream_locked(name, host, port, pool_cfg);
-                LOG_INFO("upstream added: ", name, " -> ", host, ":", port);
+                prepared_pools.emplace(name, std::make_shared<HttpPool>(ioc_, pool_cfg));
             }
+            prepared_upstreams.emplace(name, UpstreamConfig{std::move(host), port});
         }
 
-        // Remove upstreams that are no longer in config
-        std::vector<std::string> to_remove;
-        for (auto& [name, _] : upstreams_) {
-            if (!kept.count(name)) {
-                to_remove.push_back(name);
-            }
+        {
+            std::unique_lock lock(mtx_);
+            upstreams_ = std::move(prepared_upstreams);
+            pools_ = std::move(prepared_pools);
         }
-        for (auto& name : to_remove) {
-            pools_.erase(name);
-            upstreams_.erase(name);
-            LOG_INFO("upstream removed: ", name);
-        }
+        LOG_INFO("upstreams hot-reloaded, count=", new_upstreams.size());
     }
 
     std::string pool_stats() const {
@@ -116,9 +109,4 @@ private:
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
     std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
 
-    void add_upstream_locked(const std::string& name, std::string host, int port,
-                             const HttpPool::Config& pool_cfg = HttpPool::Config{}) {
-        upstreams_[name] = {std::move(host), port};
-        pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
-    }
 };

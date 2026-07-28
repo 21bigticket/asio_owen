@@ -88,6 +88,9 @@ std::filesystem::path make_temp_config_dir() {
         ("asio_owen_jwt_test_" + std::to_string(now));
     std::filesystem::remove_all(base);
     std::filesystem::create_directories(base / "config.d");
+    std::ofstream snapshot_config(base / "config.d" / "99-test-rate-limit.ini");
+    snapshot_config << "[rate_limit]\n"
+                    << "snapshot_path = " << (base / "rate_limit.bin").string() << '\n';
     return base;
 }
 
@@ -222,5 +225,59 @@ TEST(SecurityRules, ExplicitRS256WithoutPublicKeyFailsClosed) {
     SecurityRules rules;
     EXPECT_THROW(rules.load_from_config(cfg), std::invalid_argument);
 
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, FailedReloadKeepsExistingRateLimiter) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_disabled = true\n");
+    write_file(base / "config.d" / "40-rate_limit.ini",
+        "[rate_limit]\n"
+        "ip_rps = 10\n");
+
+    Config good_cfg;
+    ASSERT_TRUE(good_cfg.load(base));
+    SecurityRules rules;
+    rules.load_from_config(good_cfg);
+    auto before = rules.rate_limiter_snapshot();
+    ASSERT_NE(before, nullptr);
+
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_algorithm = HS256\n");
+    Config bad_cfg;
+    ASSERT_TRUE(bad_cfg.load(base));
+    rules.reload(bad_cfg);
+
+    EXPECT_EQ(rules.rate_limiter_snapshot(), before);
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, SuccessfulReloadPreservesRateLimiterInstance) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_disabled = true\n");
+    write_file(base / "config.d" / "40-rate_limit.ini",
+        "[rate_limit]\n"
+        "ip_rps = 10\n");
+
+    Config first_cfg;
+    ASSERT_TRUE(first_cfg.load(base));
+    SecurityRules rules;
+    rules.load_from_config(first_cfg);
+    auto before = rules.rate_limiter_snapshot();
+    ASSERT_NE(before, nullptr);
+
+    write_file(base / "config.d" / "40-rate_limit.ini",
+        "[rate_limit]\n"
+        "ip_rps = 20\n");
+    Config second_cfg;
+    ASSERT_TRUE(second_cfg.load(base));
+    rules.reload(second_cfg);
+
+    EXPECT_EQ(rules.rate_limiter_snapshot(), before);
     std::filesystem::remove_all(base);
 }

@@ -3,6 +3,7 @@
 #include <asio.hpp>
 #include <asio/experimental/parallel_group.hpp>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -49,6 +50,92 @@ inline IoStatus classify_write_error(const asio::error_code& ec, bool timed_out)
         return IoStatus::PeerClosed;
     }
     return IoStatus::SysError;
+}
+
+// Reuses one timer for sequential operations on a single socket. Callers must
+// run both the socket operations and this object on the same strand.
+class OperationDeadline {
+public:
+    explicit OperationDeadline(asio::any_io_executor executor)
+        : timer_(std::move(executor)), state_(std::make_shared<State>()) {}
+
+    uint64_t arm(asio::ip::tcp::socket& socket, std::chrono::milliseconds timeout) {
+        auto state = state_;
+        const uint64_t operation = ++state->next_operation;
+        state->active_operation = operation;
+        timer_.expires_after(timeout);
+        timer_.async_wait([state, &socket, operation](const asio::error_code& ec) {
+            if (ec || state->active_operation != operation) return;
+            state->active_operation = 0;
+            state->timed_out_operation = operation;
+            asio::error_code ignored;
+            socket.cancel(ignored);
+        });
+        return operation;
+    }
+
+    bool disarm(uint64_t operation) {
+        const bool timed_out = state_->timed_out_operation == operation;
+        if (state_->active_operation == operation) {
+            state_->active_operation = 0;
+            timer_.cancel();
+        }
+        return timed_out;
+    }
+
+    void cancel() {
+        state_->active_operation = 0;
+        timer_.cancel();
+    }
+
+private:
+    struct State {
+        uint64_t next_operation = 0;
+        uint64_t active_operation = 0;
+        uint64_t timed_out_operation = 0;
+    };
+
+    asio::steady_timer timer_;
+    std::shared_ptr<State> state_;
+};
+
+inline asio::awaitable<IoResult> read_with_timeout(
+    asio::ip::tcp::socket& sock,
+    char* buf,
+    std::size_t size,
+    std::chrono::milliseconds timeout,
+    OperationDeadline& deadline) {
+    if (timeout.count() <= 0) {
+        asio::error_code ec;
+        auto n = co_await sock.async_read_some(
+            asio::buffer(buf, size), asio::redirect_error(asio::use_awaitable, ec));
+        co_return IoResult{classify_read_error(ec, false, n), n, ec};
+    }
+
+    const auto operation = deadline.arm(sock, timeout);
+    asio::error_code ec;
+    auto n = co_await sock.async_read_some(
+        asio::buffer(buf, size), asio::redirect_error(asio::use_awaitable, ec));
+    co_return IoResult{classify_read_error(ec, deadline.disarm(operation), n), n, ec};
+}
+
+inline asio::awaitable<IoResult> write_with_timeout(
+    asio::ip::tcp::socket& sock,
+    const std::string& data,
+    std::chrono::milliseconds timeout,
+    OperationDeadline& deadline) {
+    if (timeout.count() <= 0) {
+        asio::error_code ec;
+        co_await asio::async_write(
+            sock, asio::buffer(data), asio::redirect_error(asio::use_awaitable, ec));
+        co_return IoResult{classify_write_error(ec, false), ec ? 0 : data.size(), ec};
+    }
+
+    const auto operation = deadline.arm(sock, timeout);
+    asio::error_code ec;
+    auto bytes = co_await asio::async_write(
+        sock, asio::buffer(data), asio::redirect_error(asio::use_awaitable, ec));
+    co_return IoResult{classify_write_error(ec, deadline.disarm(operation)), ec ? 0 : bytes, ec};
 }
 
 inline asio::awaitable<IoResult> read_with_timeout(

@@ -1,6 +1,6 @@
 # 数据库连接池设计文档（当前实现）
 
-> 当前状态更新于 2026-07-13。早期压测、故障排查和阶段性设计请看
+> 当前状态更新于 2026-07-27。早期压测、故障排查和阶段性设计请看
 > `docs/PERF_REPORT.md`、`docs/DB_POOL_CODE_OPTIMIZATION_2026-07-07.md`、
 > `docs/MYSQL_POOL_REVIEW_CONFIRMATION_2026-07-11.md`、
 > `docs/REDIS_POOL_REVIEW_CONFIRMATION_2026-07-11.md` 和
@@ -238,6 +238,7 @@ Redis direct 只能清理当前线程的 TLS 连接；其他线程的 TLS 连接
 | 限制 | 说明 |
 |------|------|
 | MySQL `query_timeout_ms=0` | 当前实现会变为 30s 安全超时，不是无限制。 |
+| `/api/combo` soft deadline | MySQL fallback 超过 `[server] combo_deadline_ms`（默认 500ms）时 HTTP 请求返回 504，但同步 `mysql_query` 不会被取消。查询仍在 SQL worker 上完成并正常归还连接。为避免超时请求积压，cache miss 的 MySQL fallback 在启动前占用固定 permit，最多同时 `combo_max_in_flight_queries`（默认 8）个；permit 只在 worker completion 时释放，因此超时后仍在执行的查询也受此上限约束。满额时新的 cache miss 返回 503。两项参数在启动时读取，修改后需重启。 |
 | MySQL ping 超时 | `read_timeout_ms` 会在 ping 前临时设置 `MYSQL_OPT_READ_TIMEOUT`，ping 后恢复。 |
 | Redis direct | 故障 Redis 会阻塞调用线程直到命令超时。生产稳定性优先时用 worker。 |
 | Redis worker db 假设 | 复用连接时**不再** `SELECT db`，依赖建连时的一次 SELECT + db 固定（切换靠重启）+ 业务不发运行时 `SELECT`。若将来需要运行时多 db 切换，此假设失效，需改为按 db 分池或恢复复用 SELECT。同样不处理 pubsub/MULTI/MONITOR 等连接状态；当前业务未使用这些命令。 |
