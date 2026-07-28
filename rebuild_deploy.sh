@@ -8,6 +8,8 @@ set -euo pipefail
 
 ROOT=${ROOT:-/mnt/mac/Users/mac/code/croot/asio_owen}
 BUILD_DIR=${BUILD_DIR:-$ROOT/build_ubuntu}
+CANDIDATE_BUILD_DIR="${BUILD_DIR}.candidate"
+BACKUP_BUILD_DIR="${BUILD_DIR}.previous_$(date -u +%Y%m%dT%H%M%SZ)"
 SERVICE=asio-owen.service
 RUN_TESTS=${RUN_TESTS:-1}
 KEEP_DEBUG_SYMBOLS=${KEEP_DEBUG_SYMBOLS:-1}
@@ -23,38 +25,40 @@ cd "$ROOT"
 echo "=== rebuild_deploy started: $(date -u +%FT%TZ) ==="
 echo "=== log: $LOG_FILE ==="
 
-echo "=== [1/7] 停止旧服务 ==="
-sudo systemctl stop "$SERVICE" 2>/dev/null || true
-sudo systemctl stop asio-owen-asan.service 2>/dev/null || true
-sleep 2
+echo "=== [1/7] 清理候选构建 ==="
+rm -rf "$CANDIDATE_BUILD_DIR"
 
-echo "=== [2/7] 删除旧构建 ==="
-rm -rf "$BUILD_DIR"
+echo "=== [2/7] cmake 配置候选构建 (Release + tests) ==="
+/usr/bin/cmake -B "$CANDIDATE_BUILD_DIR" -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
-echo "=== [3/7] cmake 配置 (Release + tests) ==="
-/usr/bin/cmake -B "$BUILD_DIR" -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
-
-echo "=== [4/7] 编译 server 和测试 ==="
-/usr/bin/cmake --build "$BUILD_DIR" -j2
+echo "=== [3/7] 编译候选 server 和测试 ==="
+/usr/bin/cmake --build "$CANDIDATE_BUILD_DIR" -j2
 
 if [[ "$RUN_TESTS" == "1" ]]; then
-    echo "=== [5/7] ctest ==="
-    ctest --test-dir "$BUILD_DIR" --output-on-failure
+    echo "=== [4/7] ctest ==="
+    ctest --test-dir "$CANDIDATE_BUILD_DIR" --output-on-failure
 else
-    echo "=== [5/7] ctest skipped (RUN_TESTS=$RUN_TESTS) ==="
+    echo "=== [4/7] ctest skipped (RUN_TESTS=$RUN_TESTS) ==="
 fi
 
-echo "=== [6/7] strip + 启动服务 ==="
+echo "=== [5/7] strip 候选二进制 ==="
 if [[ "$KEEP_DEBUG_SYMBOLS" == "1" ]]; then
-    objcopy --only-keep-debug "$BUILD_DIR/server" "$BUILD_DIR/server.debug"
-    strip --strip-unneeded "$BUILD_DIR/server"
-    objcopy --add-gnu-debuglink="$BUILD_DIR/server.debug" "$BUILD_DIR/server"
-    echo "debug symbols: $BUILD_DIR/server.debug"
+    objcopy --only-keep-debug "$CANDIDATE_BUILD_DIR/server" "$CANDIDATE_BUILD_DIR/server.debug"
+    strip --strip-unneeded "$CANDIDATE_BUILD_DIR/server"
+    objcopy --add-gnu-debuglink="$CANDIDATE_BUILD_DIR/server.debug" "$CANDIDATE_BUILD_DIR/server"
+    echo "debug symbols: $CANDIDATE_BUILD_DIR/server.debug"
 else
-    strip --strip-unneeded "$BUILD_DIR/server"
+    strip --strip-unneeded "$CANDIDATE_BUILD_DIR/server"
 fi
-ls -lh "$BUILD_DIR/server"
+ls -lh "$CANDIDATE_BUILD_DIR/server"
 
+echo "=== [6/7] 切换构建并重启服务 ==="
+sudo systemctl stop "$SERVICE"
+sudo systemctl stop asio-owen-asan.service 2>/dev/null || true
+if [[ -e "$BUILD_DIR" ]]; then
+    mv "$BUILD_DIR" "$BACKUP_BUILD_DIR"
+fi
+mv "$CANDIDATE_BUILD_DIR" "$BUILD_DIR"
 sudo dmesg -c > /dev/null 2>&1 || true
 sudo systemctl restart "$SERVICE"
 sleep 5
@@ -87,3 +91,4 @@ echo ""
 echo "=== segfault: $(sudo dmesg | grep -c segfault || true) ==="
 echo "=== 完成: $(date -u +%FT%TZ) ==="
 echo "=== log: $LOG_FILE ==="
+echo "=== previous build: ${BACKUP_BUILD_DIR:-none} ==="

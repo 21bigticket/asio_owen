@@ -1,6 +1,6 @@
 #include "routes.hpp"
 
-#include <asio/post.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
 
 #include <chrono>
@@ -25,10 +25,11 @@ public:
         co_return co_await mysql_->execute("SELECT 'from_mysql' AS name");
     }
 
-    void set_cache(std::string data) override {
-        auto set = redis_->cmd_argv_sync(
+    asio::awaitable<void> set_cache(std::string data) override {
+        auto set = co_await redis_->cmd_argv(
             {"SET", "cache:user:1", std::move(data), "EX", "300"});
         if (!set.ok) LOG_WARN("combo cache SET failed: ", set.error);
+        co_return;
     }
 
 private:
@@ -129,9 +130,16 @@ asio::awaitable<void> handle_api_combo(HttpContext& ctx, AppServices services) {
         }
         data = std::move(*parsed);
         auto ex = co_await asio::this_coro::executor;
-        // GCC 11 ICEs on the awaitable<void> cache-fill helper; keep this work non-coroutine.
-        asio::post(ex, [backend = services.combo_backend, data] {
-            backend->set_cache(data);
+        auto backend = services.combo_backend;
+        asio::co_spawn(ex, backend->set_cache(data), [backend](std::exception_ptr ep) {
+            if (!ep) return;
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                LOG_WARN("combo cache SET failed: ", e.what());
+            } catch (...) {
+                LOG_WARN("combo cache SET failed with an unknown exception");
+            }
         });
     }
 

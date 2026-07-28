@@ -31,8 +31,9 @@ public:
         co_return query_result;
     }
 
-    void set_cache(std::string data) override {
+    asio::awaitable<void> set_cache(std::string data) override {
         cache = std::move(data);
+        co_return;
     }
 };
 
