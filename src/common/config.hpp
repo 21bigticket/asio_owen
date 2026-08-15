@@ -5,13 +5,21 @@
 #include <tuple>
 #include <fstream>
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
+#include <cmath>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
+#include <system_error>
 #include "logger.hpp"
 
 class Config {
 public:
-    // Load a single ini file
+    // Load a single ini file. Returns false (and stops parsing) on a
+    // malformed line or section header, so a typo cannot silently fall back to
+    // defaults while the caller believes the config was applied.
     bool load_file(const std::filesystem::path& path) {
         std::ifstream file(path);
         if (!file.is_open()) return false;
@@ -21,13 +29,14 @@ public:
             trim(line);
             if (line.empty() || line[0] == '#' || line[0] == ';') continue;
 
-            if (line.front() == '[' && line.back() == ']') {
+            if (line.front() == '[') {
+                if (line.back() != ']') return false;
                 section = line.substr(1, line.size() - 2);
                 continue;
             }
 
             auto eq = line.find('=');
-            if (eq == std::string::npos) continue;
+            if (eq == std::string::npos) return false;
 
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq + 1);
@@ -66,7 +75,8 @@ public:
             });
         for (auto& f : files) {
             if (!load_file(f)) {
-                LOG_WARN("Failed to load config: ", f.string());
+                LOG_ERROR("Failed to load config: ", f.string());
+                return false;
             }
         }
         return true;
@@ -79,36 +89,48 @@ public:
     }
 
     int get_int(const std::string& section, const std::string& key, int def = 0) const {
-        auto s = get(section, key);
-        if (s.empty()) return def;
-        try {
-            return std::stoi(s);
-        } catch (...) {
-            LOG_WARN("Invalid int config ", section, ".", key, "=", s, ", using default=", def);
-            return def;
+        auto it = data_.find(section + "." + key);
+        if (it == data_.end()) return def;
+
+        const auto& value = it->second;
+        int parsed = 0;
+        auto [end, ec] = std::from_chars(
+            value.data(), value.data() + value.size(), parsed);
+        if (value.empty() || ec != std::errc{} || end != value.data() + value.size()) {
+            throw std::invalid_argument(
+                "invalid int config " + section + "." + key + "=" + value);
         }
+        return parsed;
     }
 
     double get_double(const std::string& section, const std::string& key, double def = 0.0) const {
-        auto s = get(section, key);
-        if (s.empty()) return def;
-        try {
-            return std::stod(s);
-        } catch (...) {
-            LOG_WARN("Invalid double config ", section, ".", key, "=", s, ", using default=", def);
-            return def;
+        auto it = data_.find(section + "." + key);
+        if (it == data_.end()) return def;
+
+        const auto& value = it->second;
+        errno = 0;
+        char* end = nullptr;
+        const char* begin = value.c_str();
+        double parsed = std::strtod(begin, &end);
+        if (value.empty() || errno == ERANGE ||
+            end != begin + value.size() || !std::isfinite(parsed)) {
+            throw std::invalid_argument(
+                "invalid double config " + section + "." + key + "=" + value);
         }
+        return parsed;
     }
 
     bool get_bool(const std::string& section, const std::string& key, bool def = false) const {
-        auto s = get(section, key);
-        if (s.empty()) return def;
-        std::transform(s.begin(), s.end(), s.begin(),
+        auto it = data_.find(section + "." + key);
+        if (it == data_.end()) return def;
+
+        auto value = it->second;
+        std::transform(value.begin(), value.end(), value.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (s == "true" || s == "1" || s == "yes" || s == "on") return true;
-        if (s == "false" || s == "0" || s == "no" || s == "off") return false;
-        LOG_WARN("Invalid bool config ", section, ".", key, "=", s, ", using default=", def);
-        return def;
+        if (value == "true" || value == "1" || value == "yes" || value == "on") return true;
+        if (value == "false" || value == "0" || value == "no" || value == "off") return false;
+        throw std::invalid_argument(
+            "invalid bool config " + section + "." + key + "=" + it->second);
     }
 
     // Get all key-value pairs in a section (preserves insertion order, allows duplicate keys)

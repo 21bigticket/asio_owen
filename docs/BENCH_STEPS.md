@@ -51,7 +51,7 @@ EOF
 |:-----|:---------:|:-----------:|:-----|
 | `-t`（线程） | 30 | 4 | 网关 Health 用 30 最优；纯 IO 接口（Redis/MySQL）也用 30 |
 | `-c`（连接） | 100 | 50 | 保持 100 连接不变 |
-| `-d`（时长） | 30s | 5s | 每轮 30s，每接口 2 轮 |
+| `-d`（时长） | 60s | 5s | 性能比较用 60s；小批量验证可用 5s |
 | `--timeout` | 10s | 10s | 超时 10s，避免长尾请求挂住 |
 | 轮间暂停 | 10s | - | 接口间暂停 10s 互不影响 |
 
@@ -59,7 +59,8 @@ EOF
 
 ```bash
 # 全部 5 个接口（Health → Redis → MySQL → Config直连 → Config网关）
-# 每接口 2 轮，轮间暂停 10s
+# 默认：10s warm-up；每接口 2 轮、每轮 30s，输出 p50/p90/p99。
+# 比较优化前后时，建议 ROUNDS=5、DURATION=60s，并固定同一台 VM、配置和日志级别。
 bash bench/bench_full.sh
 
 # 单接口
@@ -68,6 +69,25 @@ bash bench/bench_full.sh redis
 bash bench/bench_full.sh mysql
 bash bench/bench_full.sh config
 ```
+
+### 可比较的性能基线
+
+性能基线与 `perf` 定位必须分两次执行：`perf record` 会带来采样开销，不能把启用它时的
+RPS 和常规基线混在一起。
+
+```bash
+# 常规基线：保留 wrk 原始输出、p50/p90/p99、进程监控、当前 git/config/binary 指纹。
+PROFILE=1 PERF=0 ROUNDS=5 DURATION=60s COOLDOWN=30 \
+  PROFILE_DIR=logs/bench/current bash bench/bench_full.sh health
+
+# 热点定位：同一参数单独跑一轮，可选地采集 perf。
+PROFILE=1 PERF=1 ROUNDS=1 DURATION=60s COOLDOWN=0 \
+  PROFILE_DIR=logs/bench/profile bash bench/bench_full.sh health
+```
+
+每次 `PROFILE=1` 会生成带 UTC 时间戳的目录，`summary.txt` 固化 git revision、配置
+hash、实际运行二进制 hash、wrk 版本和 CPU/内核信息。优化后必须用完全相同的命令重跑，
+比较中位 RPS、p99、错误数和 CPU/上下文切换；不要以单轮 max RPS 下结论。
 
 ### 单次验证脚本
 

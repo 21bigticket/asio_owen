@@ -7,6 +7,7 @@
 #include <functional>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <asio.hpp>
 
@@ -23,7 +24,24 @@
 
 // Security rules: holds all security module instances, exposes a unified check() interface
 class SecurityRules {
+private:
+    struct SecuritySnapshot;
+
 public:
+    class PreparedReload {
+    public:
+        PreparedReload(PreparedReload&&) = default;
+        PreparedReload& operator=(PreparedReload&&) = default;
+        PreparedReload(const PreparedReload&) = delete;
+        PreparedReload& operator=(const PreparedReload&) = delete;
+
+    private:
+        friend class SecurityRules;
+        PreparedReload() = default;
+        std::shared_ptr<const SecuritySnapshot> snapshot_;
+        std::optional<RateLimiter::Config> rate_limiter_config_;
+    };
+
     SecurityRules() = default;
 
     // Load all rules from Config
@@ -127,12 +145,26 @@ public:
         LOG_INFO("Security rules loaded");
     }
 
+    // Generation of the currently published rules, incremented on every
+    // load_from_config/publish_reload. Client sessions record it at check time
+    // and re-check when it moved before routing, so one request never mixes
+    // an old security generation with newly published routes.
+    uint64_t generation() const {
+        return generation_.load(std::memory_order_acquire);
+    }
+
     // Full-chain security check
     // Return value: status_code=0 means allow; non-zero means reject (with HTTP status code)
     struct CheckResult {
         int status_code = 0;
         std::string reason;
         int retry_after_ms = 0;  // only meaningful for 429 (rate limited)
+    };
+
+    struct RequestCheckResult {
+        CheckResult security;
+        std::shared_ptr<const CorsPolicy> cors_policy;
+        uint64_t generation = 0;
     };
 
     CheckResult check(
@@ -142,12 +174,47 @@ public:
         const std::string& xff_header,
         const std::string& auth_header) const
     {
+        auto view = snapshot_view_fast();
+        return check_snapshot(
+            socket, method, raw_path, xff_header, auth_header, view.snapshot);
+    }
+
+    // The security decision, CORS policy, and generation must come from the
+    // same immutable snapshot. ClientSession retains the policy across awaits
+    // and checks the generation again before accepting a dynamic route.
+    RequestCheckResult check_request(
+        asio::ip::tcp::socket& socket,
+        const std::string& method,
+        const std::string& raw_path,
+        const std::string& xff_header,
+        const std::string& auth_header) const
+    {
+        auto view = snapshot_view_fast();
+        RequestCheckResult result;
+        result.generation = view.generation;
+        if (view.snapshot && view.snapshot->cors_policy &&
+            view.snapshot->cors_policy->enabled) {
+            result.cors_policy = view.snapshot->cors_policy;
+        }
+        result.security = check_snapshot(
+            socket, method, raw_path, xff_header, auth_header, view.snapshot);
+        return result;
+    }
+
+private:
+    CheckResult check_snapshot(
+        asio::ip::tcp::socket& socket,
+        const std::string& method,
+        const std::string& raw_path,
+        const std::string& xff_header,
+        const std::string& auth_header,
+        const SecuritySnapshot* snapshot) const
+    {
         // Root path returns 404 directly, skip auth chain
         if (raw_path.empty() || raw_path == "/") {
             return {404, "not found"};
         }
 
-        auto snapshot = snapshot_fast();
         if (!snapshot) return {500, "security rules unavailable"};
 
         // 1. Extract real IP from the immutable snapshot.
@@ -221,6 +288,7 @@ public:
         return {0, ""};
     }
 
+public:
     // Get rate limiter reference (for snapshot timer)
     std::shared_ptr<RateLimiter> rate_limiter_snapshot() const {
         auto snapshot = snapshot_copy();
@@ -246,30 +314,59 @@ public:
     }
 
     // Hot reload: reload from Config
-    void reload(const Config& cfg) {
+    PreparedReload prepare_reload(const Config& cfg) {
+        SecurityRules next(true);
+        next.load_from_config(cfg);
+
+        PreparedReload prepared;
+        prepared.snapshot_ = next.snapshot_copy();
+        auto current_snapshot = snapshot_copy();
+        if (current_snapshot && current_snapshot->rate_limiter &&
+            prepared.snapshot_->rate_policy) {
+            auto mutable_next = std::make_shared<SecuritySnapshot>(*prepared.snapshot_);
+            mutable_next->rate_limiter = current_snapshot->rate_limiter;
+            prepared.rate_limiter_config_.emplace(*prepared.snapshot_->rate_policy);
+            prepared.snapshot_ = std::move(mutable_next);
+        }
+        return prepared;
+    }
+
+    void publish_reload(PreparedReload prepared) {
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mu_);
+            if (prepared.rate_limiter_config_ && prepared.snapshot_->rate_limiter) {
+                prepared.snapshot_->rate_limiter->publish_config(
+                    std::move(*prepared.rate_limiter_config_));
+            }
+            snapshot_ = std::move(prepared.snapshot_);
+            generation_.store(next_generation(), std::memory_order_release);
+        }
         try {
-            SecurityRules next(true);
-            next.load_from_config(cfg);
-            auto next_snapshot = next.snapshot_copy();
-            auto current_snapshot = snapshot_copy();
-            if (current_snapshot && current_snapshot->rate_limiter) {
-                current_snapshot->rate_limiter->publish_config(*next_snapshot->rate_policy);
-                auto mutable_next = std::make_shared<SecuritySnapshot>(*next_snapshot);
-                mutable_next->rate_limiter = current_snapshot->rate_limiter;
-                next_snapshot = std::move(mutable_next);
-            }
-            {
-                std::lock_guard<std::mutex> lock(snapshot_mu_);
-                snapshot_ = std::move(next_snapshot);
-                generation_.store(next_generation(), std::memory_order_release);
-            }
             LOG_INFO("Security rules hot-reloaded");
+        } catch (...) {
+        }
+    }
+
+    bool reload(const Config& cfg) {
+        try {
+            publish_reload(prepare_reload(cfg));
+            return true;
         } catch (const std::exception& e) {
             // load_from_config throws when the new config would disable auth
             // implicitly (missing jwt_secret / jwt_public_key). At startup that
             // aborts boot by design; on hot-reload we must NOT terminate a
             // running server — keep the previously-loaded rules and warn.
-            LOG_ERROR("Security rules hot-reload rejected, keeping previous rules: ", e.what());
+            try {
+                LOG_ERROR("Security rules hot-reload rejected, keeping previous rules: ", e.what());
+            } catch (...) {
+            }
+            return false;
+        } catch (...) {
+            try {
+                LOG_ERROR("Security rules hot-reload rejected by an unknown exception, keeping previous rules");
+            } catch (...) {
+            }
+            return false;
         }
     }
 
@@ -360,7 +457,12 @@ private:
         return std::make_shared<JWTAuth>(secret, issuer, algorithm, pub_key);
     }
 
-    const SecuritySnapshot* snapshot_fast() const {
+    struct SnapshotView {
+        const SecuritySnapshot* snapshot = nullptr;
+        uint64_t generation = 0;
+    };
+
+    SnapshotView snapshot_view_fast() const {
         // TLS cache eliminates per-request refcount contention.
         // Key: (owner pointer, generation). Each snapshot publish gets unique generation.
         struct TLSCache {
@@ -375,9 +477,15 @@ private:
             std::lock_guard<std::mutex> lock(snapshot_mu_);
             tls_cache.holder = snapshot_;
             tls_cache.owner = this;
-            tls_cache.generation = current_gen;
+            // Re-read while holding the publication lock. A publisher may have
+            // advanced between the optimistic load above and this lock.
+            tls_cache.generation = generation_.load(std::memory_order_relaxed);
         }
-        return tls_cache.holder.get();  // no refcount operation
+        return {tls_cache.holder.get(), tls_cache.generation};
+    }
+
+    const SecuritySnapshot* snapshot_fast() const {
+        return snapshot_view_fast().snapshot;
     }
 
     std::shared_ptr<const SecuritySnapshot> snapshot_copy() const {

@@ -231,8 +231,10 @@ send_keep_alive_header = true
 stats_interval_sec = 30
 ```
 
-`[http_pool]` 配置被所有上游连接池共享，目前不支持按 service 覆盖。`[upstream]`
-变化需要重启。
+`[http_pool]` 配置被所有上游连接池共享，目前不支持按 service 覆盖。配置热更新采用
+prepare/publish 两阶段：先完整构造新的安全快照、upstream 映射和所需连接池，全部成功后
+再发布。`[upstream]` host/port 或任一 `[http_pool]` 参数变化时会替换对应池；旧池由在途
+请求的 `shared_ptr` 保活，请求结束后再析构。
 
 ## 已知限制
 
@@ -242,7 +244,7 @@ stats_interval_sec = 30
 | 负载均衡 | 一个 service 对应一个 host:port，没有多实例轮询或熔断。 |
 | 流式 body | 请求和响应 body 都完整缓冲，受 `max_body_size` 限制。 |
 | 连接预热 | 第一次请求承担 resolve/connect 延迟。 |
-| 热更新 | upstream 列表变更需要重启。 |
+| 热更新粒度 | `[http_pool]` 仍是全局配置，不支持按 service 单独覆盖。 |
 | `%2F` upstream 契约 | gateway 转发 raw path，上游必须不解码 `%2F`，否则可能绕过 gateway 路径黑名单。 |
 
 ## 当前性能、复用与内存基线

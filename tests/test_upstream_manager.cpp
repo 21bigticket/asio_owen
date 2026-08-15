@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 
 #include "common/config.hpp"
 #include "http/upstream_manager.hpp"
@@ -29,6 +30,22 @@ void load_upstream(UpstreamManager& manager, const std::string& name,
                    const std::string& host, int port) {
     auto cfg = make_upstream_config(name, host, port);
     manager.reload(cfg, HttpPool::Config{});
+}
+
+// Build a config whose [upstream] section body is given verbatim (for
+// malformed-entry tests).
+Config make_raw_upstream_config(const std::string& section_body) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_upstream_bad_test_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    {
+        std::ofstream out(path);
+        out << "[upstream]\n" << section_body;
+    }
+    Config cfg;
+    cfg.load_file(path);
+    std::filesystem::remove(path);
+    return cfg;
 }
 
 }  // namespace
@@ -100,6 +117,44 @@ TEST(UpstreamManager, ReloadReusesUnchangedPoolAndReplacesChangedPool) {
     EXPECT_NE(after->pool, before->pool);
 }
 
+TEST(UpstreamManager, ReloadReplacesPoolWhenPoolConfigChanges) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto upstream = make_upstream_config("zebra-config", "127.0.0.1", 30001);
+    HttpPool::Config initial_pool_cfg;
+    initial_pool_cfg.max_size = 10;
+    manager.reload(upstream, initial_pool_cfg);
+    auto before = manager.route("/zebra-config/path");
+    ASSERT_TRUE(before.has_value());
+
+    auto changed_pool_cfg = initial_pool_cfg;
+    changed_pool_cfg.max_size = 20;
+    manager.reload(upstream, changed_pool_cfg);
+    auto after = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after.has_value());
+
+    EXPECT_NE(after->pool, before->pool);
+    EXPECT_EQ(after->pool->cfg().max_size, 20u);
+}
+
+TEST(UpstreamManager, PreparedReloadDoesNotPublishEarly) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto initial = make_upstream_config("zebra-config", "127.0.0.1", 30001);
+    manager.reload(initial, HttpPool::Config{});
+
+    auto changed = make_upstream_config("zebra-config", "127.0.0.1", 30002);
+    auto prepared = manager.prepare_reload(changed, HttpPool::Config{});
+    auto before_publish = manager.route("/zebra-config/path");
+    ASSERT_TRUE(before_publish.has_value());
+    EXPECT_EQ(before_publish->config.port, 30001);
+
+    manager.publish_reload(std::move(prepared));
+    auto after_publish = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after_publish.has_value());
+    EXPECT_EQ(after_publish->config.port, 30002);
+}
+
 TEST(UpstreamManager, ReloadPublishesRemovalAsPartOfWholeMapReplacement) {
     asio::io_context ioc;
     UpstreamManager manager(ioc);
@@ -109,4 +164,91 @@ TEST(UpstreamManager, ReloadPublishesRemovalAsPartOfWholeMapReplacement) {
     manager.reload(empty, HttpPool::Config{});
 
     EXPECT_FALSE(manager.route("/zebra-config/path").has_value());
+}
+
+TEST(UpstreamManager, MalformedEntryRejectsWholeReloadAndKeepsExistingRoutes) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    load_upstream(manager, "zebra-config", "127.0.0.1", 30001);
+
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1:\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1:abc\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1:30001x\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1:70000\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = 127.0.0.1:0\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = :30001\n"), HttpPool::Config{}),
+        std::invalid_argument);
+    // IPv6 literals are explicitly rejected rather than mis-parsed.
+    EXPECT_THROW(manager.prepare_reload(
+        make_raw_upstream_config("zebra-config = ::1:30001\n"), HttpPool::Config{}),
+        std::invalid_argument);
+
+    // 即使一批里只有一条非法，既有路由也必须原样保留。
+    auto route = manager.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_EQ(route->config.port, 30001);
+}
+
+TEST(UpstreamManager, GenerationAdvancesOnlyOnPublish) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto g0 = manager.generation();
+
+    auto cfg = make_upstream_config("zebra-config", "127.0.0.1", 30001);
+    manager.reload(cfg, HttpPool::Config{});
+    EXPECT_EQ(manager.generation(), g0 + 1);
+
+    // prepare 不改变代际；只有 publish 递增。
+    auto changed = make_upstream_config("zebra-config", "127.0.0.1", 30002);
+    auto prepared = manager.prepare_reload(changed, HttpPool::Config{});
+    EXPECT_EQ(manager.generation(), g0 + 1);
+    manager.publish_reload(std::move(prepared));
+    EXPECT_EQ(manager.generation(), g0 + 2);
+}
+
+// 多个 config.d 文件按文件名升序加载，后加载的同一 service 条目必须覆盖
+// 先加载的（与 Config::get() 的 "later files override earlier files" 一致）。
+// 回归：曾用 emplace 导致第一条生效、99-local.ini 的覆盖值被忽略。
+TEST(UpstreamManager, LaterConfigFileOverridesEarlierForSameService) {
+    auto base = std::filesystem::temp_directory_path() /
+        ("asio_owen_upstream_override_test_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(base / "config.d");
+    {
+        std::ofstream out(base / "config.d" / "00-first.ini");
+        out << "[upstream]\n"
+            << "zebra-config = 127.0.0.1:30001\n";
+    }
+    {
+        std::ofstream out(base / "config.d" / "01-second.ini");
+        out << "[upstream]\n"
+            << "zebra-config = 127.0.0.2:30002\n";
+    }
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    manager.reload(cfg, HttpPool::Config{});
+
+    auto route = manager.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_EQ(route->config.host, "127.0.0.2");
+    EXPECT_EQ(route->config.port, 30002);
+
+    std::filesystem::remove_all(base);
 }

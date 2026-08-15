@@ -57,6 +57,12 @@ public:
     // Inject security rules
     void set_security_rules(SecurityRules* rules) { state_->security_rules = rules; }
 
+#ifdef ASIO_OWEN_TESTING
+    void set_after_initial_security_check_for_test(std::function<void()> hook) {
+        state_->after_initial_security_check_for_test = std::move(hook);
+    }
+#endif
+
     void stop() {
         asio::dispatch(acceptor_.get_executor(), [this] {
             if (!state_->running.exchange(false)) return;

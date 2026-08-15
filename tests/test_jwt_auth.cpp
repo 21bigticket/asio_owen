@@ -249,7 +249,7 @@ TEST(SecurityRules, FailedReloadKeepsExistingRateLimiter) {
         "jwt_algorithm = HS256\n");
     Config bad_cfg;
     ASSERT_TRUE(bad_cfg.load(base));
-    rules.reload(bad_cfg);
+    EXPECT_FALSE(rules.reload(bad_cfg));
 
     EXPECT_EQ(rules.rate_limiter_snapshot(), before);
     std::filesystem::remove_all(base);
@@ -276,8 +276,39 @@ TEST(SecurityRules, SuccessfulReloadPreservesRateLimiterInstance) {
         "ip_rps = 20\n");
     Config second_cfg;
     ASSERT_TRUE(second_cfg.load(base));
-    rules.reload(second_cfg);
+    EXPECT_TRUE(rules.reload(second_cfg));
 
     EXPECT_EQ(rules.rate_limiter_snapshot(), before);
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, PreparedReloadDoesNotPublishEarly) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_disabled = true\n"
+        "[cors]\n"
+        "enabled = false\n");
+
+    Config first_cfg;
+    ASSERT_TRUE(first_cfg.load(base));
+    SecurityRules rules;
+    rules.load_from_config(first_cfg);
+    ASSERT_FALSE(rules.cors_enabled_fast());
+
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_disabled = true\n"
+        "[cors]\n"
+        "enabled = true\n"
+        "allowed_origins = https://example.test\n");
+    Config second_cfg;
+    ASSERT_TRUE(second_cfg.load(base));
+
+    auto prepared = rules.prepare_reload(second_cfg);
+    EXPECT_FALSE(rules.cors_enabled_fast());
+
+    rules.publish_reload(std::move(prepared));
+    EXPECT_TRUE(rules.cors_enabled_fast());
     std::filesystem::remove_all(base);
 }

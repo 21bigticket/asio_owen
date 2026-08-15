@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <chrono>
+#include <unistd.h>
 
 #include "common/config.hpp"
 #include "app/app_config.hpp"
@@ -172,4 +173,97 @@ TEST(ConfigLoad, ParsesRedisWorkerPoolConfig) {
     EXPECT_EQ(app.redis.acquire_timeout_ms, 456);
 
     std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsMalformedLineWithoutEquals) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-bad.ini",
+        "[server]\n"
+        "port = 8081\n"
+        "this line has no equals sign\n");
+
+    Config cfg;
+    EXPECT_FALSE(cfg.load(base));
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsMalformedSectionHeader) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-bad.ini",
+        "[server\n"
+        "port = 8081\n");
+
+    Config cfg;
+    EXPECT_FALSE(cfg.load(base));
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsUnreadableFileInsteadOfSilentlySkipping) {
+    // chmod 无法阻止 root 读取任何文件：以 root 运行时该用例无法构造
+    // "不可读" 文件，只能跳过（文件权限由操作系统强制，无法在进程内模拟）。
+    if (geteuid() == 0) {
+        GTEST_SKIP() << "running as root: cannot create an unreadable file";
+    }
+
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "port = 8081\n");
+    auto unreadable = base / "config.d" / "01-secret.ini";
+    write_file(unreadable, "[server]\nport = 9090\n");
+    // 清空全部权限（而不是只移除 owner 位）：默认 umask 常为 group/other
+    // 保留读权限，仅移除 owner 位不足以让非特权用户也读不到。
+    std::filesystem::permissions(unreadable, std::filesystem::perms::none,
+        std::filesystem::perm_options::replace);
+
+    Config cfg;
+    EXPECT_FALSE(cfg.load(base));
+
+    std::filesystem::permissions(unreadable, std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace);
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsMalformedSingleFile) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_config_bad_file_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    write_file(path, "no_equals_here\n");
+
+    Config cfg;
+    EXPECT_FALSE(cfg.load_file(path));
+
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigLoad, RejectsInvalidTypedValuesInsteadOfUsingDefaults) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-invalid.ini",
+        "[values]\n"
+        "bad_int = 12x\n"
+        "empty_int =\n"
+        "overflow_int = 999999999999999999999\n"
+        "bad_double = 1.5ms\n"
+        "non_finite_double = inf\n"
+        "bad_bool = enabled\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    EXPECT_THROW(cfg.get_int("values", "bad_int", 7), std::invalid_argument);
+    EXPECT_THROW(cfg.get_int("values", "empty_int", 7), std::invalid_argument);
+    EXPECT_THROW(cfg.get_int("values", "overflow_int", 7), std::invalid_argument);
+    EXPECT_THROW(cfg.get_double("values", "bad_double", 2.0), std::invalid_argument);
+    EXPECT_THROW(cfg.get_double("values", "non_finite_double", 2.0), std::invalid_argument);
+    EXPECT_THROW(cfg.get_bool("values", "bad_bool", false), std::invalid_argument);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, MissingTypedValuesStillUseDefaults) {
+    Config cfg;
+    EXPECT_EQ(cfg.get_int("missing", "int", 7), 7);
+    EXPECT_DOUBLE_EQ(cfg.get_double("missing", "double", 2.5), 2.5);
+    EXPECT_TRUE(cfg.get_bool("missing", "bool", true));
 }

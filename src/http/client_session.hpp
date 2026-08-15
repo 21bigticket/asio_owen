@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -43,6 +45,9 @@ struct HttpServerState {
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
     int client_body_read_timeout_ms = 30000;
+#ifdef ASIO_OWEN_TESTING
+    std::function<void()> after_initial_security_check_for_test;
+#endif
 };
 
 class ClientSession {
@@ -218,11 +223,28 @@ public:
                     ", next_preread=", client_preread.size(),
                     ", body_preview=", sanitize_body_preview(ctx.body));
 
-                if (!handled && state_->security_rules) {
+                // Security and routes are published in two steps by the reload
+                // service (security first, upstreams second). On a multi-worker
+                // io_context a request could otherwise pass the OLD rules on one
+                // thread and then hit a route that was only ADDED afterwards
+                // ("old rules + new route"). We therefore verify that the
+                // generations of both subsystems are stable across the check and
+                // the route lookup, and re-check/re-route when a reload landed
+                // in between (bounded attempts to avoid livelock under a
+                // reload storm). Because security is always published first,
+                // this guarantees every request is judged by rules at least as
+                // new as the route table it is matched against (never the
+                // reverse).
+                uint64_t security_generation = 0;
+                std::shared_ptr<const CorsPolicy> cors_policy;
+                auto run_security_check = [&]() {
                     std::string xff = ctx.get_header("X-Forwarded-For");
                     std::string auth = ctx.get_header("Authorization");
-                    auto result = state_->security_rules->check(
+                    auto checked = state_->security_rules->check_request(
                         socket, method_str, path_str, xff, auth);
+                    security_generation = checked.generation;
+                    cors_policy = std::move(checked.cors_policy);
+                    const auto& result = checked.security;
                     if (result.status_code != 0) {
                         ctx.status_code = result.status_code;
                         // json_resp escapes reason; a future reason containing
@@ -250,11 +272,15 @@ public:
                             }
                         }
                     }
-                }
+                };
 
-                std::shared_ptr<const CorsPolicy> cors_policy;
-                if (state_->security_rules && state_->security_rules->cors_enabled_fast()) {
-                    cors_policy = state_->security_rules->cors_policy();
+                if (!handled && state_->security_rules) {
+                    run_security_check();
+#ifdef ASIO_OWEN_TESTING
+                    if (!handled && state_->after_initial_security_check_for_test) {
+                        state_->after_initial_security_check_for_test();
+                    }
+#endif
                 }
 
                 // CORS preflight: when enabled and this is a genuine preflight
@@ -277,7 +303,36 @@ public:
                 }
 
                 if (!handled) {
-                    auto upstream = state_->upstreams.route(path_str);
+                    // Consistency loop: re-check with the newest security rules
+                    // whenever a reload landed since the previous check, and
+                    // re-route when either subsystem's generation moved during
+                    // the route lookup. Bounded so a reload storm cannot stall
+                    // the request forever; on exhaustion the request falls
+                    // through to 404 rather than matching stale rules against
+                    // a newer route table (fail-closed). The rate limiter may
+                    // count the request more than once; that is the
+                    // conservative direction.
+                    constexpr int kMaxConfigConsistencyAttempts = 3;
+                    std::optional<UpstreamManager::RouteResult> upstream;
+                    for (int attempt = 0; attempt < kMaxConfigConsistencyAttempts; ++attempt) {
+                        if (state_->security_rules &&
+                            security_generation != state_->security_rules->generation()) {
+                            run_security_check();
+                            if (handled) break;
+                        }
+                        const uint64_t upstream_generation_before = state_->upstreams.generation();
+                        upstream = state_->upstreams.route(path_str);
+                        const bool generations_consistent =
+                            state_->upstreams.generation() == upstream_generation_before &&
+                            (!state_->security_rules ||
+                             security_generation == state_->security_rules->generation());
+                        if (generations_consistent) break;
+                        // A hot-reload published between our check and the route
+                        // lookup (or while we were routing): try again with the
+                        // newest generation pair.
+                        upstream.reset();
+                    }
+
                     if (upstream) {
                         const auto& cfg = upstream->config;
                         auto pool = upstream->pool;

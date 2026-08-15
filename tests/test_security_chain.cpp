@@ -134,6 +134,50 @@ TEST_F(SecurityChainTest, CorsFastPathReflectsCurrentSnapshot) {
     EXPECT_TRUE(policy->allowed_origins.contains("https://example.test"));
 }
 
+TEST_F(SecurityChainTest, RequestCheckKeepsSecurityAndCorsOnTheSameGeneration) {
+    auto base = make_temp_config_dir("request_snapshot");
+    write_file(base / "config.d" / "00-test.ini",
+        "[security]\n"
+        "jwt_disabled = true\n"
+        "[cors]\n"
+        "enabled = true\n"
+        "allowed_origins = https://old.example.test\n");
+
+    Config old_cfg;
+    ASSERT_TRUE(old_cfg.load(base));
+    SecurityRules local_rules;
+    local_rules.load_from_config(old_cfg);
+
+    auto old_request = local_rules.check_request(
+        *server_side, "GET", "/api/anything", "", "");
+    ASSERT_EQ(old_request.security.status_code, 0);
+    ASSERT_NE(old_request.cors_policy, nullptr);
+    ASSERT_TRUE(old_request.cors_policy->enabled);
+    EXPECT_TRUE(old_request.cors_policy->allowed_origins.contains(
+        "https://old.example.test"));
+
+    write_file(base / "config.d" / "00-test.ini",
+        "[security]\n"
+        "jwt_disabled = true\n"
+        "[cors]\n"
+        "enabled = false\n");
+    Config new_cfg;
+    ASSERT_TRUE(new_cfg.load(base));
+    local_rules.publish_reload(local_rules.prepare_reload(new_cfg));
+
+    EXPECT_NE(old_request.generation, local_rules.generation());
+    // The in-flight request retains its original immutable policy.
+    EXPECT_TRUE(old_request.cors_policy->enabled);
+
+    auto new_request = local_rules.check_request(
+        *server_side, "GET", "/api/anything", "", "");
+    EXPECT_EQ(new_request.generation, local_rules.generation());
+    // Disabled CORS stays on the no-refcount fast path.
+    EXPECT_EQ(new_request.cors_policy, nullptr);
+
+    std::filesystem::remove_all(base);
+}
+
 TEST_F(SecurityChainTest, RootPathReturns404) {
     auto r = rules->check(*server_side, "GET", "/", "", "");
     EXPECT_EQ(r.status_code, 404);

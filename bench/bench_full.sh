@@ -9,7 +9,8 @@
 #   bash bench/bench_full.sh config       # 只跑 config
 #
 # 环境变量:
-#   DURATION=30s  CONCURRENCY=100  THREADS=30  COOLDOWN=10
+#   DURATION=30s  CONCURRENCY=100  THREADS=30  COOLDOWN=10  ROUNDS=2
+#   WARMUP=1 WARMUP_DURATION=10s  LATENCY=1
 #   HOST=127.0.0.1
 #   PROFILE=1 PROFILE_DIR=logs/bench    # 保留 pidstat/mpstat/wrk 原始结果
 #   PERF=1 PERF_FREQ=49                 # 额外采集 perf (需 root 或免密 sudo)
@@ -30,7 +31,10 @@ CONCURRENCY=${CONCURRENCY:-100}
 THREADS=${THREADS:-30}
 TIMEOUT=10s
 COOLDOWN=${COOLDOWN:-10}
-ROUNDS=2
+ROUNDS=${ROUNDS:-2}
+WARMUP=${WARMUP:-1}
+WARMUP_DURATION=${WARMUP_DURATION:-10s}
+LATENCY=${LATENCY:-1}
 PROFILE=${PROFILE:-0}
 PROFILE_DIR=${PROFILE_DIR:-logs/bench}
 PERF=${PERF:-0}
@@ -76,6 +80,22 @@ duration_seconds() {
     esac
 }
 
+# 哈希某目录下 config.d 全部 *.ini（用于记录配置指纹）
+config_dir_hash() {
+    local dir="$1"
+    [ -d "$dir" ] || return 1
+    # 在目录内计算，使聚合输入只包含相对路径；同一份配置复制到不同部署
+    # 目录后应得到相同指纹。
+    (
+        cd "$dir" || exit 1
+        find . -type f -name '*.ini' -print0 2>/dev/null \
+            | sort -z \
+            | xargs -0 sha256sum 2>/dev/null \
+            | sha256sum \
+            | awk '{print $1}'
+    )
+}
+
 init_profile() {
     [ "$PROFILE" = "1" ] || return
 
@@ -87,8 +107,29 @@ init_profile() {
     {
         echo "benchmark_started=$(ts)"
         echo "host=$HOST duration=$DURATION threads=$THREADS concurrency=$CONCURRENCY cooldown=$COOLDOWN"
+        echo "rounds=$ROUNDS warmup=$WARMUP warmup_duration=$WARMUP_DURATION latency=$LATENCY"
         echo "profile_dir=$PROFILE_OUTPUT_DIR"
         echo "perf_requested=$PERF perf_freq=$PERF_FREQ perf_event=$PERF_EVENT"
+        echo "git_revision=$(git rev-parse --verify HEAD 2>/dev/null || echo unknown)"
+        wrk_version=$(wrk --version 2>&1 | head -1 || true)
+        echo "wrk_version=${wrk_version:-unavailable}"
+        echo "kernel=$(uname -sr)"
+        echo "cpu_count=$(nproc 2>/dev/null || echo unknown)"
+        # 仓库 config.d 与服务实际加载的（可执行文件旁的）config.d 可能因
+        # 部署复制、99-local.ini 或人工修改而不同，两个指纹都记录。
+        # 仓库根目录 = 脚本目录的上一级（bench/ -> 仓库根），不要从脚本目录
+        # 直接拼 config.d，那会得到不存在的 bench/config.d。
+        local repo_config runtime_config server_exe repo_root
+        repo_root=$(cd "$(dirname "$0")/.." && pwd)
+        repo_config=$(config_dir_hash "$repo_root/config.d" || echo unknown)
+        server_exe=$(readlink -f "/proc/$(server_pid)/exe" 2>/dev/null || true)
+        if [ -n "$server_exe" ]; then
+            runtime_config=$(config_dir_hash "$(dirname "$server_exe")/config.d" || echo unknown)
+        else
+            runtime_config=unknown
+        fi
+        echo "config_sha256_repo=$repo_config"
+        echo "config_sha256_runtime=$runtime_config"
     } > "$PROFILE_SUMMARY"
 }
 
@@ -157,6 +198,12 @@ start_monitor() {
     fi
     if [ "$PROFILE" = "1" ]; then
         echo "[$label] server_pid=$target_pid" >> "$PROFILE_SUMMARY"
+        local server_exe
+        server_exe=$(readlink -f "/proc/$target_pid/exe" 2>/dev/null || true)
+        echo "[$label] server_exe=${server_exe:-unknown}" >> "$PROFILE_SUMMARY"
+        if [ -n "$server_exe" ]; then
+            echo "[$label] server_sha256=$(sha256sum "$server_exe" 2>/dev/null | awk '{print $1}')" >> "$PROFILE_SUMMARY"
+        fi
     fi
 
     # 获取系统核心数
@@ -305,8 +352,13 @@ run_wrk() {
     # 启动系统监控
     start_monitor "$label"
 
-    local output
-    output=$(wrk -t"$THREADS" -c"$CONCURRENCY" -d"$DURATION" --timeout "$TIMEOUT" -s "$script" "$url" 2>&1)
+    local -a wrk_args=(wrk -t"$THREADS" -c"$CONCURRENCY" -d"$DURATION" --timeout "$TIMEOUT")
+    [ "$LATENCY" = "1" ] && wrk_args+=(--latency)
+    wrk_args+=(-s "$script" "$url")
+
+    local output wrk_rc
+    output=$("${wrk_args[@]}" 2>&1)
+    wrk_rc=$?
 
     # 停止监控并分析
     stop_monitor
@@ -318,8 +370,20 @@ run_wrk() {
     rps=$(echo "$output" | grep "Requests/sec:" | awk '{print $2}')
     local avg_lat
     avg_lat=$(echo "$output" | grep "Latency" | head -1 | awk '{print $2}')
+    local p50 p90 p99
+    p50=$(echo "$output" | awk '$1 == "50%" { print $2; exit }')
+    p90=$(echo "$output" | awk '$1 == "90%" { print $2; exit }')
+    p99=$(echo "$output" | awk '$1 == "99%" { print $2; exit }')
     local errors
     errors=$(echo "$output" | grep "Non-2xx" | awk '{print $NF}')
+    # Socket errors: connect/read/write/timeout 任一项非 0 都算失败。
+    # 仅看 Non-2xx 会把“连不上/大量超时”误报为通过。
+    local socket_errors sock_total
+    socket_errors=$(echo "$output" | grep "Socket errors:" | sed 's/.*Socket errors: //' | head -1)
+    sock_total=0
+    if [ -n "$socket_errors" ]; then
+        sock_total=$(echo "$socket_errors" | awk -F'[, ]+' '{s=0; for (i=2; i<=NF; i+=2) s+=$i; print s+0}')
+    fi
     if [ "$PROFILE" = "1" ]; then
         local basename
         basename=$(safe_label "$label")
@@ -327,16 +391,29 @@ run_wrk() {
         {
             echo ""
             echo "[$label]"
-            echo "rps=${rps:-missing} avg_latency=${avg_lat:-missing} errors=${errors:-0}"
+            echo "rps=${rps:-missing} avg_latency=${avg_lat:-missing} p50=${p50:-missing} p90=${p90:-missing} p99=${p99:-missing} errors=${errors:-0} socket_errors=${socket_errors:-0} wrk_rc=$wrk_rc"
         } >> "$PROFILE_SUMMARY"
     fi
-    if [ -z "$errors" ]; then
-        RESULTS+=("$label|$rps|$avg_lat|0")
+    local non2xx="${errors:-0}"
+    if [ "$wrk_rc" -eq 0 ] && [ -n "$rps" ] && [ "$sock_total" -eq 0 ] && [ "$non2xx" = "0" ]; then
+        RESULTS+=("$label|$rps|$avg_lat|${p99:-n/a}|0|0")
         ok
     else
-        RESULTS+=("$label|$rps|$avg_lat|$errors")
+        RESULTS+=("$label|$rps|$avg_lat|${p99:-n/a}|$non2xx|$sock_total")
         fail
     fi
+}
+
+warmup() {
+    local name="$1" url="$2" script="$3"
+    [ "$WARMUP" = "1" ] || return
+
+    echo "  [warm-up ${WARMUP_DURATION}]"
+    wrk -t"$THREADS" -c"$CONCURRENCY" -d"$WARMUP_DURATION" --timeout "$TIMEOUT" \
+        -s "$script" "$url" >/dev/null 2>&1 || {
+        echo "  ❌ warm-up 失败" >&2
+        fail
+    }
 }
 
 curl_check() {
@@ -355,7 +432,7 @@ curl_check() {
 
 echo "=========================================="
 echo "  wrk 压测 - ${ROUNDS}轮 × ${DURATION}"
-echo "  ${THREADS}t/${CONCURRENCY}c  暂停${COOLDOWN}s"
+echo "  ${THREADS}t/${CONCURRENCY}c  暂停${COOLDOWN}s  warm-up=${WARMUP}/${WARMUP_DURATION} latency=${LATENCY}"
 if [ "$PROFILE" = "1" ]; then
     init_profile
     echo "  诊断采样: $PROFILE_OUTPUT_DIR"
@@ -368,6 +445,7 @@ run_rounds() {
     echo "--- $name ---"
     # curl 确认
     curl_check "$name" "$url" "$method" "$body" || { fail; echo "  ❌ curl失败，跳过"; return; }
+    warmup "$name" "$url" "$script"
     for i in $(seq 1 $ROUNDS); do
         run_wrk "$name #$i" "$url" "$script"
         [ "$i" -lt "$ROUNDS" ] && sleep "$COOLDOWN"
@@ -421,16 +499,12 @@ echo ""
 echo "========== 汇总 =========="
 echo "通过: $PASS, 失败: $FAIL"
 echo ""
-printf "%-20s %10s %12s %10s\n" "接口" "RPS" "avg_lat" "errors"
-printf "%-20s %10s %12s %10s\n" "--------------------" "----------" "------------" "----------"
+printf "%-20s %10s %12s %12s %10s %10s\n" "接口" "RPS" "avg_lat" "p99" "errors" "sock_err"
+printf "%-20s %10s %12s %12s %10s %10s\n" "--------------------" "----------" "------------" "------------" "----------" "----------"
 for r in "${RESULTS[@]:-}"; do
     [ -n "$r" ] || continue
-    IFS="|" read -r label rps lat err <<< "$r"
-    if [ "$err" = "0" ]; then
-        printf "%-20s %10s %12s %10s\n" "$label" "$rps" "$lat" "0"
-    else
-        printf "%-20s %10s %12s %10s\n" "$label" "$rps" "$lat" "$err"
-    fi
+    IFS="|" read -r label rps lat p99 err sock <<< "$r"
+    printf "%-20s %10s %12s %12s %10s %10s\n" "$label" "$rps" "$lat" "$p99" "${err:-0}" "${sock:-0}"
 done
 echo ""
 [ "$FAIL" -eq 0 ] && echo "✅ 全部正常" || echo "❌ 有失败"
@@ -443,3 +517,9 @@ if [ "$PROFILE" = "1" ]; then
     echo "  诊断日志: $PROFILE_OUTPUT_DIR"
 fi
 echo "=========================================="
+
+# 有失败则用非零退出码结束，供 CI/上层脚本判断
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi
+exit 0

@@ -9,6 +9,7 @@
 #include <optional>
 #include <unordered_set>
 #include <memory>
+#include <new>
 #include <sstream>
 #include <cassert>
 #include "../common/logger.hpp"
@@ -27,6 +28,7 @@ public:
         int idle_timeout_sec = 60;              // pool-level: evict idle connections
         bool send_keep_alive_header = false;    // consumed by proxy layer, not pool
         const Config& ref() const { return *this; }
+        bool operator==(const Config&) const = default;
     };
 
     struct HttpConn {
@@ -68,6 +70,11 @@ public:
         std::atomic<size_t> released_bad{0};
         // Throttle for cross-shard eviction sweep (avoids per-acquire overhead).
         std::atomic<int64_t> last_global_evict_ms{0};
+#ifdef ASIO_OWEN_TESTING
+        // 1: fail before materializing an idle connection; 2: fail before
+        // tracking a reused connection as active. Production builds omit this.
+        std::atomic<int> fail_idle_acquire_stage_for_test{0};
+#endif
 
         State(asio::io_context& io, Config c) : ioc(io), cfg(std::move(c)) {}
 
@@ -176,41 +183,74 @@ public:
         // Step 1: Try to pop an idle connection from any shard.
         std::unique_ptr<HttpConn> idle_conn;
         size_t shard_idx = start_shard;
-        for (size_t try_idx = 0; try_idx < kShards && !idle_conn; ++try_idx) {
-            shard_idx = (start_shard + try_idx) % kShards;
-            auto& shard = state->shards[shard_idx];
-            std::lock_guard lock(shard.mtx);
-            evict_stale_idle(state, shard, state->cfg);
-            while (!shard.idle.empty()) {
-                idle_conn = std::make_unique<HttpConn>(std::move(shard.idle.front()));
-                shard.idle.pop_front();
-                if (idle_conn->connection_close) {
-                    asio::error_code ec;
-                    idle_conn->socket.close(ec);
-                    --shard.total;
-                    decrement_counter(state->total_count);
-                    idle_conn.reset();
-                    continue;
+        try {
+            for (size_t try_idx = 0; try_idx < kShards && !idle_conn; ++try_idx) {
+                shard_idx = (start_shard + try_idx) % kShards;
+                auto& shard = state->shards[shard_idx];
+                std::lock_guard lock(shard.mtx);
+                evict_stale_idle(state, shard, state->cfg);
+                while (!shard.idle.empty()) {
+#ifdef ASIO_OWEN_TESTING
+                    int expected_stage = 1;
+                    if (state->fail_idle_acquire_stage_for_test.compare_exchange_strong(
+                            expected_stage, 0, std::memory_order_relaxed)) {
+                        throw std::bad_alloc();
+                    }
+#endif
+                    idle_conn = std::make_unique<HttpConn>(std::move(shard.idle.front()));
+                    shard.idle.pop_front();
+                    if (idle_conn->connection_close) {
+                        asio::error_code ec;
+                        idle_conn->socket.close(ec);
+                        --shard.total;
+                        decrement_counter(state->total_count);
+                        idle_conn.reset();
+                        continue;
+                    }
+                    if (!idle_conn->read_buffer.empty()) {
+                        asio::error_code ec;
+                        idle_conn->socket.close(ec);
+                        --shard.total;
+                        decrement_counter(state->total_count);
+                        idle_conn.reset();
+                        continue;
+                    }
+                    ++shard.in_flight;
+                    break;
                 }
-                if (!idle_conn->read_buffer.empty()) {
-                    asio::error_code ec;
-                    idle_conn->socket.close(ec);
-                    --shard.total;
-                    decrement_counter(state->total_count);
-                    idle_conn.reset();
-                    continue;
-                }
-                ++shard.in_flight;
-                break;
             }
+        } catch (...) {
+            if (reserved_in_flight) decrement_counter(state->in_flight_count);
+            throw;
         }
 
         if (idle_conn) {
             auto& shard = state->shards[idle_conn->shard_idx];
             idle_conn->reused_from_idle = true;
-            {
+            try {
                 std::lock_guard lock(shard.mtx);
+#ifdef ASIO_OWEN_TESTING
+                int expected_stage = 2;
+                if (state->fail_idle_acquire_stage_for_test.compare_exchange_strong(
+                        expected_stage, 0, std::memory_order_relaxed)) {
+                    throw std::bad_alloc();
+                }
+#endif
                 shard.active.insert(idle_conn.get());
+            } catch (...) {
+                asio::error_code ec;
+                idle_conn->socket.close(ec);
+                {
+                    std::lock_guard lock(shard.mtx);
+                    shard.active.erase(idle_conn.get());
+                    assert(shard.total > 0);
+                    assert(shard.in_flight > 0);
+                    --shard.total;
+                    --shard.in_flight;
+                }
+                decrement_counter(state->total_count);
+                if (reserved_in_flight) decrement_counter(state->in_flight_count);
+                throw;
             }
             state->acquire_reused.fetch_add(1, std::memory_order_relaxed);
             co_return std::move(idle_conn);

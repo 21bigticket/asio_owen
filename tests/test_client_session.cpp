@@ -2,8 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -33,6 +36,49 @@ Config make_upstream_config(const std::string& name, const std::string& host, in
     Config cfg;
     cfg.load_file(path);
     std::filesystem::remove(path);
+    return cfg;
+}
+
+struct TempDirGuard {
+    std::filesystem::path path;
+
+    ~TempDirGuard() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+};
+
+TempDirGuard make_temp_security_dir() {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_client_security_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(path / "config.d");
+    return TempDirGuard{std::move(path)};
+}
+
+Config make_security_config(const std::filesystem::path& base, bool cors_enabled,
+                            const std::string& allowed_origin,
+                            bool include_upstream = false) {
+    {
+        std::ofstream out(base / "config.d" / "00-test.ini", std::ios::trunc);
+        out << "[security]\n"
+            << "jwt_disabled = true\n"
+            << "[cors]\n"
+            << "enabled = " << (cors_enabled ? "true" : "false") << "\n";
+        if (cors_enabled) {
+            out << "allowed_origins = " << allowed_origin << "\n";
+        }
+        out << "[rate_limit]\n"
+            << "snapshot_path = "
+            << (base / "rate_limit.bin").string()
+            << "\n";
+        if (include_upstream) {
+            out << "[upstream]\n"
+                << "dead = 127.0.0.1:1\n";
+        }
+    }
+    Config cfg;
+    EXPECT_TRUE(cfg.load(base));
     return cfg;
 }
 
@@ -311,6 +357,90 @@ TEST_F(ClientSessionTest, ProxyUpstreamFailureReturns502) {
         "\r\n");
 
     EXPECT_TRUE(resp.rfind("HTTP/1.1 502", 0) == 0) << resp;
+}
+
+TEST_F(ClientSessionTest, ReloadBetweenSecurityCheckAndRouteRefreshesCorsPolicy) {
+    auto temp_dir = make_temp_security_dir();
+    auto old_cfg = make_security_config(
+        temp_dir.path, true, "https://old.example.test");
+    SecurityRules rules;
+    rules.load_from_config(old_cfg);
+    server().set_security_rules(&rules);
+
+    std::mutex hook_mu;
+    std::condition_variable hook_cv;
+    bool first_check_entered = false;
+    bool release_first_check = false;
+    int hook_calls = 0;
+    server().set_after_initial_security_check_for_test([&] {
+        std::unique_lock lock(hook_mu);
+        if (++hook_calls != 1) {
+            return;
+        }
+        first_check_entered = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_first_check; });
+    });
+    start_server();
+
+    std::string response;
+    std::exception_ptr client_error;
+    std::thread client([&] {
+        try {
+            response = read_response_with_timeout(port(),
+                "GET /dead/path HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Origin: https://old.example.test\r\n"
+                "Connection: close\r\n"
+                "\r\n");
+        } catch (...) {
+            client_error = std::current_exception();
+        }
+    });
+
+    bool reached_hook = false;
+    {
+        std::unique_lock lock(hook_mu);
+        reached_hook = hook_cv.wait_for(lock, std::chrono::seconds(1), [&] {
+            return first_check_entered;
+        });
+    }
+
+    if (!reached_hook) {
+        {
+            std::lock_guard lock(hook_mu);
+            release_first_check = true;
+        }
+        hook_cv.notify_all();
+        client.join();
+        server().set_security_rules(nullptr);
+        FAIL() << "request did not reach post-security-check hook";
+        return;
+    }
+
+    auto new_cfg = make_security_config(
+        temp_dir.path, true, "https://new.example.test", true);
+    HttpPool::Config pool_cfg;
+    pool_cfg.connect_timeout_ms = 100;
+    auto prepared_security = rules.prepare_reload(new_cfg);
+    auto prepared_upstreams = server().upstreams().prepare_reload(new_cfg, pool_cfg);
+    rules.publish_reload(std::move(prepared_security));
+    server().upstreams().publish_reload(std::move(prepared_upstreams));
+
+    {
+        std::lock_guard lock(hook_mu);
+        release_first_check = true;
+    }
+    hook_cv.notify_all();
+    client.join();
+    server().set_security_rules(nullptr);
+
+    ASSERT_EQ(client_error, nullptr);
+    EXPECT_TRUE(response.rfind("HTTP/1.1 502", 0) == 0) << response;
+    EXPECT_EQ(response.find("Access-Control-Allow-Origin:"), std::string::npos)
+        << response;
+    EXPECT_EQ(response.find("https://old.example.test"), std::string::npos) << response;
+    EXPECT_EQ(response.find("https://new.example.test"), std::string::npos) << response;
 }
 
 }  // namespace

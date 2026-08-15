@@ -66,20 +66,70 @@ int Application::run(int argc, char* argv[]) {
         unsigned int thread_count = std::thread::hardware_concurrency();
         if (thread_count == 0) thread_count = 4;
         for (unsigned int i = 1; i < thread_count; ++i) {
-            threads.emplace_back([this]() { ioc_.run(); });
+            threads.emplace_back([this]() { run_io_context(); });
         }
-        ioc_.run();
+        run_io_context();
 
         join_all();
 
         cleanup();
         LOG_INFO("Server exited");
-        return 0;
+        // A fatal handler exception already forced the shutdown: report it via
+        // the exit code so Restart=on-failure / containers / CLI do not mistake
+        // it for a normal exit (systemd Restart=always would restart either way).
+        return fatal_handler_exception_.load(std::memory_order_acquire) ? 1 : 0;
     } catch (...) {
         ioc_.stop();
         join_all();
         cleanup();
         throw;
+    }
+}
+
+void Application::run_io_context() noexcept {
+    for (;;) {
+        try {
+            ioc_.run();
+            return;
+        } catch (const std::exception& e) {
+            try {
+                LOG_ERROR("Unhandled io_context handler exception; stopping server: ", e.what());
+            } catch (...) {
+                try {
+                    std::cerr << "Unhandled io_context handler exception: "
+                              << e.what() << std::endl;
+                } catch (...) {
+                }
+            }
+            stop_after_handler_exception();
+        } catch (...) {
+            try {
+                LOG_ERROR("Unhandled non-standard io_context handler exception; stopping server");
+            } catch (...) {
+                try {
+                    std::cerr << "Unhandled non-standard io_context handler exception"
+                              << std::endl;
+                } catch (...) {
+                }
+            }
+            stop_after_handler_exception();
+        }
+    }
+}
+
+void Application::stop_after_handler_exception() noexcept {
+    fatal_handler_exception_.store(true, std::memory_order_release);
+    const bool already_stopping = stop_requested_.load(std::memory_order_acquire);
+    try {
+        request_stop();
+    } catch (...) {
+        ioc_.stop();
+        return;
+    }
+    if (already_stopping) {
+        // An exception escaped while shutdown was already in progress. Do not
+        // risk waiting forever for a drain timer that may not have been armed.
+        ioc_.stop();
     }
 }
 

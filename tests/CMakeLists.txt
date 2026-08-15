@@ -11,6 +11,11 @@ add_executable(test_upstream_manager test_upstream_manager.cpp)
 target_link_libraries(test_upstream_manager PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_upstream_manager)
 
+# Configuration hot-reload prepare/publish and retry behavior
+add_executable(test_reload_service test_reload_service.cpp)
+target_link_libraries(test_reload_service PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_reload_service)
+
 # JSON key 转换
 add_executable(test_json_transform test_json_transform.cpp)
 target_link_libraries(test_json_transform PRIVATE gtest_main asio_owen_core)
@@ -49,6 +54,7 @@ gtest_discover_tests(test_response)
 # HTTP connection pool
 add_executable(test_http_pool test_http_pool.cpp)
 target_link_libraries(test_http_pool PRIVATE gtest_main asio_owen_core)
+target_compile_definitions(test_http_pool PRIVATE ASIO_OWEN_TESTING)
 gtest_discover_tests(test_http_pool)
 
 # 安全漏洞修复回归测试 (VULN-1 in_flight 统计, VULN-2 非幂等重试)
@@ -104,6 +110,7 @@ gtest_discover_tests(test_combo_routes)
 # End-to-end client session via real HttpServer + tcp client
 add_executable(test_client_session test_client_session.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)
 target_link_libraries(test_client_session PRIVATE gtest_main asio_owen_core)
+target_compile_definitions(test_client_session PRIVATE ASIO_OWEN_TESTING)
 gtest_discover_tests(test_client_session)
 
 # Security chain integration (OPTIONS → real IP → blacklist → rate limit → JWT)

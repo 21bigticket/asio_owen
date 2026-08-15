@@ -74,6 +74,52 @@ asio::awaitable<void> acquire_twice_expect_second_null(
     HttpPool::release_bad(pool.state(), std::move(first));
 }
 
+asio::awaitable<void> acquire_release_then_inject_idle_failure(
+    HttpPool& pool,
+    int port,
+    int failure_stage,
+    std::atomic<bool>& saw_bad_alloc,
+    std::atomic<bool>& counters_clean,
+    std::atomic<bool>& idle_state_correct) {
+    auto first = co_await pool.acquire("127.0.0.1", port);
+    if (!first) co_return;
+    auto state = pool.state();
+    HttpPool::release(state, std::move(first));
+
+    state->fail_idle_acquire_stage_for_test.store(failure_stage, std::memory_order_relaxed);
+    try {
+        auto second = co_await pool.acquire("127.0.0.1", port);
+        if (second) HttpPool::release_bad(state, std::move(second));
+    } catch (const std::bad_alloc&) {
+        saw_bad_alloc.store(true, std::memory_order_relaxed);
+    }
+
+    counters_clean.store(
+        state->in_flight_count.load(std::memory_order_relaxed) == 0,
+        std::memory_order_relaxed);
+    size_t total = 0;
+    size_t idle = 0;
+    size_t active = 0;
+    size_t in_flight = 0;
+    for (auto& shard : state->shards) {
+        std::lock_guard lock(shard.mtx);
+        total += shard.total;
+        idle += shard.idle.size();
+        active += shard.active.size();
+        in_flight += shard.in_flight;
+    }
+    const bool before_materialize = failure_stage == 1;
+    counters_clean.store(
+        counters_clean.load(std::memory_order_relaxed) &&
+            state->total_count.load(std::memory_order_relaxed) ==
+                (before_materialize ? 1u : 0u) &&
+            total == (before_materialize ? 1u : 0u) &&
+            active == 0 && in_flight == 0,
+        std::memory_order_relaxed);
+    idle_state_correct.store(idle == (before_materialize ? 1u : 0u),
+        std::memory_order_relaxed);
+}
+
 }  // namespace
 
 TEST(HttpPool, FailedConnectCleansGlobalAndShardCounters) {
@@ -160,6 +206,46 @@ TEST(HttpPool, MaxConcurrentIsGlobalHardLimit) {
     if (held_socket->has_value()) {
         (*held_socket)->close(ec);
     }
+}
+
+TEST(HttpPool, IdleMaterializationFailureRollsBackInFlightReservation) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+    HttpPool pool(ioc, HttpPool::Config{});
+
+    std::atomic<bool> saw_bad_alloc{false};
+    std::atomic<bool> counters_clean{false};
+    std::atomic<bool> idle_state_correct{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_release_then_inject_idle_failure(
+        pool, acceptor.local_endpoint().port(), 1,
+        saw_bad_alloc, counters_clean, idle_state_correct), asio::detached);
+    ioc.run();
+
+    EXPECT_TRUE(saw_bad_alloc.load(std::memory_order_relaxed));
+    EXPECT_TRUE(counters_clean.load(std::memory_order_relaxed));
+    EXPECT_TRUE(idle_state_correct.load(std::memory_order_relaxed));
+}
+
+TEST(HttpPool, ActiveTrackingFailureDropsConnectionAndRollsBackAllCounters) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+    HttpPool pool(ioc, HttpPool::Config{});
+
+    std::atomic<bool> saw_bad_alloc{false};
+    std::atomic<bool> counters_clean{false};
+    std::atomic<bool> idle_state_correct{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_release_then_inject_idle_failure(
+        pool, acceptor.local_endpoint().port(), 2,
+        saw_bad_alloc, counters_clean, idle_state_correct), asio::detached);
+    ioc.run();
+
+    EXPECT_TRUE(saw_bad_alloc.load(std::memory_order_relaxed));
+    EXPECT_TRUE(counters_clean.load(std::memory_order_relaxed));
+    EXPECT_TRUE(idle_state_correct.load(std::memory_order_relaxed));
 }
 
 TEST(HttpPool, ReusesIdleConnectionWhenHealthy) {

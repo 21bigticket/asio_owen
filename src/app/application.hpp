@@ -27,6 +27,8 @@ private:
     void initialize(const Config& cfg, const AppConfig& app_cfg,
                     const std::filesystem::path& config_base);
     void register_upstreams(const Config& cfg, const HttpPool::Config& http_pool_cfg);
+    void run_io_context() noexcept;
+    void stop_after_handler_exception() noexcept;
     void request_stop();
     void cleanup();
 
@@ -42,4 +44,9 @@ private:
     std::unique_ptr<SignalExit> signal_exit_;
     std::unique_ptr<asio::steady_timer> drain_timer_;
     std::atomic<bool> stop_requested_{false};
+    // Set when an unhandled io_context handler exception forced the shutdown,
+    // so run() reports a non-zero exit code instead of a clean "0" that
+    // supervisors (systemd Restart=on-failure, containers, CLI) would treat
+    // as a normal exit.
+    std::atomic<bool> fatal_handler_exception_{false};
 };

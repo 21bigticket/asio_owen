@@ -5,6 +5,8 @@
 #include <memory>
 #include <shared_mutex>
 #include <sstream>
+#include <stdexcept>
+#include <atomic>
 #include <asio.hpp>
 #include "http_pool.hpp"
 #include "../common/config.hpp"
@@ -25,7 +27,29 @@ public:
         std::string upstream_path;
     };
 
+    class PreparedReload {
+    public:
+        PreparedReload(PreparedReload&&) = default;
+        PreparedReload& operator=(PreparedReload&&) = default;
+        PreparedReload(const PreparedReload&) = delete;
+        PreparedReload& operator=(const PreparedReload&) = delete;
+
+    private:
+        friend class UpstreamManager;
+        PreparedReload() = default;
+        std::unordered_map<std::string, UpstreamConfig> upstreams_;
+        std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+    };
+
     explicit UpstreamManager(asio::io_context& ioc) : ioc_(ioc) {}
+
+    // Monotonic counter incremented on every publish. Client sessions compare
+    // it with the security-rules generation to detect that a hot-reload landed
+    // between their security check and route lookup, keeping rules and routes
+    // from the same config generation per request (see client_session.hpp).
+    uint64_t generation() const {
+        return generation_.load(std::memory_order_acquire);
+    }
 
     // Route /{service}/..., returns upstream config, shared pool, and path with service prefix stripped
     // example: /zebra-config/xxx -> service=zebra-config
@@ -43,7 +67,10 @@ public:
 
     // Hot-reload upstream config from [upstream] section.
     // Old pool is kept alive by in-flight requests holding shared_ptr references.
-    void reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
+    // Any malformed entry (missing ':', empty host/port, non-numeric,
+    // out-of-range or trailing-character port) rejects the WHOLE reload by
+    // throwing, so one typo can never silently drop routes of other services.
+    PreparedReload prepare_reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
         auto new_upstreams = cfg.get_section("upstream");
         std::unordered_map<std::string, UpstreamConfig> current_upstreams;
         std::unordered_map<std::string, std::shared_ptr<HttpPool>> current_pools;
@@ -53,33 +80,82 @@ public:
             current_pools = pools_;
         }
 
-        std::unordered_map<std::string, UpstreamConfig> prepared_upstreams;
-        std::unordered_map<std::string, std::shared_ptr<HttpPool>> prepared_pools;
+        PreparedReload prepared;
         for (auto& [name, val] : new_upstreams) {
+            if (name.empty()) {
+                throw std::invalid_argument("upstream entry with an empty service name");
+            }
             auto colon = val.find(':');
-            if (colon == std::string::npos) continue;
+            if (colon == std::string::npos) {
+                throw std::invalid_argument(
+                    "upstream \"" + name + "\": missing ':' in value \"" + val + "\"");
+            }
 
             auto host = val.substr(0, colon);
             auto port_str = val.substr(colon + 1);
-            if (port_str.empty()) continue;
+            if (host.empty()) {
+                throw std::invalid_argument("upstream \"" + name + "\": empty host");
+            }
+            if (host.find(':') != std::string::npos) {
+                throw std::invalid_argument(
+                    "upstream \"" + name + "\": IPv6 literals are not supported, "
+                    "use an IPv4 address or a hostname");
+            }
+            if (port_str.empty()) {
+                throw std::invalid_argument("upstream \"" + name + "\": empty port");
+            }
             int port = 0;
-            try { port = std::stoi(port_str); } catch (...) { continue; }
+            size_t parsed = 0;
+            try {
+                port = std::stoi(port_str, &parsed);
+            } catch (...) {
+                throw std::invalid_argument(
+                    "upstream \"" + name + "\": invalid port \"" + port_str + "\"");
+            }
+            if (parsed != port_str.size()) {
+                throw std::invalid_argument(
+                    "upstream \"" + name + "\": invalid port \"" + port_str +
+                    "\" (trailing characters)");
+            }
+            if (port < 1 || port > 65535) {
+                throw std::invalid_argument(
+                    "upstream \"" + name + "\": port out of range [1,65535]: " + port_str);
+            }
             auto current = current_upstreams.find(name);
             if (current != current_upstreams.end() &&
-                current->second.host == host && current->second.port == port) {
-                prepared_pools.emplace(name, current_pools.at(name));
+                current->second.host == host && current->second.port == port &&
+                current_pools.at(name)->cfg() == pool_cfg) {
+                prepared.pools_[name] = current_pools.at(name);
             } else {
-                prepared_pools.emplace(name, std::make_shared<HttpPool>(ioc_, pool_cfg));
+                prepared.pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
             }
-            prepared_upstreams.emplace(name, UpstreamConfig{std::move(host), port});
+            // Assign (not emplace) so that later config files (e.g.
+            // 99-local.ini) override earlier ones for the same service name,
+            // matching Config::get()'s "later files override earlier files"
+            // semantics.
+            prepared.upstreams_[name] = UpstreamConfig{std::move(host), port};
         }
+        return prepared;
+    }
 
+    void publish_reload(PreparedReload prepared) {
+        const auto count = prepared.upstreams_.size();
         {
             std::unique_lock lock(mtx_);
-            upstreams_ = std::move(prepared_upstreams);
-            pools_ = std::move(prepared_pools);
+            upstreams_.swap(prepared.upstreams_);
+            pools_.swap(prepared.pools_);
+            // Increment inside the lock: a reader that observes the new
+            // generation must also observe the new maps, and vice versa.
+            generation_.fetch_add(1, std::memory_order_release);
         }
-        LOG_INFO("upstreams hot-reloaded, count=", new_upstreams.size());
+        try {
+            LOG_INFO("upstreams hot-reloaded, count=", count);
+        } catch (...) {
+        }
+    }
+
+    void reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
+        publish_reload(prepare_reload(cfg, pool_cfg));
     }
 
     std::string pool_stats() const {
@@ -108,5 +184,6 @@ private:
     asio::io_context& ioc_;
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
     std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+    std::atomic<uint64_t> generation_{0};
 
 };
