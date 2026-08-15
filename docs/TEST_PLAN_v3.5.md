@@ -91,27 +91,39 @@ curl -s -i 'http://127.0.0.1:8081/zebra-config/config.ConfigService/GetByAppAndK
 ### 1.4 IP 黑名单测试
 
 ```bash
-# 给 config.ini 加 IP 黑名单
-# [ip_blacklist]
-# ip = 127.0.0.1
+# 如果按本计划在 build/ 目录启动服务，编辑 build/config.d/99-local.ini
+# 如果从仓库根目录启动服务，则编辑 config.d/99-local.ini
+cat > config.d/99-local.ini <<'EOF'
+[ip_blacklist]
+ip = 127.0.0.1
+EOF
 
-# 重启或 SIGHUP 热加载（如果实现了）
-kill -HUP $(pgrep server)
+# 当前实现不是 SIGHUP；这里按默认 30s 轮询间隔计算，
+# 需要连续两个 tick 指纹稳定。如果 config_reload_interval_sec 改过，
+# 按实际间隔等待至少 2 个 tick 再加少量余量。
+sleep 65
 
 # 本机请求 health（127.0.0.1 被 ban → 403）
 curl -s -i http://127.0.0.1:8081/api/health | head -1
 # 期望: HTTP/1.1 403 Forbidden
 
-# 恢复：删掉黑名单配置后 kill -HUP
+# 恢复：删掉 config.d/99-local.ini 后 sleep 65，或重启 server 立即生效
 ```
 
 ### 1.5 限流触发测试
 
 ```bash
-# 配置 ip_rps = 5（每秒 5 个请求），重启
-# [rate_limit]
-# ip_rps = 5
-# ip_burst = 5
+# 配置 ip_rps = 5（每秒 5 个请求）
+cat > config.d/99-local.ini <<'EOF'
+[rate_limit]
+ip_rps = 5
+ip_burst = 5
+EOF
+
+# 等待定时热加载；这里按默认 30s 轮询间隔计算。
+# 如果 config_reload_interval_sec 改过，按实际间隔等待至少 2 个 tick 再加少量余量。
+# 或重启 server 立即生效。
+sleep 65
 
 # 快速连发 10 个请求，部分应返回 429
 for i in $(seq 1 10); do
@@ -119,7 +131,7 @@ for i in $(seq 1 10); do
 done
 # 期望: 前 5 个 200，后 5 个 429（带 Retry-After 头）
 
-# 恢复：ip_rps = 0 后 kill -HUP
+# 恢复：删掉 config.d/99-local.ini 后 sleep 65，或重启 server 立即生效
 ```
 
 ## 任务二：常规性能压测
@@ -324,7 +336,7 @@ wait $SERVER_PID
 
 ### 配置限流
 
-编辑 `config.ini`：
+编辑 `config.d/99-local.ini`（如果服务从 `build/` 目录启动，则编辑 `build/config.d/99-local.ini`）：
 
 ```ini
 [rate_limit]

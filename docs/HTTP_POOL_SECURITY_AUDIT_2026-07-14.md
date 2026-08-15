@@ -35,12 +35,12 @@ HTTP 连接池 (`HttpPool`) 在并发控制和资源管理上总体设计成熟�
 
 #### 问题描述
 
-`in_flight_count` 原子计数器在 `max_concurrent = 0`（默认配置）时不被维护：
+修复前，`in_flight_count` 原子计数器在 `max_concurrent = 0`（默认配置）时不被维护：
 
 - `acquire()` 中：只有 `max_concurrent > 0` 时才增加计数（`:174-180`）
 - `release_in_flight()` 中：只有 `max_concurrent > 0` 时才减少计数（`:412-416`）
 
-这导致在默认配置下，`in_flight_count` **始终为 0**。如前述复核说明，这不影响 `stats()` 输出（它读 shard 汇总），但会让任何未来直接读取 `in_flight_count` 的代码拿到错误值。
+这会导致修复前在默认配置下，`in_flight_count` **始终为 0**。如前述复核说明，这不影响 `stats()` 输出（它读 shard 汇总），但会让任何未来直接读取 `in_flight_count` 的代码拿到错误值。
 
 ```cpp
 // acquire() 中（默认配置 max_concurrent = 0 时跳过）：
@@ -64,15 +64,15 @@ static void release_in_flight(const std::shared_ptr<State>& state) {
 
 **注意**：当前代码的 increment/decrement 是**对称的**（代码注释 `:409-411` 明确说明了这一点），但这种对称性导致统计功能在默认配置下完全失效。
 
-#### 触发条件
+#### 修复前触发条件
 - 默认配置（`max_concurrent = 0`，大多数部署使用此配置）
 - 任何正常流量
 
 #### 影响（复核后修正）
 - ~~监控盲区~~：**不成立**。`stats()` 读 shard 汇总，监控数据准确。
 - ~~告警失效~~：**不成立**。同上。
-- **潜在误导**: 未来若有代码直接读 `in_flight_count`（而非 `stats()`），在默认配置下会拿到恒 0 的错误值。
-- **语义一致性**: 修复后 `in_flight_count` 始终反映真实 in-flight 数，便于将来将其纳入 `stats()` 或用于自适应限流。
+- **潜在误导**: 修复前若有代码直接读 `in_flight_count`（而非 `stats()`），在默认配置下会拿到恒 0 的错误值。
+- **当前状态**: 已按方案 A 修复。`acquire()` 在 `max_concurrent == 0` 时仍 `fetch_add`，`release_in_flight()` 无条件递减；`in_flight_count` 始终反映真实 in-flight 数。
 
 #### 修复建议
 
@@ -150,9 +150,9 @@ if (state->cfg.max_concurrent > 0) {
 
 #### 问题描述
 
-当从连接池获取的连接是 stale-idle（上游已关闭但客户端未感知），`ClientSession` 会检测到首次读取失败并**自动重试**，但对 **POST/PUT/PATCH/DELETE 等非幂等方法也执行相同逻辑**。
+修复前，当从连接池获取的连接是 stale-idle（上游已关闭但客户端未感知），`ClientSession` 会检测到首次读取失败并**自动重试**，但对 **POST/PUT/PATCH/DELETE 等非幂等方法也执行相同逻辑**。
 
-场景：
+修复前场景：
 1. 客户端发送 `POST /order` 创建订单
 2. 从池中取出一个 idle 连接（实际已被上游关闭）
 3. 写请求成功（数据进入 socket 缓冲区）
@@ -171,7 +171,7 @@ if (conn->reused_from_idle) {
 }
 ```
 
-#### 触发条件
+#### 修复前触发条件
 - 连接池中存在 stale-idle 连接（上游 keepalive 超时短于客户端 `idle_timeout_sec`）
 - 客户端发起非幂等请求（POST/PUT/DELETE）
 - 写入成功但读响应前连接被上游关闭
@@ -180,6 +180,7 @@ if (conn->reused_from_idle) {
 - **业务逻辑错误**: 重复创建订单、重复扣款、重复删除资源
 - **数据不一致**: 幂等性假设被破坏
 - **审计困难**: 日志显示为"stale-idle 重试"而非"重复提交"
+- **当前状态**: 已修复。当前 `ClientSession::is_idempotent_method()` 只允许 GET/HEAD/OPTIONS/TRACE 自动重试，POST/PUT/PATCH/DELETE 不自动重放。
 
 #### 实际利用场景
 攻击者可通过以下方式放大影响：
@@ -318,13 +319,14 @@ static void evict_stale_idle(const std::shared_ptr<State>& state, Shard& shard, 
 
 ---
 
-### ⚠️ WEAK-4: DNS 解析无缓存且无超时
+### ⚠️ WEAK-4: DNS 解析无缓存
 
 **严重度**: LOW  
 **位置**: `http_pool.hpp:418-441`
 
 #### 问题
-每次创建新连接时都执行 `async_resolve`，恶意 DNS 服务器可通过慢响应触发超时，但不影响已有连接。
+每次创建新连接时都执行 `async_resolve`，当前已有 `connect_timeout_ms` 覆盖 resolve 超时，
+但没有 TTL-aware DNS 缓存；在频繁建连或 DNS 波动时会增加解析开销。
 
 #### 建议
 添加 DNS 缓存层（TTL-aware），或使用 `asio::ip::address::from_string` 接受 IP 地址直连。
@@ -380,11 +382,11 @@ static void evict_stale_idle(const std::shared_ptr<State>& state, Shard& shard, 
 
 | 报告中的问题 | 本次审计验证 | 状态 |
 |-------------|-------------|------|
-| MEDIUM: 非幂等重试（client_session.hpp:254-331） | 确认 → VULN-2 | ❌ 仍存在 |
-| MEDIUM: `in_flight_count` 计数偏移（http_pool.hpp:174） | 重新定性 → VULN-1（设计缺陷，非不对称 bug） | ❌ 仍存在 |
+| MEDIUM: 非幂等重试（client_session.hpp:254-331） | 确认 → VULN-2 | ✅ 已修复 |
+| MEDIUM: `in_flight_count` 计数偏移（http_pool.hpp:174） | 重新定性 → VULN-1（设计缺陷，非不对称 bug） | ✅ 已修复 |
 | LOW: `client_body_timeout` 硬编码（client_session.hpp:56） | 不属于连接池，跳过 | - |
 
-**澄清**: 原报告描述 VULN-1 为"acquire 不增、release 无条件减"是**不准确的**。实际代码在 `max_concurrent=0` 时，acquire 和 release 都不操作 `in_flight_count`（对称的），但这导致统计功能失效。
+**澄清**: 原报告描述 VULN-1 为"acquire 不增、release 无条件减"是**不准确的**。修复前代码在 `max_concurrent=0` 时，acquire 和 release 都不操作 `in_flight_count`（对称的），但这导致统计功能失效；当前代码已无条件维护该计数。
 
 **新发现**: VULN-3（TOCTOU 时序窗口）和 4 个设计弱点。
 

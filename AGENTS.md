@@ -16,7 +16,7 @@ Dependencies: `asio/` and `spdlog/` are fetched via CMake FetchContent (or use l
 
 ## Architecture & Performance Constraints
 
-HTTP uses one multi-threaded `asio::io_context`, `async_accept`, and one coroutine per keep-alive connection. MySQL wraps synchronous libmysqlclient in an `asio::thread_pool`; never query MySQL on the `io_context` thread. Keep `MysqlPool::execute` copying SQL into a fixed stack buffer before `post`, avoiding `std::string` across workers. Redis uses `thread_local redisContext*` plus direct `redisCommand` with timeouts; do not replace it with a locked pool or keepalive PINGs. Logging must stay on spdlog async sinks.
+HTTP uses one multi-threaded `asio::io_context`, `async_accept`, and one coroutine per keep-alive connection. MySQL wraps synchronous libmysqlclient in an `asio::thread_pool`; never query MySQL on the `io_context` thread. Keep `MysqlPool::execute` switching executor with `co_await asio::post(worker_pool_, asio::use_awaitable)` before using the coroutine-frame SQL string; do not reintroduce a posted lambda that captures request data. Redis is dual-mode: `direct` keeps the thread-local fast path, while the checked-in config runs `worker` mode with a dedicated thread pool, shared idle pool, maintain PING, and command-level idempotent retry. Logging must stay on spdlog async sinks.
 
 ## Coding Style & Naming Conventions
 
@@ -28,7 +28,7 @@ Tests use GoogleTest and should be named `test_<component>.cpp`. Add executables
 
 ## Runtime & Configuration Notes
 
-Configuration is split across `config.d/*.ini` files (loaded in sorted order, later overrides earlier). Key sections: `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]`. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/{service}/...` (gateway reverse proxy, for example `/zebra-config/...`). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis reconnects via `ctx->err`.
+Configuration is split across `config.d/*.ini` files (loaded in sorted order, later overrides earlier). Key sections: `[server]`, `[mysql]`, `[redis]`, `[http_pool]`, and `[upstream]`. Endpoints include `/api/health`, `/api/redis`, `/api/mysql`, `/api/combo`, and `/{service}/...` (gateway reverse proxy, for example `/zebra-config/...`). Pool defaults are intentional: MySQL uses min/max size, idle recycling, timeouts, and `mysql_reset_connection()`; Redis worker mode isolates synchronous hiredis from `io_context`, while direct mode reconnects via `ctx->err`.
 
 ## Commit & Pull Request Guidelines
 

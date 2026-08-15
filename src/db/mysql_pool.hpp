@@ -25,7 +25,8 @@
 //   - total_ — current total connections (idle + in-use)
 //   - max_idle_sec — time-based reclamation, not count-based
 //   - maintain runs on its own thread — does not block io_context
-//   - SQL is moved into the worker lambda; synchronous mysql calls never run on io_context.
+//   - SQL stays in the coroutine frame; execute() switches to the worker executor
+//     before do_query(), so synchronous mysql calls never run on io_context.
 
 class MysqlPool {
 public:

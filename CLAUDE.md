@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool, plus an HTTP reverse-proxy gateway (`/{service}/...`, for example `/zebra-config/...`). Performance characteristics and past incidents are documented in `PERF_REPORT.md` — read it before touching the DB or logging layers.
+`asio_owen` is a C++20 full-stack HTTP server built on standalone ASIO coroutines (`-DASIO_STANDALONE -DASIO_HAS_CO_AWAIT`, **no Boost**). It exposes a small JSON API backed by a MySQL connection pool and a Redis pool, plus an HTTP reverse-proxy gateway (`/{service}/...`, for example `/zebra-config/...`). Current architecture constraints live in `DB_POOL_DESIGN.md` and `GATEWAY_DESIGN.md`; `PERF_REPORT.md` is a historical performance and incident log.
 
 ## Build & Run
 
@@ -35,10 +35,10 @@ The runtime is a **single `asio::io_context` driven by N threads** (N = `std::th
 
 ### DB layer (`src/db/`)
 
-The two pools use **deliberately different async strategies** — this is the core architectural decision and the source of past crashes:
+The DB pools isolate synchronous client libraries from the HTTP event loop where the current configuration requires it:
 
-- **`MysqlPool`** wraps the *synchronous* libmysqlclient API (`mysql_query`/`mysql_store_result`) by `asio::post`-ing each query onto a dedicated `asio::thread_pool` (sized to `pool_size`). The calling coroutine `co_await`s the result. Connections are shared across worker threads and protected by a `mutex` + `condition_variable` acquire/release queue.
-- **`RedisPool`** calls synchronous `redisCommand` **directly on the io_context thread** (no thread_pool). This is safe because (a) hiredis calls are microseconds-fast and (b) each io_context thread holds its own `thread_local redisContext*` (`tls_conn_`), so there are no locks and no cross-thread sharing.
+- **`MysqlPool`** wraps the synchronous libmysqlclient API (`mysql_query`/`mysql_store_result`) by switching the coroutine to a dedicated `asio::thread_pool` before `do_query()`. Connections are shared across worker threads and protected by a `mutex` + `condition_variable` acquire/release queue.
+- **`RedisPool`** is dual-mode. The checked-in config uses `mode = worker`, so `cmd_argv()` / `get()` switch to a dedicated Redis `asio::thread_pool` and use a shared idle pool plus maintain thread. `mode = direct` remains available as a thread-local fast path where each calling thread owns a `TlsRedisConn`.
 
 ### Cross-thread SQL passing — do not regress
 

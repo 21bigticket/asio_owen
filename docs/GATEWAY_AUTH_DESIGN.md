@@ -122,34 +122,35 @@ verifier.verify(decoded);
 
 ### 🟠 High（逻辑缺陷）
 
-#### H1. 热加载实现：细粒度 mutex + shared_ptr 替换
+#### H1. 热加载实现：不可变快照 + prepare/publish
 
-**风险：** 当前实现不是 `atomic<shared_ptr>` 无锁读，而是 `rules_mu_` + 内部子模块各自锁。
+**风险：** 热加载不能在解析失败或分配失败时发布半套规则，也不能让请求混用旧安全规则和新 upstream 路由。
 
 **当前实现：**
 
 ```cpp
 class SecurityRules {
-    mutable std::mutex rules_mu_;
-    IpBlacklist ip_blacklist_;
-    AuthWhitelist auth_whitelist_;
-    PathBlacklist path_blacklist_;
-    std::shared_ptr<JWTAuth> jwt_auth_;
+    struct SecuritySnapshot {
+        bool case_sensitive_paths = false;
+        std::vector<std::string> trusted_proxies;
+        std::shared_ptr<IpBlacklist> ip_blacklist;
+        std::shared_ptr<AuthWhitelist> auth_whitelist;
+        std::shared_ptr<PathBlacklist> path_blacklist;
+        std::shared_ptr<JWTAuth> jwt_auth;
+        std::shared_ptr<RateLimiter> rate_limiter;
+        std::shared_ptr<const RateLimiter::Config> rate_policy;
+        std::shared_ptr<const CorsPolicy> cors_policy;
+    };
 
-    void reload(const Config& cfg) {
-        std::lock_guard<std::mutex> lock(rules_mu_);
-        load_from_config(cfg);
-    }
+    PreparedReload prepare_reload(const Config& cfg);
+    void publish_reload(PreparedReload prepared);
 
-    CheckResult check(...) const {
-        std::lock_guard<std::mutex> lock(rules_mu_);
-        // 复制 proxies_copy 和 jwt_copy，然后释放锁
-        // 子模块内部（IpBlacklist / AuthWhitelist / etc）各自有 mutex
-    }
+    RequestCheckResult check_request(...) const; // 安全决策 + CORS + generation 同源
 };
 ```
 
-读侧有少量锁（`rules_mu_` + 子模块 mutex），但锁持有时间极短（仅复制 shared_ptr 和简单查询）。在 Config 免鉴权场景下，热路径上没有 JWT 验证，锁竞争对 RPS 影响有限。
+读侧走 TLS snapshot cache，稳定代际下不做 shared_ptr refcount 争用；热加载先完整构造新快照，再发布。
+`ClientSession` 会比较 security/upstream generation，检测到热更新插入安全检查和路由之间时会重新检查。
 
 #### H2. 解析失败的回退行为未定义
 
@@ -592,8 +593,11 @@ config_reload_interval_sec = 30
 | IP 黑名单 | ✅ | 热加载 |
 | 路由黑名单 | ✅ | 热加载 |
 | 免鉴权白名单 | ✅ | 热加载 |
-| JWT 密钥/算法 | ❌ | 走正式轮转流程 |
-| 信任代理列表 | ❌ | 部署架构确定后不变 |
+| JWT 密钥/算法 | ✅ | 热加载（新配置非法则保留旧规则） |
+| 信任代理列表 | ✅ | 热加载 |
+| 路径大小写匹配 | ✅ | 热加载 |
+| 限流全局/IP/路径/服务规则 | ✅ | 热加载（`[rate_limit]` / `[rate_limit_paths]` / `[rate_limit_services]`） |
+| CORS 策略 | ✅ | 热加载 |
 
 ### 触发方式
 
@@ -604,7 +608,7 @@ config_reload_interval_sec = 30
 config_reload_interval_sec = 30   ; 定时刷新间隔（秒），0 表示关闭
 ```
 
-**定时刷新：** `asio::steady_timer` 每 N 秒调用 `Config::load()` 重新加载所有配置，再调用 `SecurityRules::reload()` 原子替换规则。
+**定时刷新：** `asio::steady_timer` 每 N 秒检查 `config.d/*.ini` 指纹；变更稳定两个 tick 后，先完整 `Config::load()`，再 prepare 新 `SecurityRules` 快照和 `UpstreamManager` 映射，全部成功后按 security → upstream 顺序 publish。
 
 > 当前未实现 SIGHUP 触发，只有定时轮询。
 
@@ -612,25 +616,16 @@ config_reload_interval_sec = 30   ; 定时刷新间隔（秒），0 表示关闭
 
 ```cpp
 class SecurityRules {
-    mutable std::mutex rules_mu_;  // 保护 trusted_proxies_ 和 jwt_auth_ 写操作
-    IpBlacklist ip_blacklist_;
-    AuthWhitelist auth_whitelist_;
-    PathBlacklist path_blacklist_;
-    std::shared_ptr<JWTAuth> jwt_auth_;
+    std::shared_ptr<const SecuritySnapshot> snapshot_;
+    std::atomic<uint64_t> generation_{0};
 public:
-    void reload(const Config& cfg) {
-        std::lock_guard<std::mutex> lock(rules_mu_);
-        load_from_config(cfg);
-    }
-    CheckResult check(...) const {
-        // 1. 复制 proxies_copy 和 jwt_copy（持 rules_mu_ 极短时间）
-        // 2. 释放 rules_mu_ 后执行 IP 黑名单 / 白名单 / JWT 验证
-        //    子模块各自有内部 mutex（IpBlacklist 无锁，AuthWhitelist 有 mu_）
-    }
+    PreparedReload prepare_reload(const Config& cfg);
+    void publish_reload(PreparedReload prepared);
+    RequestCheckResult check_request(...) const;
 };
 ```
 
-读侧有少量 mutex，但持有时间极短。在免鉴权场景下热路径无 JWT 验证，不影响 RPS。
+读侧从不可变快照检查规则；热加载失败时不更新 generation，旧规则继续服务。
 
 ---
 

@@ -1,12 +1,12 @@
 # CORS（跨域）处理设计文档
 
-> 状态：已实现并通过测试（`test_cors` 22/22、`test_security_chain` 13/13、`test_client_session` 10/10）
+> 状态：已实现并通过测试（全量 `ctest` 223/223；CORS 相关 `test_cors` 22/22、`test_security_chain` 16/16、`test_client_session` 11/11）
 > 适用范围：`src/http` 下游 HTTP 网关层
 > 涉及文件：
 > - 新增 `src/http/cors.hpp`（策略结构 + 解析 + 注入/预检/去重）
 > - 新增 `config.d/35-cors.ini`（默认 `enabled=false` 的模板）
 > - 新增 `tests/test_cors.cpp` + `tests/CMakeLists.txt` 注册
-> - 改 `src/security/security_rules.hpp`（加载策略、下移 OPTIONS 短路、`cors_policy()` 访问器）
+> - 改 `src/security/security_rules.hpp`（加载策略、下移 OPTIONS 短路、`check_request()` 返回 CORS 快照）
 > - 改 `src/http/client_session.hpp`（预检短路 + 正常响应注入）
 > - `src/http/response_builder.hpp` **未改动**（见 §5.4，去重改由 `strip_cors_headers` 承担）
 
@@ -173,21 +173,27 @@ inline bool build_preflight_response(HttpContext& ctx, const CorsPolicy& policy)
 
 ### 5.2 策略存放：随 SecurityRules 热重载（与设计稿不同）
 
-> **偏差说明**：设计稿原计划把 `CorsPolicy` 作为 `HttpServerState` 的普通成员。实际实现改为**存放在 `SecurityRules` 里**，理由是复用既有的配置热重载链路（`ReloadService` 已经周期性调用 `SecurityRules::reload()`），让 `[cors]` 段无需重启即可生效，且与其它安全配置保持一致的加载/加锁语义。
+> **偏差说明**：设计稿原计划把 `CorsPolicy` 作为 `HttpServerState` 的普通成员。实际实现改为**存放在 `SecurityRules` 的不可变快照里**，理由是复用既有的配置热重载链路（`ReloadService` 定时 prepare/publish 新安全快照），让 `[cors]` 段无需重启即可生效，且与其它安全配置保持同一代际。
 
-- `SecurityRules` 新增成员：
+- `SecuritySnapshot` 持有不可变策略：
   ```cpp
-  std::shared_ptr<const CorsPolicy> cors_policy_ = std::make_shared<const CorsPolicy>();
+  std::shared_ptr<const CorsPolicy> cors_policy = std::make_shared<const CorsPolicy>();
   ```
 - `load_from_config()` 第 7 步加载（整段缺失 → 禁用默认）：
   ```cpp
-  cors_policy_ = std::make_shared<const CorsPolicy>(load_cors_policy(cfg));
+  next->cors_policy = std::make_shared<const CorsPolicy>(load_cors_policy(cfg));
   ```
-- 对外暴露快照访问器（`rules_mu_` 下 cheap shared_ptr 拷贝，支持热重载时无撕裂读取）：
+- 对外通过 TLS 快照访问器读取，同一请求的安全决策、CORS 策略和 generation 来自同一个快照：
   ```cpp
-  std::shared_ptr<const CorsPolicy> cors_policy() const {
-      std::lock_guard<std::mutex> lock(rules_mu_);
-      return cors_policy_;
+  RequestCheckResult check_request(...) const {
+      auto view = snapshot_view_fast();
+      result.generation = view.generation;
+      if (view.snapshot && view.snapshot->cors_policy &&
+          view.snapshot->cors_policy->enabled) {
+          result.cors_policy = view.snapshot->cors_policy;
+      }
+      result.security = check_snapshot(..., view.snapshot);
+      return result;
   }
   ```
 
@@ -195,12 +201,13 @@ inline bool build_preflight_response(HttpContext& ctx, const CorsPolicy& policy)
 
 ### 5.3 `client_session.hpp` 两个接入点
 
-先在安全检查之后取一次策略快照（`security_rules` 未设置时 `cors_policy` 为空指针，后续分支自然跳过）：
+安全检查时同时取策略快照（`security_rules` 未设置时 `cors_policy` 为空指针，后续分支自然跳过）：
 
 ```cpp
-std::shared_ptr<const CorsPolicy> cors_policy;
 if (state_->security_rules) {
-    cors_policy = state_->security_rules->cors_policy();
+    auto checked = state_->security_rules->check_request(...);
+    security_generation = checked.generation;
+    cors_policy = std::move(checked.cors_policy);
 }
 ```
 
@@ -294,11 +301,11 @@ if (method == "OPTIONS") return {0, ""};
 ## 8. 关键陷阱（实现务必落实）
 
 1. **凭证与通配互斥**：`allow_credentials=true` 时严禁 `Allow-Origin: *`，须回显具体 Origin——`resolve_origin` 已处理。
-6. **通配 + 凭证 = 加载层降级**：`allowed_origins=*` 与 `allow_credentials=true` 同时配置属高危误配（reflect-any-origin-with-credentials，等于任意站点可带用户 Cookie 跨域打接口）。`load_cors_policy` 在加载阶段检测到该组合会 **`LOG_WARN` 告警并强制 `allow_credentials=false`**，而非静默照做。精确白名单 + 凭证是合法用法，不受影响。由 `LoadCorsPolicy.WildcardWithCredentialsIsDowngraded` 守护。
-2. **`Vary: Origin`**：只要回显具体 origin 就必须带，否则共享缓存会把 A 站响应喂给 B 站。
-3. **预检不能被 JWT 拦**：浏览器预检不带 `Authorization`，短路必须在 JWT 之前。
-4. **非法 Origin 的预检不伪造 204**：`build_preflight_response` 返回 false 时走正常流程，避免把“未授权”伪装成功。
-5. **默认态零副作用**：`enabled=false` 时所有 CORS 分支必须是 no-op，确保不配置就是现网行为。
+2. **通配 + 凭证 = 加载层降级**：`allowed_origins=*` 与 `allow_credentials=true` 同时配置属高危误配（reflect-any-origin-with-credentials，等于任意站点可带用户 Cookie 跨域打接口）。`load_cors_policy` 在加载阶段检测到该组合会 **`LOG_WARN` 告警并强制 `allow_credentials=false`**，而非静默照做。精确白名单 + 凭证是合法用法，不受影响。由 `LoadCorsPolicy.WildcardWithCredentialsIsDowngraded` 守护。
+3. **`Vary: Origin`**：只要回显具体 origin 就必须带，否则共享缓存会把 A 站响应喂给 B 站。
+4. **预检不能被 JWT 拦**：浏览器预检不带 `Authorization`，短路必须在 JWT 之前。
+5. **非法 Origin 的预检不伪造 204**：`build_preflight_response` 返回 false 时走正常流程，避免把“未授权”伪装成功。
+6. **默认态零副作用**：`enabled=false` 时所有 CORS 分支必须是 no-op，确保不配置就是现网行为。
 
 ---
 
@@ -315,8 +322,8 @@ if (method == "OPTIONS") return {0, ""};
 
 受本次改动影响的既有测试同样全绿（真实运行）：
 
-- `test_security_chain` **13/13** —— `OPTIONS` 短路下移未破坏“预检免鉴权”，黑名单/限流对 OPTIONS 生效。
-- `test_client_session` **10/10** —— 端到端链路（404 / 502 / framing / keep-alive）不受注入点影响。
+- `test_security_chain` **16/16** —— `OPTIONS` 短路下移未破坏“预检免鉴权”，黑名单/限流对 OPTIONS 生效；请求级 CORS 快照与 security generation 保持一致。
+- `test_client_session` **11/11** —— 端到端链路（404 / 502 / framing / keep-alive）不受注入点影响；热更新插入安全检查和路由之间时会刷新 CORS 策略。
 
 ---
 
@@ -326,7 +333,7 @@ if (method == "OPTIONS") return {0, ""};
 
 | # | 设计稿 | 实际实现 | 原因 |
 |---|---|---|---|
-| 1 | `CorsPolicy` 作为 `HttpServerState` 普通成员（§5.2） | 存放于 `SecurityRules`，`shared_ptr<const>` 快照 + `cors_policy()` 访问器 | 复用既有热重载链路，`[cors]` 无需重启即可生效 |
+| 1 | `CorsPolicy` 作为 `HttpServerState` 普通成员（§5.2） | 存放于 `SecurityRules::SecuritySnapshot`，由 `check_request()` 随安全决策和 generation 一起返回 | 复用既有热重载链路，`[cors]` 无需重启即可生效，且请求不会混用不同代际 |
 | 2 | 改 `response_builder.hpp` 的 proxy `filtered` 列表去重（§5.4） | `response_builder.hpp` 未改，去重由 `apply_cors_headers` 内的 `strip_cors_headers` 承担 | 仅开启时去重、逻辑内聚、覆盖本地 route 响应 |
 
 另一处需留意的**行为变化**（§6 加固的副作用，非偏差）：`OPTIONS` 短路从安全链第 0 步下移后，OPTIONS 请求现在也会经过路径规范化与根路径检查——即 `OPTIONS /` 现返回 404、`OPTIONS` 到非法编码路径返回 400，而非旧行为的一律放行。对合法路径的真实预检无影响。

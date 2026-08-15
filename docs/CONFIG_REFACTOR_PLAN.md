@@ -1,8 +1,8 @@
-# config.ini 配置重组方案
+# config.d 配置分组方案
 
 ## 现状问题
 
-当前 `config.ini` 所有配置堆积在一起，没有清晰的分组：
+早期 `config.ini` 所有配置堆积在一起，没有清晰的分组：
 
 - 安全和限流混在一起
 - 上游路由和连接池混在一起
@@ -14,19 +14,20 @@
 1. **按功能域分组** — 每个功能区独立一个区块，互不干扰
 2. **标注生效方式** — 每个区块头注明"重启生效"或"定时器热加载"
 
-## 最终分组方案（10 个区块）
+## 当前分组方案（10 个编号区块 + 1 个可选 CORS 文件）
 
 ```
 1. 基础服务      — 端口/日志/进程         重启生效      改动极少
 2. 数据库        — MySQL/Redis 连接池     重启生效      改动极少
 3. 上游路由      — zebra-* 服务地址       定时器热加载  经常改
-4. 上游连接池    — 超时/并发/大小限制     重启生效      改动极少
+4. 上游连接池    — 超时/并发/大小限制     定时器热加载  偶尔调优
 5. 安全 JWT      — 密钥/算法/签发者       定时器热加载  偶尔改（密钥轮换）
 6. 信任代理      — XFF 信任 IP            定时器热加载  偶尔改
 7. IP 黑名单     — 封禁 IP/CIDR            定时器热加载  经常改
 8. 免鉴权白名单  — 跳过 JWT 的路径        定时器热加载  经常改
 9. 路由黑名单    — 禁止路径+角色要求      定时器热加载  偶尔改
 10. 限流         — IP/全局/路径限流        定时器热加载  经常改
+可选 CORS        — 跨域策略               定时器热加载  视前端域名变化
 ```
 
 ## 区块格式规范
@@ -55,12 +56,15 @@ key = value
 ├── 是（重启生效）
 │   ├── 端口 / 日志级别           → [server]
 │   ├── 数据库连接串 / 池大小    → [mysql] [redis]
-│   ├── 上游连接池超时/并发       → [http_pool]
 │
 └── 否（定时器热加载（30s））
     ├── 上游路由                  → [upstream]
-    ├── JWT 密钥/算法/公钥        → [security]  ⚠ 密钥轮换建议维护窗口期重启以确保一致性
+    ├── 上游连接池超时/并发       → [http_pool]
+    ├── JWT 密钥/算法/公钥        → [security]  ⚠ 非法配置会保留旧规则
     ├── 限流阈值 / 桶大小         → [rate_limit]
+    ├── 路径限流规则              → [rate_limit_paths]
+    ├── 服务限流规则              → [rate_limit_services]
+    ├── CORS 跨域策略             → [cors]
     ├── 信任代理 IP               → [trusted_proxies]
     ├── IP 黑名单                 → [ip_blacklist]
     ├── 免鉴权路径                → [auth_whitelist]
@@ -68,12 +72,14 @@ key = value
 ```
 
 > 热加载机制：server 每 30s（`config_reload_interval_sec`）轮询一次 config.d/ 目录，
-> 重新加载全部配置。不是 SIGHUP 信号触发，不需要手动操作。
+> 发现指纹变化后等待连续两个 tick 稳定，再重新加载配置并两阶段发布。
+> 不是 SIGHUP 信号触发，不需要手动操作。
 > 定时器间隔本身也支持热加载：每次 reload 都会读取最新的 `config_reload_interval_sec` 并重新设定定时器。
 > 
-> 热加载生效范围：`[upstream]` `[security]` `[rate_limit]` `[trusted_proxies]`
+> 热加载生效范围：`[upstream]` `[http_pool]` `[security]` `[rate_limit]`
+> `[rate_limit_paths]` `[rate_limit_services]` `[cors]` `[trusted_proxies]`
 > `[ip_blacklist]` `[auth_whitelist]` `[path_blacklist]`。
-> 其余区块（`[server]` `[mysql]` `[redis]` `[http_pool]`）仍需重启。
+> 其余区块（`[server]` `[mysql]` `[redis]`）仍需重启。
 
 ## 独立文件方案（已实施）
 
@@ -87,12 +93,13 @@ config.d/
 ├── 10-mysql.ini           # MySQL 连接池（重启生效）
 ├── 11-redis.ini           # Redis 连接池（重启生效）
 ├── 20-upstream.ini        # 上游路由（定时器热加载（30s））
-├── 21-http_pool.ini       # 上游连接池（重启生效）
+├── 21-http_pool.ini       # 上游连接池（定时器热加载（30s））
 ├── 30-security.ini        # JWT 密钥/算法（定时器热加载（30s））
 ├── 31-trusted_proxies.ini # 信任代理 IP（定时器热加载（30s））
 ├── 32-ip_blacklist.ini    # IP 黑名单（定时器热加载（30s））
 ├── 33-auth_whitelist.ini  # 免鉴权白名单（定时器热加载（30s））
 ├── 34-path_blacklist.ini  # 路由黑名单（定时器热加载（30s））
+├── 35-cors.ini            # CORS 跨域策略（可选，定时器热加载（30s））
 ├── 40-rate_limit.ini      # 限流（定时器热加载（30s））
 └── 99-local.ini           # 本地覆盖（.gitignore，不提交）
 ```
@@ -123,16 +130,21 @@ load_file("config.d/99-local.ini");  // 如果存在，优先级最高
 
 ### 热加载实现
 
-server 启动时创建 30s 定时器（`config_reload_interval_sec`），到期后：
+server 启动时创建 30s 定时器（`config_reload_interval_sec`）。核心流程示意：
 
 ```cpp
-Config new_cfg;
-	if (new_cfg.load(".")) {
-    // 安全模块热加载（IP黑名单/白名单/限流/路由黑名单/信任代理）
-    if (g_security_rules) g_security_rules->reload(new_cfg);
+auto current_fingerprint = read_config_fingerprint();
+if (pending_fingerprint_ && current_fingerprint &&
+    *pending_fingerprint_ == *current_fingerprint) {
+    Config new_cfg;
+    if (new_cfg.load(config_base_)) {
+        auto prepared_security = security_rules_.prepare_reload(new_cfg);
+        auto prepared_upstreams = upstreams_.prepare_reload(
+            new_cfg, http_pool_config_from(new_cfg));
 
-    // 上游路由热加载（shared_ptr 替换，飞行请求不受影响）
-    if (g_server) g_server->upstreams().reload(new_cfg, http_pool_cfg);
+        security_rules_.publish_reload(std::move(prepared_security));
+        upstreams_.publish_reload(std::move(prepared_upstreams));
+    }
 }
 ```
 
@@ -141,12 +153,12 @@ Config new_cfg;
 | 文件 | 改动 | 状态 |
 |:-----|:------|:----:|
 | `src/common/config.hpp` | `load()` 自动扫描 `config.d/`，按文件名排序加载 | ✅ |
-| `src/http/upstream_manager.hpp` | `reload()` 增/改/删上游；`shared_ptr` 延迟销毁旧池 | ✅ |
-| `src/main.cpp` | reload 回调中调用 `upstreams().reload()` + `stoi` 异常保护 | ✅ |
+| `src/http/upstream_manager.hpp` | `prepare_reload()` / `publish_reload()` 增改删上游；`shared_ptr` 延迟销毁旧池 | ✅ |
+| `src/app/reload_service.hpp` | 指纹检测、双 tick 防抖、security/upstream 两阶段发布 | ✅ |
 | `src/http/http_server.hpp` | `ConnGuard` 持 `shared_ptr<HttpPool>` 保活 | ✅ |
 
 ### 不需要改的代码
 
-- `security_rules.hpp` — `reload` → `load_from_config` 覆盖限流/IP 黑白名单/信任代理/JWT ✅
-- `http_pool.hpp` — 连接池配置重启生效，不热加载
-- `rate_limiter.hpp` — `update_config` 已被 `load_from_config` 调用 ✅
+- `security_rules.hpp` — 不可变快照覆盖限流/IP 黑白名单/信任代理/JWT/CORS ✅
+- `http_pool.hpp` — 配置对象随 upstream reload 读取，参数变化时替换对应上游连接池 ✅
+- `rate_limiter.hpp` — 随 `SecurityRules::prepare_reload()` 构造新配置 ✅

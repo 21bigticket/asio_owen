@@ -1,5 +1,9 @@
 # 内存泄漏检查报告
 
+> 本文是 v3.3/v3.4 阶段的历史内存排查记录。当前 DB/Redis 连接池设计和运行时
+> 内存基线以 `docs/DB_POOL_DESIGN.md` 为准；当前 HTTP 网关/HttpPool 的复用和
+> 内存基线以 `docs/GATEWAY_DESIGN.md` 为准。
+
 ## 目标
 
 确认 v3.3 版连接池（MysqlPool、RedisPool、HttpServer）是否存在内存泄漏。
@@ -555,7 +559,7 @@ plow -c 200 -d 60s http://127.0.0.1:8081/api/health
 # 1. 获取本机主 IP
 CLIENT_IP=$(hostname -I | awk '{print $1}')
 # 2. 编辑 config.d/32-ip_blacklist.ini，在 [ip_blacklist] 段加一行 $CLIENT_IP
-# 3. 热加载触发（如果实现了 SIGHUP）：kill -HUP $(pgrep server)
+# 3. 当前实现不是 SIGHUP；等待定时热加载（默认 30s，需连续两个 tick 稳定）或重启 server
 # 4. 验证返回 403
 curl -i http://127.0.0.1:8081/api/health | head -1
 # 期望：HTTP/1.1 403 Forbidden

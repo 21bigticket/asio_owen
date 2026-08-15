@@ -1,6 +1,6 @@
 # HTTP 网关设计（当前实现）
 
-> 当前状态更新于 2026-07-13。早期连接复用、probe、压测和故障排查记录保留在
+> 当前状态更新于 2026-08-15。早期连接复用、probe、压测和故障排查记录保留在
 > `docs/CONN_REUSE_PROBE_2026-07-10.md`、`docs/HTTP_POOL_PROBE_REMOVAL_2026-07-11.md`、
 > `docs/HTTP_LAYER_REVIEW_2026-07-11.md`、`docs/PERF_REPORT.md` 等文档中。
 > 本文是当前实现的总设计入口。
@@ -70,7 +70,7 @@ HttpServer
 - HTTP/1.1 上游响应默认可复用，除非 `Connection: close`。
 - HTTP/1.0 上游响应默认不复用，除非 `Connection: keep-alive`。
 - 无 `Content-Length` 且无 `Transfer-Encoding` 的响应按 EOF framing 读取，并标记连接不可复用。
-- 当前实现不做主动 idle probe。复用 idle 连接时直接尝试写/读；如果复用的 idle 连接失败，只重试一次并新建连接。
+- 当前实现不做主动 idle probe。复用 idle 连接时直接尝试写/读；如果复用的 idle 连接失败，只对 GET/HEAD/OPTIONS/TRACE 重试一次并新建连接。
 - `conn.read_buffer` 非空时连接不会回到 idle，也不会再次复用，直接关闭。这样避免上游 pipeline/多余字节污染下一次请求。
 
 ## Header 处理
@@ -168,7 +168,7 @@ State
 
 1. 如果 pool 已停止，返回 `nullptr`。
 2. 最多每秒做一次跨 shard idle 回收，防止冷 shard 长期持有 fd。
-3. 如果配置了 `max_concurrent`，入口处一次性预订 `in_flight_count`。
+3. 入口处一次性维护 `in_flight_count`；`max_concurrent > 0` 时同一个计数器也作为并发上限，`0` 表示不额外限流但仍统计。
 4. 从 round-robin shard 起，遍历所有 shard 找 idle 连接。
 5. idle 连接若 `connection_close` 或 `read_buffer` 非空，直接关闭并继续找下一个。
 6. 命中 idle 后标记 `reused_from_idle = true`，登记到 `active`，返回连接。
@@ -196,14 +196,16 @@ State
 
 ### stale idle retry
 
-`ClientSession` 对代理请求最多尝试 2 次。只有第一次使用的是复用 idle 连接，且写上游或读上游失败时，才会重试。新建连接失败不做额外重试，避免放大上游故障。
+`ClientSession` 对代理请求最多尝试 2 次。只有第一次使用的是复用 idle 连接、方法属于
+GET/HEAD/OPTIONS/TRACE 白名单，且写上游或读上游失败时，才会重试。POST/PUT/PATCH/DELETE
+不自动重放，避免重复提交；新建连接失败也不做额外重试，避免放大上游故障。
 
 ## 超时矩阵
 
 | 方向 | 操作 | 当前控制 |
 |------|------|----------|
 | 客户端 | header read | `client_header_read_timeout_ms`，默认 10s |
-| 客户端 | body read | 30s |
+| 客户端 | body read | `client_body_read_timeout_ms`，默认 30s |
 | 客户端 | header size | 64KB |
 | 客户端 | response write | `downstream_write_timeout_ms`，默认 30s |
 | 上游 | resolve | `connect_timeout_ms` |

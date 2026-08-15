@@ -1,5 +1,10 @@
 # 压测报告
 
+> 本文是阶段性压测与排查记录，包含早期 Redis direct 模式、旧 HttpPool probe 指标、
+> 以及当时的 `pool_size=64` / `cmd_timeout_ms=0` 等配置快照。当前总设计以
+> `docs/DB_POOL_DESIGN.md` 和 `docs/GATEWAY_DESIGN.md` 为准；引用本文数字时需保留
+> 对应日期、环境和配置上下文。
+
 ## 测试环境
 
 | 项目 | 配置 |
@@ -13,6 +18,8 @@
 > 注意：本机 7080 端口被 OrbStack 占用，实际使用 8081 端口。
 
 ## 服务配置
+
+> 以下是当时压测快照，不是当前 `config.d/` 默认配置。
 
 ```ini
 [mysql]
@@ -33,7 +40,7 @@ port = 8081
 |------|:--------:|:-------:|:--------:|------|
 | **HTTP 服务器** | ASIO socket | **真异步** | `io_context` 多线程 | 事件驱动，`co_spawn` 协程处理每个连接 |
 | **MySQL** | `mysql_query` | **同步阻塞** → 异步封装 | `asio::thread_pool` 线程池 | `post` 到线程池执行，`co_await` 等待返回 |
-| **Redis** | `redisCommand` | **同步阻塞** → 异步封装 | 直接在 io_context 线程执行 | 操作微秒级，直接同步调用，`co_return` 包装 |
+| **Redis** | `redisCommand` | **同步阻塞** → 异步封装 | 当前配置为 Redis worker pool；direct 模式可选 | worker 模式隔离同步 hiredis，direct 模式保留 thread-local 快路径 |
 
 ### HTTP 层
 - **真异步，事件驱动**：ASIO `io_context` 多线程（CPU 核数）运行，`acceptor.async_accept` + `co_spawn` 协程处理每个连接
@@ -42,13 +49,13 @@ port = 8081
 
 ### MySQL 层
 - **底层是同步阻塞**：`mysql_query` / `mysql_store_result` 是 libmysqlclient 的同步 API，线程内阻塞等待数据库返回
-- **异步封装**：通过 `asio::post` 将查询任务投递到 `thread_pool` 线程池执行，执行完成后通过 ASIO 协程恢复机制返回结果
-- **SQL 传递优化**：用栈数组 (`char[4096]`) + `memcpy` 传递 SQL 到 worker 线程，避免 `std::string` 跨线程内存竞争导致的 `double free`
+- **异步封装**：`MysqlPool::execute(std::string sql)` 先 `co_await asio::post(worker_pool_, asio::use_awaitable)` 切到 SQL worker，再调用 `do_query(sql.c_str())`
+- **SQL 传递约束**：SQL 留在协程帧里，不要改回 `asio::post(lambda)` 捕获 `std::string` 的写法；历史栈数组方案只是早期规避 lambda 捕获 UAF 的过渡实现
 
 ### Redis 层
 - **底层是同步阻塞**：`redisCommand` 是 hiredis 的同步 API，TCP 发送命令后阻塞等待 Redis 返回
-- **直接执行**：不经过线程池，直接在 io_context 线程上调用（Redis 纯内存操作，延迟微秒级，阻塞时间极短，对事件循环影响可忽略）
-- **无锁设计**：每个 io_context 线程持有一条独立 `thread_local redisContext*` 连接，无需加锁
+- **当前默认 worker 模式**：`config.d/11-redis.ini` 配置 `mode = worker`，通过 `co_await asio::post(*worker_pool_)` 切到专用 Redis worker pool，避免同步 hiredis 阻塞 HTTP `io_context`
+- **direct 模式仍可选**：每个调用线程持有一条 `thread_local` Redis 连接，无共享池锁，但故障 Redis 会占用当前调用线程直到超时
 
 ### 日志层
 - **spdlog 异步日志**：异步模式，日志写入后台线程，`LOG_INFO` 等宏只做一次内存拷贝后立即返回，不阻塞业务线程
@@ -297,7 +304,7 @@ tcpdump/tshark 进一步确认真实 TCP stream 也恢复复用：
 | 网关 | `status_text` 端到端保留 |
 | 网关 | HTTP/1.0 default-close 检测 |
 | 网关 | `HEAD`/`204`/`304`/`1xx` 无 body 路径 |
-| 网关 | 复用 idle 上游连接失败时做一次新连接重试，规避对端空闲关闭后的 TCP TOCTOU |
+| 网关 | 复用 idle 上游连接失败时仅对 GET/HEAD/OPTIONS/TRACE 做一次新连接重试，规避对端空闲关闭后的 TCP TOCTOU 且避免非幂等请求重复提交 |
 | 网关 | 4xx/5xx 响应增加 `X-Asio-Owen-Status-Source`，方便区分本地网关错误和上游透传错误 |
 | 构建 | ASIO 升级到 1.38.0（FetchContent 自动拉取） |
 | 构建 | spdlog 升级到 v1.17.0（FetchContent 自动拉取） |
@@ -355,7 +362,7 @@ tcpdump/tshark 进一步确认真实 TCP stream 也恢复复用：
 **预热：** 服务启动后有约 1 分钟冷启动期（64 worker 线程初始化、epoll 就绪等），建议上线前发少量请求预热再接入流量。
 
 **Redis：**
-- `cmd_timeout_ms` 配置开关：压测/内网设 0（性能模式），线上设 1000（稳定性优先）
+- 当前配置默认 `mode = worker`、`cmd_timeout_ms = 500`；`cmd_timeout_ms <= 0` 会归一化为 30s 安全超时，不再表示无限制性能模式
 - 使用 `get(key)` fast path API 替代通用 `cmd("GET %s", key)`，固定 GET 场景可提升约 8%
 
 **MySQL：**
@@ -423,7 +430,8 @@ dmesg | grep -c 'server['
 ### `double free` 原因
 `asio::post` 的 lambda 按值捕获 `std::string` 后投递到 `thread_pool`，高并发下 `std::string` 的内部引用计数在多线程间竞争，导致同一内存被释放两次。
 
-**解决方案**：SQL 传递改用栈数组 (`char sql_buf[4096]`) + `memcpy`，避免 `std::string` 跨线程传递。`std::string` 只在 worker 线程内部构造和析构，生命周期不跨线程。
+**当时解决方案**：SQL 传递改用栈数组 (`char sql_buf[4096]`) + `memcpy`，避免 `std::string` 跨线程传递。
+**当前实现**：`MysqlPool::execute(std::string sql)` 直接切到 worker executor 后再使用协程帧内的 SQL 字符串，不再使用栈数组中转；仍然禁止 `asio::post(lambda)` 捕获请求数据跨 executor 边界。
 
 ### 日志性能瓶颈
 手写 Logger 每次调用加全局锁 + `ostringstream` 构造 + `cout` 输出 + 文件写入，高并发下锁竞争严重。
