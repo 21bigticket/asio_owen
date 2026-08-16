@@ -25,6 +25,10 @@ public:
         UpstreamConfig config;
         std::shared_ptr<HttpPool> pool;
         std::string upstream_path;
+        // Gateway response-transform switch ([gateway] json_keys_snake_to_camel,
+        // default on). Read by the proxy layer to decide whether upstream JSON
+        // bodies get their keys converted snake_case -> camelCase.
+        bool json_keys_snake_to_camel = true;
     };
 
     class PreparedReload {
@@ -39,6 +43,7 @@ public:
         PreparedReload() = default;
         std::unordered_map<std::string, UpstreamConfig> upstreams_;
         std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+        bool json_keys_snake_to_camel_ = true;
     };
 
     explicit UpstreamManager(asio::io_context& ioc) : ioc_(ioc) {}
@@ -62,7 +67,8 @@ public:
         if (it == upstreams_.end()) return std::nullopt;
         std::string upstream_path = (end == std::string::npos) ? "/" : path.substr(end);
         auto pool = pools_.at(svc);
-        return RouteResult{it->second, pool, std::move(upstream_path)};
+        return RouteResult{it->second, pool, std::move(upstream_path),
+            json_keys_snake_to_camel_};
     }
 
     // Hot-reload upstream config from [upstream] section.
@@ -71,6 +77,13 @@ public:
     // out-of-range or trailing-character port) rejects the WHOLE reload by
     // throwing, so one typo can never silently drop routes of other services.
     PreparedReload prepare_reload(const Config& cfg, const HttpPool::Config& pool_cfg) {
+        // Gateway-wide response-transform switch. Parsed before anything else so
+        // an invalid value rejects the whole reload (get_bool throws), same
+        // fail-closed semantics as a malformed upstream entry below.
+        PreparedReload prepared;
+        prepared.json_keys_snake_to_camel_ =
+            cfg.get_bool("gateway", "json_keys_snake_to_camel", true);
+
         auto new_upstreams = cfg.get_section("upstream");
         std::unordered_map<std::string, UpstreamConfig> current_upstreams;
         std::unordered_map<std::string, std::shared_ptr<HttpPool>> current_pools;
@@ -80,7 +93,6 @@ public:
             current_pools = pools_;
         }
 
-        PreparedReload prepared;
         for (auto& [name, val] : new_upstreams) {
             if (name.empty()) {
                 throw std::invalid_argument("upstream entry with an empty service name");
@@ -144,6 +156,9 @@ public:
             std::unique_lock lock(mtx_);
             upstreams_.swap(prepared.upstreams_);
             pools_.swap(prepared.pools_);
+            // Swapped inside the same lock as the maps + generation bump, so a
+            // request never sees the new flag mixed with the old route table.
+            json_keys_snake_to_camel_ = prepared.json_keys_snake_to_camel_;
             // Increment inside the lock: a reader that observes the new
             // generation must also observe the new maps, and vice versa.
             generation_.fetch_add(1, std::memory_order_release);
@@ -184,6 +199,9 @@ private:
     asio::io_context& ioc_;
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
     std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+    // Written only under the unique_lock in publish_reload, read under the
+    // shared_lock in route(), so it always publishes atomically with the maps.
+    bool json_keys_snake_to_camel_ = true;
     std::atomic<uint64_t> generation_{0};
 
 };

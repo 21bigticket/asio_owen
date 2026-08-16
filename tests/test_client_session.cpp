@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,6 +34,25 @@ Config make_upstream_config(const std::string& name, const std::string& host, in
         std::ofstream out(path);
         out << "[upstream]\n";
         out << name << " = " << host << ":" << port << "\n";
+    }
+    Config cfg;
+    cfg.load_file(path);
+    std::filesystem::remove(path);
+    return cfg;
+}
+
+// Like make_upstream_config, but also writes the [gateway] transform switch.
+Config make_gateway_upstream_config(const std::string& name, const std::string& host,
+                                    int port, bool snake_to_camel) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_client_session_gw_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    {
+        std::ofstream out(path);
+        out << "[upstream]\n";
+        out << name << " = " << host << ":" << port << "\n";
+        out << "[gateway]\n";
+        out << "json_keys_snake_to_camel = " << (snake_to_camel ? "true" : "false") << "\n";
     }
     Config cfg;
     cfg.load_file(path);
@@ -126,6 +147,80 @@ std::string read_response_with_timeout(unsigned short port, const std::string& r
     client.close(ignore);
     return response;
 }
+
+// Minimal mock upstream: binds an ephemeral port, drains each request's
+// headers, then answers with the same canned response. Serves at most
+// max_responses requests; after that its io_context runs out of work and the
+// thread exits on its own.
+class MockUpstream {
+public:
+    unsigned short start(std::string canned_response, int max_responses = 1) {
+        canned_ = std::move(canned_response);
+        remaining_ = max_responses;
+        acceptor_ = std::make_unique<tcp::acceptor>(
+            ioc_, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+        const unsigned short port = acceptor_->local_endpoint().port();
+        do_accept();
+        runner_ = std::thread([this] { ioc_.run(); });
+        return port;
+    }
+
+    ~MockUpstream() {
+        if (runner_.joinable()) {
+            // Cancels a still-pending accept so run() can return.
+            asio::post(ioc_, [this] {
+                asio::error_code ec;
+                acceptor_->close(ec);
+            });
+            runner_.join();
+        }
+    }
+
+    MockUpstream() = default;
+    MockUpstream(const MockUpstream&) = delete;
+    MockUpstream& operator=(const MockUpstream&) = delete;
+
+private:
+    void do_accept() {
+        acceptor_->async_accept([this](asio::error_code ec, tcp::socket peer) {
+            if (ec) return;
+            peer_ = std::move(peer);
+            request_.clear();
+            read_request();
+        });
+    }
+
+    void read_request() {
+        peer_.async_read_some(asio::buffer(buf_),
+            [this](asio::error_code ec, size_t n) {
+                request_.append(buf_.data(), n);
+                if (!ec && request_.find("\r\n\r\n") == std::string::npos) {
+                    read_request();
+                    return;
+                }
+                write_response();
+            });
+    }
+
+    void write_response() {
+        asio::async_write(peer_, asio::buffer(canned_),
+            [this](asio::error_code, size_t) {
+                asio::error_code ignore;
+                peer_.shutdown(tcp::socket::shutdown_both, ignore);
+                peer_.close(ignore);
+                if (--remaining_ > 0) do_accept();
+            });
+    }
+
+    asio::io_context ioc_;
+    std::unique_ptr<tcp::acceptor> acceptor_;
+    tcp::socket peer_{ioc_};
+    std::array<char, 1024> buf_{};
+    std::string request_;
+    std::string canned_;
+    int remaining_ = 0;
+    std::thread runner_;
+};
 
 class ClientSessionTest : public ::testing::Test {
 protected:
@@ -357,6 +452,60 @@ TEST_F(ClientSessionTest, ProxyUpstreamFailureReturns502) {
         "\r\n");
 
     EXPECT_TRUE(resp.rfind("HTTP/1.1 502", 0) == 0) << resp;
+}
+
+// ============== Gateway snake_to_camel switch (proxy happy path) ==============
+
+TEST_F(ClientSessionTest, ProxyJsonResponseSnakeToCamelAppliedWhenEnabled) {
+    const std::string body = R"({"user_name":"a","nested":{"deep_key":1}})";
+    MockUpstream mock;
+    auto upstream_port = mock.start(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + body);
+    auto cfg = make_gateway_upstream_config("mock", "127.0.0.1", upstream_port, true);
+    server().upstreams().reload(cfg, HttpPool::Config{});
+    start_server();
+
+    auto resp = read_response_with_timeout(port(),
+        "GET /mock/path HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    EXPECT_TRUE(resp.rfind("HTTP/1.1 200", 0) == 0) << resp;
+    EXPECT_NE(resp.find("\"userName\":\"a\""), std::string::npos) << resp;
+    EXPECT_NE(resp.find("\"deepKey\":1"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("user_name"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("deep_key"), std::string::npos) << resp;
+}
+
+TEST_F(ClientSessionTest, ProxyJsonResponseSnakeToCamelDisabledByConfig) {
+    const std::string body = R"({"user_name":"a","nested":{"deep_key":1}})";
+    MockUpstream mock;
+    auto upstream_port = mock.start(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + body);
+    auto cfg = make_gateway_upstream_config("mock", "127.0.0.1", upstream_port, false);
+    server().upstreams().reload(cfg, HttpPool::Config{});
+    start_server();
+
+    auto resp = read_response_with_timeout(port(),
+        "GET /mock/path HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    EXPECT_TRUE(resp.rfind("HTTP/1.1 200", 0) == 0) << resp;
+    EXPECT_NE(resp.find("\"user_name\":\"a\""), std::string::npos) << resp;
+    EXPECT_NE(resp.find("\"deep_key\":1"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("userName"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("deepKey"), std::string::npos) << resp;
 }
 
 TEST_F(ClientSessionTest, ReloadBetweenSecurityCheckAndRouteRefreshesCorsPolicy) {

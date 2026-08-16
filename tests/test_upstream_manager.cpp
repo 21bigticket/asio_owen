@@ -48,6 +48,21 @@ Config make_raw_upstream_config(const std::string& section_body) {
     return cfg;
 }
 
+// Build a config from verbatim ini text (for [gateway] switch tests).
+Config make_raw_config(const std::string& ini_text) {
+    auto path = std::filesystem::temp_directory_path() /
+        ("asio_owen_gateway_test_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
+    {
+        std::ofstream out(path);
+        out << ini_text;
+    }
+    Config cfg;
+    cfg.load_file(path);
+    std::filesystem::remove(path);
+    return cfg;
+}
+
 }  // namespace
 
 TEST(UpstreamManager, RoutesServicePrefixAndStripsItForUpstream) {
@@ -251,4 +266,86 @@ TEST(UpstreamManager, LaterConfigFileOverridesEarlierForSameService) {
     EXPECT_EQ(route->config.port, 30002);
 
     std::filesystem::remove_all(base);
+}
+
+// [gateway] json_keys_snake_to_camel 缺省必须打开（老配置行为不变）。
+TEST(UpstreamManager, GatewaySnakeToCamelDefaultsToEnabled) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    load_upstream(manager, "zebra-config", "127.0.0.1", 30001);
+
+    auto route = manager.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_TRUE(route->json_keys_snake_to_camel);
+}
+
+TEST(UpstreamManager, GatewaySnakeToCamelSwitchDisablesTransform) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto cfg = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n"
+        "[gateway]\njson_keys_snake_to_camel = false\n");
+    manager.reload(cfg, HttpPool::Config{});
+
+    auto route = manager.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_FALSE(route->json_keys_snake_to_camel);
+
+    // get_bool 接受的其它拼写同样生效，热加载翻回 true。
+    auto re_enabled = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n"
+        "[gateway]\njson_keys_snake_to_camel = on\n");
+    manager.reload(re_enabled, HttpPool::Config{});
+    auto after = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_TRUE(after->json_keys_snake_to_camel);
+}
+
+// 非法取值必须拒绝整次热加载，且已发布的状态（路由 + 当前开关值）原样保留。
+TEST(UpstreamManager, InvalidGatewaySnakeToCamelValueRejectsWholeReload) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto initial = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n"
+        "[gateway]\njson_keys_snake_to_camel = false\n");
+    manager.reload(initial, HttpPool::Config{});
+
+    auto bad = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n"
+        "[gateway]\njson_keys_snake_to_camel = maybe\n");
+    EXPECT_THROW(manager.prepare_reload(bad, HttpPool::Config{}),
+        std::invalid_argument);
+
+    auto route = manager.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_EQ(route->config.port, 30001);
+    EXPECT_FALSE(route->json_keys_snake_to_camel);
+}
+
+// 只翻开关、上游表不变时，连接池必须原样复用（开关不参与池重建比较）。
+// 回归保护：避免把开关放进 HttpPool::Config 导致翻一次开关就重建全部上游池。
+TEST(UpstreamManager, TogglingGatewaySnakeToCamelKeepsPoolsAlive) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto enabled = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n");
+    manager.reload(enabled, HttpPool::Config{});
+    auto before = manager.route("/zebra-config/path");
+    ASSERT_TRUE(before.has_value());
+    EXPECT_TRUE(before->json_keys_snake_to_camel);
+
+    auto disabled = make_raw_config(
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n"
+        "[gateway]\njson_keys_snake_to_camel = false\n");
+    manager.reload(disabled, HttpPool::Config{});
+    auto after_off = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after_off.has_value());
+    EXPECT_FALSE(after_off->json_keys_snake_to_camel);
+    EXPECT_EQ(after_off->pool, before->pool);
+
+    manager.reload(enabled, HttpPool::Config{});
+    auto after_on = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after_on.has_value());
+    EXPECT_TRUE(after_on->json_keys_snake_to_camel);
+    EXPECT_EQ(after_on->pool, before->pool);
 }

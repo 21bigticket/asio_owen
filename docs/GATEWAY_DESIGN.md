@@ -124,6 +124,13 @@ HttpServer
 `Content-Length`，因为 `json_keys_snake_to_camel()` 可能改变 body 长度，并在最终响应中按
 实际 body 重写 CL。
 
+### JSON key 蛇形转驼峰开关
+
+`json_keys_snake_to_camel()` 受 `[gateway] json_keys_snake_to_camel`（默认 `true`）控制，
+仅作用于网关代理路径中 Content-Type 含 `application/json` 的响应。开关随
+`[upstream]` 一起热加载：只翻转开关不会重建上游连接池（池复用比较不包含此标志），
+非法取值（非 true/false/1/0/yes/no/on/off）会拒绝整次热加载。
+
 无 body 响应保留上游 `Content-Length` 的语义，尤其是 HEAD 响应。
 
 4xx/5xx 响应会加：
@@ -290,7 +297,7 @@ Config Direct 是直压同一个上游；Config Gateway 是走网关代理到该
 4. 上游请求重建和 header 过滤。
 5. 上游 write/read。
 6. 上游响应解析和 body 读取。
-7. JSON key snake_to_camel 转换。
+7. JSON key snake_to_camel 转换（`[gateway] json_keys_snake_to_camel` 打开时）。
 8. 下游响应重建和写回。
 
 绝对 RPS 会随上游服务状态、VM 负载、日志级别、JWT/鉴权配置、body 大小波动。

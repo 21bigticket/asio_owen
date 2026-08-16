@@ -438,7 +438,8 @@ public:
                                     ctx.response_headers = std::move(proxy_resp.headers);
                                     proxy_response = true;
 
-                                    if (!ctx.response_body.empty()) {
+                                    if (upstream->json_keys_snake_to_camel
+                                            && !ctx.response_body.empty()) {
                                         auto ct = get_header_value(ctx.response_headers, "content-type");
                                         if (!ct.empty() && ct.find("application/json") != std::string::npos) {
                                             json_keys_snake_to_camel(ctx.response_body);
