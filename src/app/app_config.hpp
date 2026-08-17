@@ -3,12 +3,35 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "../common/config.hpp"
 #include "../common/logger.hpp"
 #include "../db/mysql_pool.hpp"
 #include "../db/redis_pool.hpp"
 #include "../http/http_pool.hpp"
+
+struct AdminAccountConfig {
+    std::string username;
+    std::string password_hash;
+};
+
+struct AdminConfig {
+    std::vector<AdminAccountConfig> accounts;
+    std::string jwt_private_key;
+    std::string jwt_public_key;
+    int token_ttl_min = 120;
+    bool insecure_no_auth = false;
+};
+
+struct ConfigSyncConfig {
+    bool enabled = false;
+    int sync_interval_sec = 5;
+    std::string machine_name;
+    std::string first_pull = "async";
+    int first_pull_timeout_ms = 3000;
+    AdminConfig admin;
+};
 
 struct AppConfig {
     LogLevel log_level = INFO;
@@ -25,7 +48,35 @@ struct AppConfig {
     int snapshot_interval_sec = 30;
     int reload_interval_sec = 30;
     int http_pool_stats_interval_sec = 30;
+    ConfigSyncConfig config_sync;
 };
+
+inline AdminConfig admin_config_from(const Config& cfg) {
+    AdminConfig admin;
+    admin.jwt_private_key = cfg.get("admin", "jwt_private_key", "");
+    admin.jwt_public_key = cfg.get("admin", "jwt_public_key", "");
+    admin.token_ttl_min = std::max(1, cfg.get_int("admin", "token_ttl_min", 120));
+    admin.insecure_no_auth = cfg.get_bool("admin", "insecure_no_auth", false);
+    for (const auto& [key, value] : cfg.get_section("admin")) {
+        if (key == "jwt_private_key" || key == "jwt_public_key" ||
+            key == "token_ttl_min" || key == "insecure_no_auth") {
+            continue;
+        }
+        if (key.empty() || value.empty()) {
+            continue;
+        }
+        auto it = std::find_if(admin.accounts.begin(), admin.accounts.end(),
+            [&](const AdminAccountConfig& account) {
+                return account.username == key;
+            });
+        if (it != admin.accounts.end()) {
+            it->password_hash = value;
+        } else {
+            admin.accounts.push_back({key, value});
+        }
+    }
+    return admin;
+}
 
 // Parse the [http_pool] section into an HttpPool::Config. Factored out so the
 // hot-reload path (ReloadService) can re-read it on every reload instead of
@@ -106,5 +157,13 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.snapshot_interval_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
     app.reload_interval_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
     app.http_pool_stats_interval_sec = cfg.get_int("http_pool", "stats_interval_sec", 30);
+    app.config_sync = ConfigSyncConfig{
+        .enabled = cfg.get_bool("config_sync", "enabled", false),
+        .sync_interval_sec = cfg.get_int("config_sync", "sync_interval_sec", 5),
+        .machine_name = cfg.get("config_sync", "machine_name", ""),
+        .first_pull = cfg.get("config_sync", "first_pull", "async"),
+        .first_pull_timeout_ms = cfg.get_int("config_sync", "first_pull_timeout_ms", 3000)
+    };
+    app.config_sync.admin = admin_config_from(cfg);
     return app;
 }

@@ -20,6 +20,7 @@
 #include "path_blacklist.hpp"
 #include "jwt_auth.hpp"
 #include "rate_limiter.hpp"
+#include "principal.hpp"
 #include "../http/cors.hpp"
 
 // Security rules: holds all security module instances, exposes a unified check() interface
@@ -43,6 +44,11 @@ public:
     };
 
     SecurityRules() = default;
+
+    static void validate_config_for_staging(const Config& cfg) {
+        SecurityRules staged(true);
+        staged.load_from_config(cfg);
+    }
 
     // Load all rules from Config
     void load_from_config(const Config& cfg) {
@@ -159,6 +165,9 @@ public:
         int status_code = 0;
         std::string reason;
         int retry_after_ms = 0;  // only meaningful for 429 (rate limited)
+        std::optional<Principal> principal;
+        std::string client_ip;
+        bool jwt_disabled = false;
     };
 
     struct RequestCheckResult {
@@ -224,6 +233,9 @@ private:
             return {400, "invalid client ip"};
         }
         auto& normalized_ip = normalized_ip_result.str;
+        CheckResult result;
+        result.client_ip = normalized_ip;
+        result.jwt_disabled = !snapshot->jwt_auth;
 
         // 2. Path normalization (case_sensitive controls whether paths are lowercased)
         auto norm = normalize_path(raw_path, snapshot->case_sensitive_paths);
@@ -237,14 +249,19 @@ private:
 
         // 4. IP blacklist check
         if (snapshot->ip_blacklist->is_blocked(normalized_ip)) {
-            return {403, "ip blocked"};
+            result.status_code = 403;
+            result.reason = "ip blocked";
+            return result;
         }
 
         // 5. Rate limit check
         if (snapshot->rate_limiter && snapshot->rate_policy) {
             auto decision = snapshot->rate_limiter->check_all(normalized_ip, path, service, *snapshot->rate_policy);
             if (!decision.allowed) {
-                return {429, "too many requests", decision.retry_after_ms};
+                result.status_code = 429;
+                result.reason = "too many requests";
+                result.retry_after_ms = decision.retry_after_ms;
+                return result;
             }
         }
 
@@ -264,28 +281,41 @@ private:
         if (!is_whitelisted && snapshot->jwt_auth) {
             claims = snapshot->jwt_auth->verify(auth_header);
             if (!claims) {
-                return {401, "invalid jwt"};
+                result.status_code = 401;
+                result.reason = "invalid jwt";
+                return result;
             }
+            result.principal = Principal{
+                .subject = claims->subject,
+                .username = claims->username,
+                .roles = claims->roles
+            };
         }
 
         // 8. Path blacklist (single lock for both blocked + role check)
         auto path_result = snapshot->path_blacklist->check(path);
         if (path_result.blocked) {
-            return {403, "path blocked"};
+            result.status_code = 403;
+            result.reason = "path blocked";
+            return result;
         }
         // Role check: compare JWT claims roles with path requirements
         if (!path_result.required_role.empty()) {
             // Path requires a role but request is whitelisted (no JWT), reject
             if (is_whitelisted) {
-                return {403, "role required"};
+                result.status_code = 403;
+                result.reason = "role required";
+                return result;
             }
             // Check if JWT claims contain the required role
             if (!claims || !has_role(*claims, path_result.required_role)) {
-                return {403, "insufficient role"};
+                result.status_code = 403;
+                result.reason = "insufficient role";
+                return result;
             }
         }
 
-        return {0, ""};
+        return result;
     }
 
 public:

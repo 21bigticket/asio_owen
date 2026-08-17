@@ -21,11 +21,52 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+set(ASIO_OWEN_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(ASIO_OWEN_ADMIN_LOGIN_HTML ${PROJECT_SOURCE_DIR}/src/app/admin/pages/login.html)
+set(ASIO_OWEN_ADMIN_LOGIN_HEADER ${ASIO_OWEN_GENERATED_DIR}/admin_login_html.hpp)
+set(ASIO_OWEN_ADMIN_SETTINGS_HTML ${PROJECT_SOURCE_DIR}/src/app/admin/pages/settings.html)
+set(ASIO_OWEN_ADMIN_SETTINGS_HEADER ${ASIO_OWEN_GENERATED_DIR}/admin_settings_html.hpp)
+add_custom_command(
+    OUTPUT ${ASIO_OWEN_ADMIN_LOGIN_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${ASIO_OWEN_GENERATED_DIR}
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT_FILE=${ASIO_OWEN_ADMIN_LOGIN_HTML}
+        -DOUTPUT_FILE=${ASIO_OWEN_ADMIN_LOGIN_HEADER}
+        -DVARIABLE_NAME=admin_login_html
+        -P ${PROJECT_SOURCE_DIR}/cmake/embed_text.cmake
+    DEPENDS ${ASIO_OWEN_ADMIN_LOGIN_HTML} ${PROJECT_SOURCE_DIR}/cmake/embed_text.cmake
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${ASIO_OWEN_ADMIN_SETTINGS_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${ASIO_OWEN_GENERATED_DIR}
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT_FILE=${ASIO_OWEN_ADMIN_SETTINGS_HTML}
+        -DOUTPUT_FILE=${ASIO_OWEN_ADMIN_SETTINGS_HEADER}
+        -DVARIABLE_NAME=admin_settings_html
+        -P ${PROJECT_SOURCE_DIR}/cmake/embed_text.cmake
+    DEPENDS ${ASIO_OWEN_ADMIN_SETTINGS_HTML} ${PROJECT_SOURCE_DIR}/cmake/embed_text.cmake
+    VERBATIM
+)
+add_custom_target(asio_owen_generated_assets
+    DEPENDS ${ASIO_OWEN_ADMIN_LOGIN_HEADER} ${ASIO_OWEN_ADMIN_SETTINGS_HEADER})
+add_custom_target(asio_owen_runtime_files
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${PROJECT_SOURCE_DIR}/jwt_keys
+        -DDEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/jwt_keys
+        -P ${PROJECT_SOURCE_DIR}/cmake/copy_optional_dir.cmake
+    COMMENT "Copying optional runtime jwt_keys"
+    VERBATIM
+)
+
 # ==================== 通用编译选项 ====================
 add_library(asio_owen_options INTERFACE)
 target_compile_features(asio_owen_options INTERFACE cxx_std_20)
 target_compile_definitions(asio_owen_options INTERFACE ASIO_STANDALONE ASIO_HAS_CO_AWAIT)
-target_include_directories(asio_owen_options INTERFACE ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(asio_owen_options INTERFACE
+    ${PROJECT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
 
 # ==================== ASIO + spdlog（优先本地，否则 FetchContent 自动拉取）====================
 include(FetchContent)
@@ -214,18 +255,13 @@ add_executable(server
 )
 target_link_libraries(server PRIVATE asio_owen_core)
 target_compile_options(server PRIVATE $<$<CONFIG:Release>:-g>)
+add_dependencies(server asio_owen_generated_assets asio_owen_runtime_files)
 
 # 复制 config.d/ 目录（如果存在），排除本地覆盖文件
 if(EXISTS ${PROJECT_SOURCE_DIR}/config.d)
     file(COPY ${PROJECT_SOURCE_DIR}/config.d/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/config.d/
         PATTERN "99-local.ini" EXCLUDE)
     message(STATUS "config.d: copied to build directory (excluded 99-local.ini)")
-endif()
-
-# 复制 jwt_keys/ 公钥目录（如果存在，供 RS256 JWT 验证使用）
-if(EXISTS ${PROJECT_SOURCE_DIR}/jwt_keys)
-    file(COPY ${PROJECT_SOURCE_DIR}/jwt_keys/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/jwt_keys/)
-    message(STATUS "jwt_keys: copied to build directory")
 endif()
 
 # ==================== GoogleTest（优先本地，否则 FetchContent 自动拉取）====================

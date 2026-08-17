@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asio_owen Config Settings</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8fb;--panel:#fff;--line:#d8dee8;--text:#18202f;--muted:#687386;--accent:#1463ff;--danger:#b42318;--ok:#067647}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.shell{height:100vh;display:grid;grid-template-rows:auto 1fr auto}.top{height:52px;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{font-weight:700}.version{color:var(--muted)}.token{margin-left:auto;display:flex;gap:8px;align-items:center}.token input{width:min(42vw,420px);height:30px;border:1px solid var(--line);border-radius:6px;padding:0 9px}
+button{height:30px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);padding:0 10px;cursor:pointer}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{border-color:#f2b8b5;color:var(--danger)}
+.main{min-height:0;display:grid;grid-template-columns:280px 1fr 300px}.side,.machines{min-height:0;overflow:auto;background:var(--panel)}.side{border-right:1px solid var(--line)}.machines{border-left:1px solid var(--line)}
+.side-head,.machine-head{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.file{width:100%;height:auto;text-align:left;border:0;border-bottom:1px solid #eef1f5;border-radius:0;padding:10px 14px;background:#fff}.file.active{background:#eef4ff}.badge{font-size:12px;color:var(--muted);margin-left:6px}.badge.hot{color:var(--ok)}.badge.restart{color:#b54708}
+.work{min-width:0;display:grid;grid-template-rows:auto 1fr;background:#fbfcfe}.toolbar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.toolbar .name{font-weight:650;margin-right:auto}.mode button.active{background:#eaf1ff;border-color:#9dbbff}
+textarea{width:100%;height:100%;resize:none;border:0;padding:14px 16px;background:#fbfcfe;color:var(--text);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}.form{height:100%;overflow:auto;padding:14px 16px}.row{display:grid;grid-template-columns:160px 1fr;gap:8px;margin-bottom:8px}.row input{height:30px;border:1px solid var(--line);border-radius:6px;padding:0 8px}.row .section{color:var(--muted);font-size:12px}
+.status{min-height:34px;padding:8px 14px;border-top:1px solid var(--line);background:var(--panel);color:var(--muted)}.machine{padding:10px 14px;border-bottom:1px solid #eef1f5}.machine .ok{color:var(--ok)}.machine .partial{color:#b54708}.machine .bad{color:var(--danger)}@media(max-width:900px){.main{grid-template-columns:1fr}.side,.machines{display:none}.token input{width:160px}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="top"><div class="brand">asio_owen Config Center</div><div class="version" id="version">v-</div><div class="token"><input id="token" placeholder="Bearer token"><button id="logout">Logout</button><button id="load">Load</button><button class="primary" id="save">Save</button></div></div>
+  <div class="main">
+    <aside class="side"><div class="side-head"><strong>Files</strong><button id="add">+</button></div><div id="files"></div></aside>
+    <section class="work"><div class="toolbar"><div class="name" id="fileName">No file</div><div class="mode"><button id="sourceBtn" class="active">Source</button><button id="formBtn">Form</button></div><button class="danger" id="delete">Delete</button></div><textarea id="editor" spellcheck="false"></textarea><div class="form" id="form" hidden></div></section>
+    <aside class="machines"><div class="machine-head"><strong>Machines</strong><button id="refreshMachines">Refresh</button></div><div id="machines"></div></aside>
+  </div>
+  <div class="status" id="status">Idle</div>
+</div>
+<script>
+const api="/api/admin/config";const machinesApi="/api/admin/config/machines";let version=0;let files=[];let selected=0;let mode="source";
+const $=id=>document.getElementById(id);$("token").value=localStorage.getItem("adminToken")||"";
+function headers(){const t=$("token").value.trim();localStorage.setItem("adminToken",t);return t?{"Authorization":"Bearer "+t}:{}}
+function checkAuth(r){if(r.status===401){localStorage.removeItem("adminToken");location.href="/admin/login";return false}return true}
+function status(s,bad=false){$("status").textContent=s;$("status").style.color=bad?"var(--danger)":"var(--muted)"}
+function syncEditor(){if(files[selected]&&mode==="source")files[selected].content=$("editor").value}
+function render(){files.sort((a,b)=>a.name.localeCompare(b.name));$("version").textContent="v"+version;$("files").innerHTML=files.map((f,i)=>`<button class="file ${i===selected?"active":""}" onclick="selectFile(${i})">${esc(f.name)}<span class="badge ${f.restart_required?"restart":"hot"}">${f.restart_required?"restart":"hot"}</span></button>`).join("");const f=files[selected];$("fileName").textContent=f?f.name:"No file";$("editor").hidden=mode!=="source";$("form").hidden=mode!=="form";$("editor").value=f?f.content:"";if(mode==="form")renderForm()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
+function selectFile(i){syncEditor();selected=i;render()}
+function parseIni(s){const rows=[];let section="";s.split(/\r?\n/).forEach(line=>{const m=line.match(/^\s*\[([^\]]+)\]\s*$/);if(m){section=m[1];return}const eq=line.indexOf("=");if(eq>0)rows.push({section,key:line.slice(0,eq).trim(),value:line.slice(eq+1).trim()})});return rows}
+function renderForm(){const f=files[selected];if(!f){$("form").innerHTML="";return}const rows=parseIni(f.content);$("form").innerHTML=rows.map((r,i)=>`<div class="row"><div><div class="section">[${esc(r.section)}]</div><input data-i="${i}" data-k="key" value="${esc(r.key)}"></div><input data-i="${i}" data-k="value" value="${esc(r.value)}"></div>`).join("")+`<button onclick="applyForm()">Apply Form</button>`;$("form").dataset.rows=JSON.stringify(rows)}
+function applyForm(){const rows=JSON.parse($("form").dataset.rows||"[]");$("form").querySelectorAll("input").forEach(input=>{rows[input.dataset.i][input.dataset.k]=input.value});let out="",sec="";rows.forEach(r=>{if(r.section!==sec){sec=r.section;out+=`[${sec}]\n`}out+=`${r.key} = ${r.value}\n`});files[selected].content=out;mode="source";setModeButtons();render()}
+function setModeButtons(){$("sourceBtn").classList.toggle("active",mode==="source");$("formBtn").classList.toggle("active",mode==="form")}
+async function load(){status("Loading");const r=await fetch(api,{headers:headers()});if(!checkAuth(r))return;const j=await r.json();if(!r.ok||j.code!==0)throw new Error(j.msg||r.statusText);version=j.data.version;files=j.data.files||[];selected=0;render();status("Loaded")}
+async function save(){syncEditor();if(files.some(f=>/\[path_blacklist\][\s\S]*^\s*\/\s*=\s*$/m.test(f.content))&&!confirm("Save block-all path_blacklist rule?"))return;status("Saving");const r=await fetch(api,{method:"POST",headers:{...headers(),"Content-Type":"application/json"},body:JSON.stringify({base_version:version,files:files.map(f=>({name:f.name,content:f.content}))})});if(!checkAuth(r))return;const j=await r.json();if(!r.ok||j.code!==0)throw new Error(j.msg||r.statusText);version=j.data.version;status("Saved v"+version);await load()}
+async function loadMachines(){const r=await fetch(machinesApi,{headers:headers()});if(!checkAuth(r))return;const j=await r.json();if(!r.ok||j.code!==0)throw new Error(j.msg||r.statusText);$("machines").innerHTML=(j.data.machines||[]).map(m=>`<div class="machine"><strong>${esc(m.machine)}</strong><div class="${m.status==="ok"?"ok":m.status==="partial"?"partial":"bad"}">v${esc(m.version)} ${esc(m.status||"unknown")}</div><small>${esc(m.detail||"")}</small></div>`).join("")}
+$("logout").onclick=()=>{localStorage.removeItem("adminToken");location.href="/admin/login"};$("load").onclick=()=>load().then(loadMachines).catch(e=>status(e.message,true));$("save").onclick=()=>save().catch(e=>status(e.message,true));$("refreshMachines").onclick=()=>loadMachines().catch(e=>status(e.message,true));$("add").onclick=()=>{syncEditor();files.push({name:"20-new.ini",content:"[upstream]\nservice = 127.0.0.1:30001\n",restart_required:false});selected=files.length-1;render()};$("delete").onclick=()=>{if(!files[selected])return;files.splice(selected,1);selected=Math.max(0,selected-1);render()};$("sourceBtn").onclick=()=>{syncEditor();mode="source";setModeButtons();render()};$("formBtn").onclick=()=>{syncEditor();mode="form";setModeButtons();render()};setInterval(()=>loadMachines().catch(()=>{}),5000);if(!$("token").value.trim())location.href="/admin/login";else load().then(loadMachines).catch(e=>status(e.message,true));
+</script>
+</body>
+</html>

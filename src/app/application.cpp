@@ -29,6 +29,23 @@ int Application::run(int argc, char* argv[]) {
     }
 
     auto app_cfg = app_config_from(cfg);
+    if (ConfigSyncService::blocking_first_pull(
+            config_base, app_cfg.config_sync, app_cfg.redis, app_cfg)) {
+        if (app_cfg.config_sync.enabled && app_cfg.config_sync.first_pull == "blocking") {
+            Config reloaded_cfg;
+            if (reloaded_cfg.load(config_base)) {
+                cfg = std::move(reloaded_cfg);
+                app_cfg = app_config_from(cfg);
+            } else {
+                std::cerr << "Reload config failed after config_sync blocking first pull; "
+                          << "using pre-pull config" << std::endl;
+            }
+        }
+    } else if (app_cfg.config_sync.enabled && app_cfg.config_sync.first_pull == "blocking") {
+        std::cerr << "config_sync blocking first pull failed; using local config"
+                  << std::endl;
+    }
+
     Logger::instance().init(app_cfg.log_file, app_cfg.log_level);
 
     LOG_INFO("Server starting...");
@@ -155,13 +172,22 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
         .redis = redis_.get(),
         .combo_query_limiter = combo_query_limiter_,
         .combo_backend = make_pool_combo_backend(mysql_.get(), redis_.get()),
-        .combo_deadline_ms = app_cfg.combo_deadline_ms
+        .combo_deadline_ms = app_cfg.combo_deadline_ms,
+        .config_base = config_base,
+        .config_sync = app_cfg.config_sync,
+        .redis_command = [redis = redis_.get()](std::vector<std::string> args) {
+            return redis->cmd_argv(std::move(args));
+        }
     });
 
     register_upstreams(cfg, app_cfg.http_pool);
 
     pool_stats_service_ = std::make_unique<PoolStatsService>(ioc_, server_->upstreams());
     pool_stats_service_->start(app_cfg.http_pool_stats_interval_sec);
+
+    config_sync_service_ = std::make_shared<ConfigSyncService>(
+        ioc_, *redis_, config_base, app_cfg.config_sync, app_cfg);
+    config_sync_service_->start();
 
     reload_service_ = std::make_unique<ReloadService>(
         ioc_, config_base, *security_rules_, server_->upstreams());
@@ -187,12 +213,14 @@ void Application::request_stop() {
 }
 
 void Application::cleanup() {
+    if (config_sync_service_) config_sync_service_->stop();
     if (reload_service_) reload_service_->stop();
     if (pool_stats_service_) pool_stats_service_->stop();
     if (snapshot_service_) snapshot_service_->stop();
     if (server_) server_->stop();
 
     signal_exit_.reset();
+    config_sync_service_.reset();
     reload_service_.reset();
     pool_stats_service_.reset();
     snapshot_service_.reset();

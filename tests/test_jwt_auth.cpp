@@ -77,6 +77,16 @@ std::string make_hs256_token() {
         .sign(jwt::algorithm::hs256{"test-secret-for-wrong-algorithm-token"});
 }
 
+std::string make_admin_token() {
+    return jwt::create()
+        .set_issuer("pixiu-gateway")
+        .set_subject("42")
+        .set_payload_claim("name", jwt::claim(std::string("admin-user")))
+        .set_payload_claim("role", jwt::claim(std::string("admin")))
+        .set_expires_at(Clock::now() + std::chrono::hours(1))
+        .sign(jwt::algorithm::rs256{kPublicKey, kPrivateKey});
+}
+
 JWTAuth make_auth() {
     return JWTAuth("test-secret-that-is-not-used-for-rs256",
         "pixiu-gateway", "RS256", kPublicKey);
@@ -194,6 +204,42 @@ TEST(SecurityRules, RS256DoesNotRequireJwtSecretToEnableVerification) {
         "", "");
 
     EXPECT_EQ(result.status_code, 401);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(SecurityRules, CheckRequestPublishesVerifiedPrincipal) {
+    auto base = make_temp_config_dir();
+    auto key_path = base / "public-key.pem";
+    write_file(key_path, kPublicKey);
+    write_file(base / "config.d" / "30-security.ini",
+        "[security]\n"
+        "jwt_algorithm = RS256\n"
+        "jwt_public_key = " + key_path.string() + "\n"
+        "jwt_issuer = pixiu-gateway\n");
+    write_file(base / "config.d" / "40-rate_limit.ini",
+        "[rate_limit]\n"
+        "ip_rps = 0\n"
+        "global_rps = 0\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+
+    SecurityRules rules;
+    rules.load_from_config(cfg);
+
+    asio::io_context ioc;
+    auto socket = make_connected_socket(ioc);
+    auto result = rules.check_request(*socket, "GET", "/api/admin/config",
+        "", "Bearer " + make_admin_token());
+
+    EXPECT_EQ(result.security.status_code, 0);
+    ASSERT_TRUE(result.security.principal.has_value());
+    EXPECT_EQ(result.security.principal->subject, "42");
+    EXPECT_EQ(result.security.principal->username, "admin-user");
+    ASSERT_EQ(result.security.principal->roles.size(), 1u);
+    EXPECT_EQ(result.security.principal->roles[0], "admin");
+    EXPECT_FALSE(result.security.jwt_disabled);
 
     std::filesystem::remove_all(base);
 }

@@ -16,6 +16,11 @@ add_executable(test_reload_service test_reload_service.cpp)
 target_link_libraries(test_reload_service PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_reload_service)
 
+# Redis-backed config center mirror service
+add_executable(test_config_sync_service test_config_sync_service.cpp)
+target_link_libraries(test_config_sync_service PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_config_sync_service)
+
 # JSON key 转换
 add_executable(test_json_transform test_json_transform.cpp)
 target_link_libraries(test_json_transform PRIVATE gtest_main asio_owen_core)
@@ -105,7 +110,14 @@ gtest_discover_tests(test_combo_query_limiter)
 # /api/combo response status and cache-fallback flow without external services
 add_executable(test_combo_routes test_combo_routes.cpp ${PROJECT_SOURCE_DIR}/src/app/routes.cpp)
 target_link_libraries(test_combo_routes PRIVATE gtest_main asio_owen_core)
+add_dependencies(test_combo_routes asio_owen_generated_assets)
 gtest_discover_tests(test_combo_routes)
+
+# Config center Admin API and embedded /admin page
+add_executable(test_admin_config_routes test_admin_config_routes.cpp ${PROJECT_SOURCE_DIR}/src/app/routes.cpp)
+target_link_libraries(test_admin_config_routes PRIVATE gtest_main asio_owen_core)
+add_dependencies(test_admin_config_routes asio_owen_generated_assets)
+gtest_discover_tests(test_admin_config_routes)
 
 # End-to-end client session via real HttpServer + tcp client
 add_executable(test_client_session test_client_session.cpp ${PROJECT_SOURCE_DIR}/picohttpparser.c)

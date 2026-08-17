@@ -245,6 +245,9 @@ public:
                     security_generation = checked.generation;
                     cors_policy = std::move(checked.cors_policy);
                     const auto& result = checked.security;
+                    ctx.principal = result.principal;
+                    ctx.client_ip = result.client_ip;
+                    ctx.jwt_disabled = result.jwt_disabled;
                     if (result.status_code != 0) {
                         ctx.status_code = result.status_code;
                         // json_resp escapes reason; a future reason containing

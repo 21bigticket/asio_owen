@@ -1,0 +1,15 @@
+if(NOT DEFINED INPUT_FILE OR NOT DEFINED OUTPUT_FILE OR NOT DEFINED VARIABLE_NAME)
+    message(FATAL_ERROR "embed_text.cmake requires INPUT_FILE, OUTPUT_FILE and VARIABLE_NAME")
+endif()
+
+file(READ "${INPUT_FILE}" content)
+string(REPLACE "\\" "\\\\" content "${content}")
+string(REPLACE "\"" "\\\"" content "${content}")
+string(REPLACE "\n" "\\n\"\n\"" content "${content}")
+
+file(WRITE "${OUTPUT_FILE}" "#pragma once\n\n")
+file(APPEND "${OUTPUT_FILE}" "#include <string_view>\n\n")
+file(APPEND "${OUTPUT_FILE}" "namespace generated_assets {\n")
+file(APPEND "${OUTPUT_FILE}" "inline constexpr std::string_view ${VARIABLE_NAME} =\n")
+file(APPEND "${OUTPUT_FILE}" "\"${content}\";\n")
+file(APPEND "${OUTPUT_FILE}" "}  // namespace generated_assets\n")
