@@ -2,7 +2,7 @@
 
 **日期**：2026-08-18
 
-**阶段**：Phase 4 已完成代码实现和本地回归（Clang 291/291、Phase 4 相关 ASan 54/54）；生产迁移、真实 Redis 故障演练和本次修复后的 Ubuntu GCC 11 门禁待执行
+**阶段**：Phase 4 已完成代码实现、本地回归、Ubuntu GCC 11 构建与 291/291 测试、真实 Redis v1 播种和运行压测；AOF/故障恢复专项演练仍按 §15.2 单独执行
 
 **依赖设计**：`docs/CONFIG_CENTER_DESIGN_2026-08-16.md`
 
@@ -688,6 +688,26 @@ ctest --test-dir build-gcc11 --output-on-failure
 ```
 
 - 若开发环境没有 GCC 11，可先做本地验证，但在 Ubuntu GCC 11 门禁通过前不得判定 Phase 4 实现完成。
+
+### 15.5 2026-08-18 Ubuntu 运行验收
+
+Ubuntu 22.04、GCC/G++ 11.4.0 目标机已完成完整构建和 `ctest`，291/291 测试通过；
+随后使用当前部署版本执行 `./bench.sh` 全量压测及额外 Config Gateway 重复压测。
+
+验收结果包括：
+
+- Health 平均约 117k RPS，Redis 平均约 25.3k RPS，MySQL 平均约 11.0k RPS，错误均为 0。
+- Config Gateway 四轮为 8.8k～10.9k RPS，位于历史短压测区间；测试期间宿主机
+  iowait 约 50%～53%，因此不对小幅性能变化作版本归因。
+- HttpPool 累计 1,333,241 次获取，复用率约 99.986%；停止流量后 active/in_flight
+  归零，约 60 秒后 93 条空闲连接全部回收。
+- Release RSS 两次压力冷却后分别为 117,276 KiB 和 117,252 KiB，VmHWM 始终为
+  119,324 KiB，未出现逐轮增长。
+- 当前 v1 全部配置中心 key 的 `MEMORY USAGE` 合计 16,359 B，其中 snapshot、meta、
+  index 合计 8,215 B。
+
+完整环境、逐轮延迟、连接池计数、内存采样和结论边界见
+`docs/PHASE4_PERF_VALIDATION_2026-08-18.md`。
 
 ## 16. 待确认参数
 

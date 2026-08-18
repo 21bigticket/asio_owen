@@ -6,7 +6,9 @@
 
 **相关设计**：`docs/CONFIG_CENTER_DESIGN_2026-08-16.md`
 
-**版本历史设计**：`docs/CONFIG_HISTORY_DESIGN_2026-08-18.md`（Phase 4 已实现，生产迁移和目标机门禁待执行）
+**版本历史设计**：`docs/CONFIG_HISTORY_DESIGN_2026-08-18.md`（Phase 4 已实现，Ubuntu GCC 11 目标机门禁已通过）
+
+**运行验收记录**：`docs/PHASE4_PERF_VALIDATION_2026-08-18.md`
 
 ## 1. 发布原则
 
