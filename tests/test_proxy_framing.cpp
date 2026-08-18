@@ -214,6 +214,34 @@ TEST(ProxyFraming, ChunkedBodyTooLargeReturns502) {
     expect_bad_gateway_without_truncated_body(response);
 }
 
+TEST(ProxyFraming, CompoundTransferEncodingReturns502) {
+    auto response = proxy_request_for(
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: gzip, chunked\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "2\r\n"
+        "ok\r\n"
+        "0\r\n"
+        "\r\n");
+
+    EXPECT_TRUE(response.rfind("HTTP/1.1 502", 0) == 0) << response;
+}
+
+TEST(ProxyFraming, InformationalResponseIsConsumedBeforeFinalResponse) {
+    auto response = proxy_request_for(
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "ok");
+
+    EXPECT_TRUE(response.rfind("HTTP/1.1 200", 0) == 0) << response;
+    EXPECT_NE(response.find("\r\n\r\nok"), std::string::npos) << response;
+    EXPECT_EQ(response.find("100 Continue"), std::string::npos) << response;
+}
+
 TEST(ProxyFraming, ChunkedControlLineTooLargeReturns502) {
     std::string upstream_response =
         "HTTP/1.1 200 OK\r\n"

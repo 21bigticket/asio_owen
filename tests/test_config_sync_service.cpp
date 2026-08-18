@@ -632,3 +632,95 @@ TEST(ConfigSyncService, CleanSyncAdvancesVersionAndDeletesStaleFiles) {
 
     std::filesystem::remove_all(base);
 }
+
+TEST(ConfigSyncService, StaleFileDeleteFailureDoesNotAdvanceVersion) {
+    auto base = make_temp_base("delete_failure");
+    write_never_sync_files(base);
+    auto stale_path = base / "config.d" / "20-old.ini";
+    std::filesystem::create_directories(stale_path);
+    write_file(stale_path / "keep", "not empty");
+
+    ConfigSyncService::State previous;
+    previous.exists = true;
+    previous.synced_version = 1;
+    previous.status = "ok";
+    previous.managed_files["20-old.ini"] = "old-hash";
+    previous.last_ok = previous.managed_files;
+    ASSERT_TRUE(ConfigSyncService::write_state(base, previous));
+
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("2");
+        if (args.front() == "HGETALL") {
+            return array_reply({
+                "20-upstream.ini",
+                "[upstream]\nzebra = 127.0.0.1:30002\n"
+            });
+        }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30002\n"}
+            });
+        }
+        if (args.front() == "HSET") {
+            EXPECT_NE(args[3].find("|partial|"), std::string::npos);
+            EXPECT_NE(args[3].find("20-old.ini"), std::string::npos);
+            return integer_reply(1);
+        }
+        return error_reply("unexpected command " + args.front());
+    };
+
+    EXPECT_FALSE(run_sync_once(base, redis));
+    EXPECT_TRUE(std::filesystem::exists(stale_path));
+
+    auto state = ConfigSyncService::load_state(base);
+    EXPECT_EQ(state.synced_version, 1);
+    EXPECT_EQ(state.status, "partial");
+    EXPECT_TRUE(state.failures.count("20-old.ini"));
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, EqualVersionLocalDriftReappliesSnapshot) {
+    auto base = make_temp_base("equal_version_drift");
+    write_never_sync_files(base);
+    const std::string expected =
+        "[upstream]\nzebra = 127.0.0.1:30002\n";
+    write_file(base / "config.d" / "20-upstream.ini",
+        "[upstream]\nzebra = 127.0.0.1:39999\n");
+
+    ConfigSyncService::State previous;
+    previous.exists = true;
+    previous.synced_version = 2;
+    previous.status = "ok";
+    previous.managed_files["20-upstream.ini"] =
+        ConfigSyncService::content_hash(expected);
+    previous.last_ok = previous.managed_files;
+    ASSERT_TRUE(ConfigSyncService::write_state(base, previous));
+
+    FakeRedis redis;
+    redis.handler = [&expected](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("2");
+        if (args.front() == "HGETALL") {
+            return array_reply({"20-upstream.ini", expected});
+        }
+        if (args.front() == "HGET") {
+            return string_reply(snapshot_meta({{"20-upstream.ini", expected}}));
+        }
+        if (args.front() == "HSET") {
+            EXPECT_NE(args[3].find("|ok"), std::string::npos);
+            return integer_reply(1);
+        }
+        return error_reply("unexpected command " + args.front());
+    };
+
+    EXPECT_TRUE(run_sync_once(base, redis));
+    EXPECT_EQ(read_file(base / "config.d" / "20-upstream.ini"), expected);
+    EXPECT_EQ(redis.count("HGETALL"), 1u);
+
+    auto state = ConfigSyncService::load_state(base);
+    EXPECT_EQ(state.synced_version, 2);
+    EXPECT_EQ(state.status, "ok");
+
+    std::filesystem::remove_all(base);
+}

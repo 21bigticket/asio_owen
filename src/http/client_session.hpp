@@ -153,6 +153,7 @@ public:
                 std::string& preread = body_buffer;
                 if (request_header_state.invalid_content_length ||
                     request_header_state.duplicate_content_length ||
+                    request_header_state.invalid_transfer_encoding ||
                     (request_header_state.has_transfer_encoding && !request_header_state.is_chunked)) {
                     LOG_INFO("Reject request framing: method=", method_str,
                         ", path=", path_str,
@@ -160,6 +161,7 @@ public:
                         ", duplicate_cl=", request_header_state.duplicate_content_length,
                         ", has_te=", request_header_state.has_transfer_encoding,
                         ", is_chunked=", request_header_state.is_chunked,
+                        ", invalid_te=", request_header_state.invalid_transfer_encoding,
                         ", headers=[", describe_headers(ctx.headers), "]");
                     ctx.status_code = 400;
                     ctx.response_body = "{\"code\":400,\"msg\":\"invalid request framing\"}";

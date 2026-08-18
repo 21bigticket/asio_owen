@@ -482,11 +482,29 @@ private:
                     local_state.failures.find("history_snapshot") !=
                         local_state.failures.end();
                 if (remote_version == local_version && !history_recovery_pending) {
-                    self->heartbeat(heartbeat_payload(remote_version, "ok"),
-                        [completion = std::move(completion)]() mutable {
-                            completion(true);
-                        });
-                    return;
+                    std::map<std::string, std::string> local_files;
+                    std::vector<std::string> errors;
+                    const bool collected = collect_local_managed_files(
+                        self->config_base_, local_files, errors);
+                    std::map<std::string, std::string> local_hashes;
+                    if (collected) {
+                        for (const auto& [name, content] : local_files) {
+                            local_hashes[name] = content_hash(content);
+                        }
+                    }
+                    const bool local_matches = collected &&
+                        local_state.status == "ok" &&
+                        local_state.managed_files == local_state.last_ok &&
+                        local_hashes == local_state.last_ok;
+                    if (local_matches) {
+                        self->heartbeat(heartbeat_payload(remote_version, "ok"),
+                            [completion = std::move(completion)]() mutable {
+                                completion(true);
+                            });
+                        return;
+                    }
+                    LOG_WARN("ConfigSync local drift detected; reapplying version ",
+                        remote_version);
                 }
 
                 self->read_remote_files(remote_version, std::move(completion));
@@ -861,10 +879,13 @@ private:
                 std::error_code ec;
                 std::filesystem::remove(config_dir() / name, ec);
                 if (ec) {
-                    LOG_WARN("ConfigSync failed to remove stale file ", name,
-                        ": ", ec.message());
+                    next.failures[name] = "failed to remove stale file: " + ec.message();
                 }
             }
+        }
+
+        if (!next.failures.empty()) {
+            return persist_partial();
         }
 
         State clean;

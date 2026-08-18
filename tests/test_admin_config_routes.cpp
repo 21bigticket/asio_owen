@@ -1102,4 +1102,10 @@ TEST(AdminConfigRoutes, AdminSettingsPageReturnsEmbeddedSinglePageApp) {
     EXPECT_NE(ctx.response_body.find("/api/admin/config"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("function render"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/admin/login"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("from the pending changes?"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("prompt(\"Change reason\", \"\")"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("if (!reason) return"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("from the saved configuration:"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("Save these configuration changes as a new version?"),
+        std::string::npos);
 }

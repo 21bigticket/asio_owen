@@ -1,83 +1,781 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>asio_owen Config Settings</title>
-<style>
-:root{color-scheme:light;--bg:#f7f8fb;--panel:#fff;--line:#d8dee8;--text:#18202f;--muted:#687386;--accent:#1463ff;--danger:#b42318;--ok:#067647}
-*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.shell{height:100vh;display:grid;grid-template-rows:auto 1fr auto}.top{height:52px;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--panel)}
-.brand{font-weight:700}.version{color:var(--muted)}.token{margin-left:auto;display:flex;gap:8px;align-items:center}.token input{width:min(42vw,420px);height:30px;border:1px solid var(--line);border-radius:6px;padding:0 9px}
-button{height:30px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);padding:0 10px;cursor:pointer}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{border-color:#f2b8b5;color:var(--danger)}
-.view-tabs{display:flex;gap:2px}.view-tabs button.active{background:#eaf1ff;border-color:#9dbbff}
-.main{min-height:0;display:grid;grid-template-columns:280px 1fr 300px}.side,.machines{min-height:0;overflow:auto;background:var(--panel)}.side{border-right:1px solid var(--line)}.machines{border-left:1px solid var(--line)}
-.side-head,.machine-head{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.file{width:100%;height:auto;text-align:left;border:0;border-bottom:1px solid #eef1f5;border-radius:0;padding:10px 14px;background:#fff}.file.active{background:#eef4ff}.badge{font-size:12px;color:var(--muted);margin-left:6px}.badge.hot{color:var(--ok)}.badge.restart{color:#b54708}
-.work{min-width:0;display:grid;grid-template-rows:auto 1fr;background:#fbfcfe}.toolbar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.toolbar .name{font-weight:650;margin-right:auto}.mode button.active{background:#eaf1ff;border-color:#9dbbff}
-textarea{width:100%;height:100%;resize:none;border:0;padding:14px 16px;background:#fbfcfe;color:var(--text);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}.form{height:100%;overflow:auto;padding:14px 16px}.row{display:grid;grid-template-columns:160px 1fr;gap:8px;margin-bottom:8px}.row input{height:30px;border:1px solid var(--line);border-radius:6px;padding:0 8px}.row .section{color:var(--muted);font-size:12px}
-.status{min-height:34px;padding:8px 14px;border-top:1px solid var(--line);background:var(--panel);color:var(--muted)}.machine{padding:10px 14px;border-bottom:1px solid #eef1f5}.machine .ok{color:var(--ok)}.machine .partial{color:#b54708}.machine .bad{color:var(--danger)}
-.history-main{min-height:0;display:grid;grid-template-columns:340px 1fr}.history-list{min-height:0;overflow:auto;border-right:1px solid var(--line);background:var(--panel)}.history-row{width:100%;height:auto;text-align:left;border:0;border-bottom:1px solid #eef1f5;border-radius:0;padding:10px 14px}.history-row.active{background:#eef4ff}.history-row small{display:block;color:var(--muted);margin-top:3px}.history-detail{min-width:0;display:grid;grid-template-rows:auto 1fr}.history-actions{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}.history-actions strong{margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-actions select{height:30px;max-width:120px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:0 6px}.history-content{margin:0;overflow:auto;padding:14px 16px;white-space:pre-wrap;word-break:break-word;background:#fbfcfe;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.history-row.current strong::after{content:" current";color:var(--ok);font-size:12px;font-weight:500}
-@media(max-width:900px){.shell{height:100dvh}.top{height:auto;min-height:52px;flex-wrap:wrap;padding:8px 12px}.token{order:2;width:100%;margin-left:0}.token input{min-width:0;flex:1;width:auto}.main{grid-template-columns:1fr;grid-template-rows:minmax(120px,28vh) 1fr}.side{display:block;border-right:0;border-bottom:1px solid var(--line)}.machines{display:none}.history-main{grid-template-columns:1fr;grid-template-rows:minmax(140px,34vh) 1fr}.history-list{display:block;border-right:0;border-bottom:1px solid var(--line)}.history-actions{flex-wrap:wrap}.history-actions strong{width:100%;margin-right:0}}
-</style>
-</head>
-<body>
-<div class="shell">
-  <div class="top"><div class="brand">asio_owen Config Center</div><div class="version" id="version">v-</div><div class="view-tabs"><button id="configView" class="active">Config</button><button id="historyView">History</button></div><div class="token"><input id="token" placeholder="Bearer token"><button id="logout">Logout</button><button id="load">Load</button><button class="primary" id="save">Save</button></div></div>
-  <div class="main" id="configMain">
-    <aside class="side"><div class="side-head"><strong>Files</strong><button id="add">+</button></div><div id="files"></div></aside>
-    <section class="work"><div class="toolbar"><div class="name" id="fileName">No file</div><div class="mode"><button id="sourceBtn" class="active">Source</button><button id="formBtn">Form</button></div><button class="danger" id="delete">Delete</button></div><textarea id="editor" spellcheck="false"></textarea><div class="form" id="form" hidden></div></section>
-    <aside class="machines"><div class="machine-head"><strong>Machines</strong><button id="refreshMachines">Refresh</button></div><div id="machines"></div></aside>
-  </div>
-  <div class="history-main" id="historyMain" hidden>
-    <aside class="history-list"><div class="side-head"><strong>Versions</strong><button id="moreHistory">More</button></div><div id="historyRows"></div></aside>
-    <section class="history-detail"><div class="history-actions"><strong id="historyTitle">Select a version</strong><select id="compareTo" aria-label="Compare target"></select><button id="compareHistory">Compare</button><button class="danger" id="rollbackHistory">Rollback</button></div><pre class="history-content" id="historyContent"></pre></section>
-  </div>
-  <div class="status" id="status">Idle</div>
-</div>
-<script>
-const api="/api/admin/config";
-const machinesApi=api+"/machines";
-const historyApi=api+"/history";
-let version=0,files=[],selected=0,mode="source",view="config";
-let historyRows=[],historyBefore=null,historySelected=null,historyDetail=null;
-const $=id=>document.getElementById(id);
-$("token").value=localStorage.getItem("adminToken")||"";
-function headers(){const t=$("token").value.trim();localStorage.setItem("adminToken",t);return t?{"Authorization":"Bearer "+t}:{}}
-function checkAuth(r){if(r.status===401){localStorage.removeItem("adminToken");location.href="/admin/login";return false}return true}
-function status(s,bad=false){$("status").textContent=s;$("status").style.color=bad?"var(--danger)":"var(--muted)"}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
-function syncEditor(){if(files[selected]&&mode==="source")files[selected].content=$("editor").value}
-function render(){files.sort((a,b)=>a.name.localeCompare(b.name));$("version").textContent="v"+version;$("files").innerHTML=files.map((f,i)=>`<button class="file ${i===selected?"active":""}" onclick="selectFile(${i})">${esc(f.name)}<span class="badge ${f.restart_required?"restart":"hot"}">${f.restart_required?"restart":"hot"}</span></button>`).join("");const f=files[selected];$("fileName").textContent=f?f.name:"No file";$("editor").hidden=mode!=="source";$("form").hidden=mode!=="form";$("editor").value=f?f.content:"";if(mode==="form")renderForm()}
-function selectFile(i){syncEditor();selected=i;render()}
-function parseIni(s){const rows=[];let section="";s.split(/\r?\n/).forEach(line=>{const m=line.match(/^\s*\[([^\]]+)\]\s*$/);if(m){section=m[1];return}const eq=line.indexOf("=");if(eq>0)rows.push({section,key:line.slice(0,eq).trim(),value:line.slice(eq+1).trim()})});return rows}
-function renderForm(){const f=files[selected];if(!f){$("form").innerHTML="";return}const rows=parseIni(f.content);$("form").innerHTML=rows.map((r,i)=>`<div class="row"><div><div class="section">[${esc(r.section)}]</div><input data-i="${i}" data-k="key" value="${esc(r.key)}"></div><input data-i="${i}" data-k="value" value="${esc(r.value)}"></div>`).join("")+`<button onclick="applyForm()">Apply Form</button>`;$("form").dataset.rows=JSON.stringify(rows)}
-function applyForm(){const rows=JSON.parse($("form").dataset.rows||"[]");$("form").querySelectorAll("input").forEach(input=>{rows[input.dataset.i][input.dataset.k]=input.value});let out="",sec="";rows.forEach(r=>{if(r.section!==sec){sec=r.section;out+=`[${sec}]\n`}out+=`${r.key} = ${r.value}\n`});files[selected].content=out;mode="source";setModeButtons();render()}
-function setModeButtons(){$("sourceBtn").classList.toggle("active",mode==="source");$("formBtn").classList.toggle("active",mode==="form")}
-function setView(next){view=next;$("configMain").hidden=next!=="config";$("historyMain").hidden=next!=="history";$("configView").classList.toggle("active",next==="config");$("historyView").classList.toggle("active",next==="history");$("save").hidden=next!=="config";if(next==="history"&&!historyRows.length)loadHistory(false).catch(e=>status(e.message,true))}
-async function request(url,options={}){options.headers={...headers(),...(options.headers||{})};const r=await fetch(url,options);if(!checkAuth(r))return null;const j=await r.json();if(!r.ok||j.code!==0)throw new Error(j.msg||r.statusText);return j.data}
-async function load(){status("Loading");const data=await request(api);if(!data)return;version=data.version;files=data.files||[];selected=0;render();status(data.degraded?"Loaded with verified mirror fallback":"Loaded")}
-async function save(){syncEditor();if(files.some(f=>/\[path_blacklist\][\s\S]*^\s*\/\s*=\s*$/m.test(f.content))&&!confirm("Save block-all path_blacklist rule?"))return;const reason=prompt("Change reason","");if(reason===null)return;status("Saving");const data=await request(api,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_version:version,reason,files:files.map(f=>({name:f.name,content:f.content}))})});if(!data)return;version=data.version;status("Saved v"+version);historyRows=[];await load()}
-async function loadMachines(){const data=await request(machinesApi);if(!data)return;$("machines").innerHTML=(data.machines||[]).map(m=>`<div class="machine"><strong>${esc(m.machine)}</strong><div class="${m.status==="ok"?"ok":m.status==="partial"?"partial":"bad"}">v${esc(m.version)} ${esc(m.status||"unknown")}</div><small>${esc(m.detail||"")}</small></div>`).join("")}
-function renderHistoryRows(){const seen=new Set();const options=historyRows.filter(row=>!seen.has(row.version)&&seen.add(row.version)).map(row=>`<option value="${row.version}" ${row.version===version?"selected":""}>v${row.version}</option>`).join("");$("compareTo").innerHTML=options;$("historyRows").innerHTML=historyRows.map(row=>{const when=row.ts?new Date(row.ts*1000).toLocaleString():"";return `<button class="history-row ${row.version===historySelected?"active":""} ${row.version===version?"current":""}" onclick="selectHistory(${row.version})"><strong>v${row.version}</strong> ${esc(row.action||"")}<small>${esc(row.user||"")} - ${esc(when)} - ${esc(row.reason||"")} - ${row.file_count||0} files - ${row.total_bytes||0} B</small></button>`}).join("")}
-async function loadHistory(append){status("Loading history");const query=new URLSearchParams({limit:"20"});if(append&&historyBefore)query.set("before",historyBefore);const data=await request(historyApi+"?"+query);if(!data)return;version=data.current_version;if(!append)historyRows=[];historyRows.push(...(data.versions||[]));historyBefore=data.next_before;renderHistoryRows();status("History loaded")}
-async function selectHistory(v){historySelected=v;renderHistoryRows();const data=await request(historyApi+"/"+v);if(!data)return;historyDetail=data;$("historyTitle").textContent=`v${v} - ${data.meta.action||""} - ${data.meta.reason||""}`;$("historyContent").textContent=(data.files||[]).map(f=>`# ${f.name}\n${f.content}`).join("\n\n")}
-function renderDiff(data){$("historyTitle").textContent=`v${data.from} -> v${data.to}`;$("historyContent").textContent=(data.changes||[]).map(c=>`${c.type.toUpperCase()} ${c.name}${c.sensitive?" [SENSITIVE]":""}\n${c.diff||c.content||""}`).join("\n\n")||"No changes"}
-async function compareHistory(){if(!historySelected)return;const target=$("compareTo").value||version;const data=await request(historyApi+"/"+historySelected+"/diff?to="+encodeURIComponent(target));if(data)renderDiff(data)}
-async function rollbackHistory(){if(!historySelected)return;const diff=await request(historyApi+"/"+historySelected+"/diff?to="+version);if(!diff)return;renderDiff(diff);const sensitive=(diff.changes||[]).some(c=>c.sensitive);if(sensitive&&!confirm("This rollback may reactivate historical credentials. Continue?"))return;if(!confirm(`Review the displayed diff, then create a new version from v${historySelected}?`))return;const reason=prompt("Rollback reason","");if(!reason)return;status("Rolling back");const data=await request(api+"/rollback",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_version:version,target_version:historySelected,reason})});if(!data)return;version=data.version;historyRows=[];historyDetail=null;status(`Rolled back as v${version}${data.restart_required?"; restart required":""}`);await loadHistory(false)}
-$("logout").onclick=()=>{localStorage.removeItem("adminToken");location.href="/admin/login"};
-$("load").onclick=()=>load().then(loadMachines).catch(e=>status(e.message,true));
-$("save").onclick=()=>save().catch(e=>status(e.message,true));
-$("refreshMachines").onclick=()=>loadMachines().catch(e=>status(e.message,true));
-$("configView").onclick=()=>setView("config");$("historyView").onclick=()=>setView("history");
-$("moreHistory").onclick=()=>loadHistory(true).catch(e=>status(e.message,true));
-$("compareHistory").onclick=()=>compareHistory().catch(e=>status(e.message,true));
-$("rollbackHistory").onclick=()=>rollbackHistory().catch(e=>status(e.message,true));
-$("add").onclick=()=>{syncEditor();files.push({name:"20-new.ini",content:"[upstream]\nservice = 127.0.0.1:30001\n",restart_required:false});selected=files.length-1;render()};
-$("delete").onclick=()=>{if(!files[selected])return;files.splice(selected,1);selected=Math.max(0,selected-1);render()};
-$("sourceBtn").onclick=()=>{syncEditor();mode="source";setModeButtons();render()};
-$("formBtn").onclick=()=>{syncEditor();mode="form";setModeButtons();render()};
-setInterval(()=>loadMachines().catch(()=>{}),5000);
-if(!$("token").value.trim())location.href="/admin/login";else load().then(loadMachines).catch(e=>status(e.message,true));
-</script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>asio_owen Config Settings</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fb;
+        --panel: #fff;
+        --line: #d8dee8;
+        --text: #18202f;
+        --muted: #687386;
+        --accent: #1463ff;
+        --danger: #b42318;
+        --ok: #067647;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.45 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+      .shell {
+        height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+      }
+      .top {
+        height: 52px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .brand {
+        font-weight: 700;
+      }
+      .version {
+        color: var(--muted);
+      }
+      .token {
+        margin-left: auto;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .token input {
+        width: min(42vw, 420px);
+        height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 9px;
+      }
+      button {
+        height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        padding: 0 10px;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button.danger {
+        border-color: #f2b8b5;
+        color: var(--danger);
+      }
+      .view-tabs {
+        display: flex;
+        gap: 2px;
+      }
+      .view-tabs button.active {
+        background: #eaf1ff;
+        border-color: #9dbbff;
+      }
+      .main {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 280px 1fr 300px;
+      }
+      .side,
+      .machines {
+        min-height: 0;
+        overflow: auto;
+        background: var(--panel);
+      }
+      .side {
+        border-right: 1px solid var(--line);
+      }
+      .machines {
+        border-left: 1px solid var(--line);
+      }
+      .side-head,
+      .machine-head {
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .file {
+        width: 100%;
+        height: auto;
+        text-align: left;
+        border: 0;
+        border-bottom: 1px solid #eef1f5;
+        border-radius: 0;
+        padding: 10px 14px;
+        background: #fff;
+      }
+      .file.active {
+        background: #eef4ff;
+      }
+      .badge {
+        font-size: 12px;
+        color: var(--muted);
+        margin-left: 6px;
+      }
+      .badge.hot {
+        color: var(--ok);
+      }
+      .badge.restart {
+        color: #b54708;
+      }
+      .work {
+        min-width: 0;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        background: #fbfcfe;
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .toolbar .name {
+        font-weight: 650;
+        margin-right: auto;
+      }
+      .mode button.active {
+        background: #eaf1ff;
+        border-color: #9dbbff;
+      }
+      textarea {
+        width: 100%;
+        height: 100%;
+        resize: none;
+        border: 0;
+        padding: 14px 16px;
+        background: #fbfcfe;
+        color: var(--text);
+        font:
+          13px/1.5 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+        outline: none;
+      }
+      .form {
+        height: 100%;
+        overflow: auto;
+        padding: 14px 16px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .row input {
+        height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 8px;
+      }
+      .row .section {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .status {
+        min-height: 34px;
+        padding: 8px 14px;
+        border-top: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--muted);
+      }
+      .machine {
+        padding: 10px 14px;
+        border-bottom: 1px solid #eef1f5;
+      }
+      .machine .ok {
+        color: var(--ok);
+      }
+      .machine .partial {
+        color: #b54708;
+      }
+      .machine .bad {
+        color: var(--danger);
+      }
+      .history-main {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 340px 1fr;
+      }
+      .history-list {
+        min-height: 0;
+        overflow: auto;
+        border-right: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .history-row {
+        width: 100%;
+        height: auto;
+        text-align: left;
+        border: 0;
+        border-bottom: 1px solid #eef1f5;
+        border-radius: 0;
+        padding: 10px 14px;
+      }
+      .history-row.active {
+        background: #eef4ff;
+      }
+      .history-row small {
+        display: block;
+        color: var(--muted);
+        margin-top: 3px;
+      }
+      .history-detail {
+        min-width: 0;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+      .history-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .history-actions strong {
+        margin-right: auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .history-actions select {
+        height: 30px;
+        max-width: 120px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        padding: 0 6px;
+      }
+      .history-content {
+        margin: 0;
+        overflow: auto;
+        padding: 14px 16px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #fbfcfe;
+        font:
+          13px/1.5 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+      }
+      .history-row.current strong::after {
+        content: " current";
+        color: var(--ok);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      @media (max-width: 900px) {
+        .shell {
+          height: 100dvh;
+        }
+        .top {
+          height: auto;
+          min-height: 52px;
+          flex-wrap: wrap;
+          padding: 8px 12px;
+        }
+        .token {
+          order: 2;
+          width: 100%;
+          margin-left: 0;
+        }
+        .token input {
+          min-width: 0;
+          flex: 1;
+          width: auto;
+        }
+        .main {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(120px, 28vh) 1fr;
+        }
+        .side {
+          display: block;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+        .machines {
+          display: none;
+        }
+        .history-main {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(140px, 34vh) 1fr;
+        }
+        .history-list {
+          display: block;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+        .history-actions {
+          flex-wrap: wrap;
+        }
+        .history-actions strong {
+          width: 100%;
+          margin-right: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="top">
+        <div class="brand">asio_owen Config Center</div>
+        <div class="version" id="version">v-</div>
+        <div class="view-tabs">
+          <button id="configView" class="active">Config</button
+          ><button id="historyView">History</button>
+        </div>
+        <div class="token">
+          <input id="token" placeholder="Bearer token" /><button id="logout">
+            Logout</button
+          ><button id="load">Load</button
+          ><button class="primary" id="save">Save</button>
+        </div>
+      </div>
+      <div class="main" id="configMain">
+        <aside class="side">
+          <div class="side-head">
+            <strong>Files</strong><button id="add">+</button>
+          </div>
+          <div id="files"></div>
+        </aside>
+        <section class="work">
+          <div class="toolbar">
+            <div class="name" id="fileName">No file</div>
+            <div class="mode">
+              <button id="sourceBtn" class="active">Source</button
+              ><button id="formBtn">Form</button>
+            </div>
+            <button class="danger" id="delete">Delete</button>
+          </div>
+          <textarea id="editor" spellcheck="false"></textarea>
+          <div class="form" id="form" hidden></div>
+        </section>
+        <aside class="machines">
+          <div class="machine-head">
+            <strong>Machines</strong
+            ><button id="refreshMachines">Refresh</button>
+          </div>
+          <div id="machines"></div>
+        </aside>
+      </div>
+      <div class="history-main" id="historyMain" hidden>
+        <aside class="history-list">
+          <div class="side-head">
+            <strong>Versions</strong><button id="moreHistory">More</button>
+          </div>
+          <div id="historyRows"></div>
+        </aside>
+        <section class="history-detail">
+          <div class="history-actions">
+            <strong id="historyTitle">Select a version</strong
+            ><select id="compareTo" aria-label="Compare target"></select
+            ><button id="compareHistory">Compare</button
+            ><button class="danger" id="rollbackHistory">Rollback</button>
+          </div>
+          <pre class="history-content" id="historyContent"></pre>
+        </section>
+      </div>
+      <div class="status" id="status">Idle</div>
+    </div>
+    <script>
+      const api = "/api/admin/config";
+      const machinesApi = api + "/machines";
+      const historyApi = api + "/history";
+      let version = 0,
+        files = [],
+        loadedFileNames = [],
+        selected = 0,
+        mode = "source",
+        view = "config";
+      let historyRows = [],
+        historyBefore = null,
+        historySelected = null,
+        historyDetail = null;
+      const $ = (id) => document.getElementById(id);
+      $("token").value = localStorage.getItem("adminToken") || "";
+      function headers() {
+        const t = $("token").value.trim();
+        localStorage.setItem("adminToken", t);
+        return t ? { Authorization: "Bearer " + t } : {};
+      }
+      function checkAuth(r) {
+        if (r.status === 401) {
+          localStorage.removeItem("adminToken");
+          location.href = "/admin/login";
+          return false;
+        }
+        return true;
+      }
+      function status(s, bad = false) {
+        $("status").textContent = s;
+        $("status").style.color = bad ? "var(--danger)" : "var(--muted)";
+      }
+      function esc(s) {
+        return String(s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      }
+      function syncEditor() {
+        if (files[selected] && mode === "source")
+          files[selected].content = $("editor").value;
+      }
+      function render() {
+        files.sort((a, b) => a.name.localeCompare(b.name));
+        $("version").textContent = "v" + version;
+        $("files").innerHTML = files
+          .map(
+            (f, i) =>
+              `<button class="file ${i === selected ? "active" : ""}" onclick="selectFile(${i})">${esc(f.name)}<span class="badge ${f.restart_required ? "restart" : "hot"}">${f.restart_required ? "restart" : "hot"}</span></button>`,
+          )
+          .join("");
+        const f = files[selected];
+        $("fileName").textContent = f ? f.name : "No file";
+        $("editor").hidden = mode !== "source";
+        $("form").hidden = mode !== "form";
+        $("editor").value = f ? f.content : "";
+        if (mode === "form") renderForm();
+      }
+      function selectFile(i) {
+        syncEditor();
+        selected = i;
+        render();
+      }
+      function parseIni(s) {
+        const rows = [];
+        let section = "";
+        s.split(/\r?\n/).forEach((line) => {
+          const m = line.match(/^\s*\[([^\]]+)\]\s*$/);
+          if (m) {
+            section = m[1];
+            return;
+          }
+          const eq = line.indexOf("=");
+          if (eq > 0)
+            rows.push({
+              section,
+              key: line.slice(0, eq).trim(),
+              value: line.slice(eq + 1).trim(),
+            });
+        });
+        return rows;
+      }
+      function renderForm() {
+        const f = files[selected];
+        if (!f) {
+          $("form").innerHTML = "";
+          return;
+        }
+        const rows = parseIni(f.content);
+        $("form").innerHTML =
+          rows
+            .map(
+              (r, i) =>
+                `<div class="row"><div><div class="section">[${esc(r.section)}]</div><input data-i="${i}" data-k="key" value="${esc(r.key)}"></div><input data-i="${i}" data-k="value" value="${esc(r.value)}"></div>`,
+            )
+            .join("") + `<button onclick="applyForm()">Apply Form</button>`;
+        $("form").dataset.rows = JSON.stringify(rows);
+      }
+      function applyForm() {
+        const rows = JSON.parse($("form").dataset.rows || "[]");
+        $("form")
+          .querySelectorAll("input")
+          .forEach((input) => {
+            rows[input.dataset.i][input.dataset.k] = input.value;
+          });
+        let out = "",
+          sec = "";
+        rows.forEach((r) => {
+          if (r.section !== sec) {
+            sec = r.section;
+            out += `[${sec}]\n`;
+          }
+          out += `${r.key} = ${r.value}\n`;
+        });
+        files[selected].content = out;
+        mode = "source";
+        setModeButtons();
+        render();
+      }
+      function setModeButtons() {
+        $("sourceBtn").classList.toggle("active", mode === "source");
+        $("formBtn").classList.toggle("active", mode === "form");
+      }
+      function setView(next) {
+        view = next;
+        $("configMain").hidden = next !== "config";
+        $("historyMain").hidden = next !== "history";
+        $("configView").classList.toggle("active", next === "config");
+        $("historyView").classList.toggle("active", next === "history");
+        $("save").hidden = next !== "config";
+        if (next === "history" && !historyRows.length)
+          loadHistory(false).catch((e) => status(e.message, true));
+      }
+      async function request(url, options = {}) {
+        options.headers = { ...headers(), ...(options.headers || {}) };
+        const r = await fetch(url, options);
+        if (!checkAuth(r)) return null;
+        const j = await r.json();
+        if (!r.ok || j.code !== 0) throw new Error(j.msg || r.statusText);
+        return j.data;
+      }
+      async function load() {
+        status("Loading");
+        const data = await request(api);
+        if (!data) return;
+        version = data.version;
+        files = data.files || [];
+        loadedFileNames = files.map((f) => f.name);
+        selected = 0;
+        render();
+        status(
+          data.degraded ? "Loaded with verified mirror fallback" : "Loaded",
+        );
+      }
+      async function save() {
+        syncEditor();
+        if (
+          files.some((f) =>
+            /\[path_blacklist\][\s\S]*^\s*\/\s*=\s*$/m.test(f.content),
+          ) &&
+          !confirm("Save block-all path_blacklist rule?")
+        )
+          return;
+        const reason = (prompt("Change reason", "") || "").trim();
+        if (!reason) return;
+        const currentNames = new Set(files.map((f) => f.name));
+        const deleted = loadedFileNames.filter(
+          (name) => !currentNames.has(name),
+        );
+        const confirmation = deleted.length
+          ? `Publish these configuration changes?\n\nThis will delete ${deleted.length} file(s) from the saved configuration:\n${deleted.map((name) => "- " + name).join("\n")}`
+          : "Save these configuration changes as a new version?";
+        if (!confirm(confirmation)) return;
+        status("Saving");
+        const data = await request(api, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_version: version,
+            reason,
+            files: files.map((f) => ({ name: f.name, content: f.content })),
+          }),
+        });
+        if (!data) return;
+        version = data.version;
+        status("Saved v" + version);
+        historyRows = [];
+        await load();
+      }
+      async function loadMachines() {
+        const data = await request(machinesApi);
+        if (!data) return;
+        $("machines").innerHTML = (data.machines || [])
+          .map(
+            (m) =>
+              `<div class="machine"><strong>${esc(m.machine)}</strong><div class="${m.status === "ok" ? "ok" : m.status === "partial" ? "partial" : "bad"}">v${esc(m.version)} ${esc(m.status || "unknown")}</div><small>${esc(m.detail || "")}</small></div>`,
+          )
+          .join("");
+      }
+      function renderHistoryRows() {
+        const seen = new Set();
+        const options = historyRows
+          .filter((row) => !seen.has(row.version) && seen.add(row.version))
+          .map(
+            (row) =>
+              `<option value="${row.version}" ${row.version === version ? "selected" : ""}>v${row.version}</option>`,
+          )
+          .join("");
+        $("compareTo").innerHTML = options;
+        $("historyRows").innerHTML = historyRows
+          .map((row) => {
+            const when = row.ts ? new Date(row.ts * 1000).toLocaleString() : "";
+            return `<button class="history-row ${row.version === historySelected ? "active" : ""} ${row.version === version ? "current" : ""}" onclick="selectHistory(${row.version})"><strong>v${row.version}</strong> ${esc(row.action || "")}<small>${esc(row.user || "")} - ${esc(when)} - ${esc(row.reason || "")} - ${row.file_count || 0} files - ${row.total_bytes || 0} B</small></button>`;
+          })
+          .join("");
+      }
+      async function loadHistory(append) {
+        status("Loading history");
+        const query = new URLSearchParams({ limit: "20" });
+        if (append && historyBefore) query.set("before", historyBefore);
+        const data = await request(historyApi + "?" + query);
+        if (!data) return;
+        version = data.current_version;
+        if (!append) historyRows = [];
+        historyRows.push(...(data.versions || []));
+        historyBefore = data.next_before;
+        renderHistoryRows();
+        status("History loaded");
+      }
+      async function selectHistory(v) {
+        historySelected = v;
+        renderHistoryRows();
+        const data = await request(historyApi + "/" + v);
+        if (!data) return;
+        historyDetail = data;
+        $("historyTitle").textContent =
+          `v${v} - ${data.meta.action || ""} - ${data.meta.reason || ""}`;
+        $("historyContent").textContent = (data.files || [])
+          .map((f) => `# ${f.name}\n${f.content}`)
+          .join("\n\n");
+      }
+      function renderDiff(data) {
+        $("historyTitle").textContent = `v${data.from} -> v${data.to}`;
+        $("historyContent").textContent =
+          (data.changes || [])
+            .map(
+              (c) =>
+                `${c.type.toUpperCase()} ${c.name}${c.sensitive ? " [SENSITIVE]" : ""}\n${c.diff || c.content || ""}`,
+            )
+            .join("\n\n") || "No changes";
+      }
+      async function compareHistory() {
+        if (!historySelected) return;
+        const target = $("compareTo").value || version;
+        const data = await request(
+          historyApi +
+            "/" +
+            historySelected +
+            "/diff?to=" +
+            encodeURIComponent(target),
+        );
+        if (data) renderDiff(data);
+      }
+      async function rollbackHistory() {
+        if (!historySelected) return;
+        const diff = await request(
+          historyApi + "/" + historySelected + "/diff?to=" + version,
+        );
+        if (!diff) return;
+        renderDiff(diff);
+        const sensitive = (diff.changes || []).some((c) => c.sensitive);
+        if (
+          sensitive &&
+          !confirm(
+            "This rollback may reactivate historical credentials. Continue?",
+          )
+        )
+          return;
+        if (
+          !confirm(
+            `Review the displayed diff, then create a new version from v${historySelected}?`,
+          )
+        )
+          return;
+        const reason = prompt("Rollback reason", "");
+        if (!reason) return;
+        status("Rolling back");
+        const data = await request(api + "/rollback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_version: version,
+            target_version: historySelected,
+            reason,
+          }),
+        });
+        if (!data) return;
+        version = data.version;
+        historyRows = [];
+        historyDetail = null;
+        status(
+          `Rolled back as v${version}${data.restart_required ? "; restart required" : ""}`,
+        );
+        await loadHistory(false);
+      }
+      $("logout").onclick = () => {
+        localStorage.removeItem("adminToken");
+        location.href = "/admin/login";
+      };
+      $("load").onclick = () =>
+        load()
+          .then(loadMachines)
+          .catch((e) => status(e.message, true));
+      $("save").onclick = () => save().catch((e) => status(e.message, true));
+      $("refreshMachines").onclick = () =>
+        loadMachines().catch((e) => status(e.message, true));
+      $("configView").onclick = () => setView("config");
+      $("historyView").onclick = () => setView("history");
+      $("moreHistory").onclick = () =>
+        loadHistory(true).catch((e) => status(e.message, true));
+      $("compareHistory").onclick = () =>
+        compareHistory().catch((e) => status(e.message, true));
+      $("rollbackHistory").onclick = () =>
+        rollbackHistory().catch((e) => status(e.message, true));
+      $("add").onclick = () => {
+        syncEditor();
+        files.push({
+          name: "20-new.ini",
+          content: "[upstream]\nservice = 127.0.0.1:30001\n",
+          restart_required: false,
+        });
+        selected = files.length - 1;
+        render();
+      };
+      $("delete").onclick = () => {
+        const file = files[selected];
+        if (!file || !confirm(`Delete ${file.name} from the pending changes?`))
+          return;
+        files.splice(selected, 1);
+        selected = Math.max(0, selected - 1);
+        render();
+      };
+      $("sourceBtn").onclick = () => {
+        syncEditor();
+        mode = "source";
+        setModeButtons();
+        render();
+      };
+      $("formBtn").onclick = () => {
+        syncEditor();
+        mode = "form";
+        setModeButtons();
+        render();
+      };
+      setInterval(() => loadMachines().catch(() => {}), 5000);
+      if (!$("token").value.trim()) location.href = "/admin/login";
+      else
+        load()
+          .then(loadMachines)
+          .catch((e) => status(e.message, true));
+    </script>
+  </body>
 </html>

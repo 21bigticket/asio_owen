@@ -23,6 +23,7 @@ TEST(HttpProtocol, ParsesHeaderFieldsWithoutMutatingInput) {
     EXPECT_TRUE(state.connection_keep_alive);
     EXPECT_TRUE(state.has_transfer_encoding);
     EXPECT_TRUE(state.is_chunked);
+    EXPECT_TRUE(state.invalid_transfer_encoding);
     EXPECT_EQ(headers.find("Content-Length"), 0u);
 }
 
@@ -86,6 +87,7 @@ TEST(HttpProtocol, UpdateHeaderStateTransferEncodingChunked) {
     update_header_state("Transfer-Encoding", "chunked", state);
     EXPECT_TRUE(state.has_transfer_encoding);
     EXPECT_TRUE(state.is_chunked);
+    EXPECT_FALSE(state.invalid_transfer_encoding);
 }
 
 TEST(HttpProtocol, UpdateHeaderStateTransferEncodingGzipOnly) {
@@ -93,6 +95,16 @@ TEST(HttpProtocol, UpdateHeaderStateTransferEncodingGzipOnly) {
     update_header_state("Transfer-Encoding", "gzip", state);
     EXPECT_TRUE(state.has_transfer_encoding);
     EXPECT_FALSE(state.is_chunked);
+    EXPECT_TRUE(state.invalid_transfer_encoding);
+}
+
+TEST(HttpProtocol, UpdateHeaderStateRejectsMultipleTransferEncodingFields) {
+    HeaderParseState state;
+    update_header_state("Transfer-Encoding", "chunked", state);
+    update_header_state("Transfer-Encoding", "chunked", state);
+    EXPECT_TRUE(state.has_transfer_encoding);
+    EXPECT_TRUE(state.is_chunked);
+    EXPECT_TRUE(state.invalid_transfer_encoding);
 }
 
 TEST(HttpProtocol, UpdateHeaderStateTransferEncodingGzipChunked) {
@@ -100,13 +112,15 @@ TEST(HttpProtocol, UpdateHeaderStateTransferEncodingGzipChunked) {
     update_header_state("Transfer-Encoding", "gzip, chunked", state);
     EXPECT_TRUE(state.has_transfer_encoding);
     EXPECT_TRUE(state.is_chunked);
+    EXPECT_TRUE(state.invalid_transfer_encoding);
 }
 
-TEST(HttpProtocol, UpdateHeaderStateTransferEncodingChunkedGzipIsNotChunked) {
+TEST(HttpProtocol, UpdateHeaderStateTransferEncodingChunkedGzipIsInvalid) {
     HeaderParseState state;
     update_header_state("Transfer-Encoding", "chunked, gzip", state);
     EXPECT_TRUE(state.has_transfer_encoding);
-    EXPECT_FALSE(state.is_chunked);
+    EXPECT_TRUE(state.is_chunked);
+    EXPECT_TRUE(state.invalid_transfer_encoding);
 }
 
 TEST(HttpProtocol, UpdateHeaderStateDuplicateContentLength) {

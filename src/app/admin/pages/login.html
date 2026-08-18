@@ -1,38 +1,161 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>asio_owen Admin Login</title>
-<style>
-:root{color-scheme:light;--bg:#f7f8fb;--panel:#fff;--line:#d8dee8;--text:#18202f;--muted:#687386;--accent:#1463ff;--danger:#b42318}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;padding:24px}
-.login{width:min(100%,360px);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:22px;box-shadow:0 10px 30px rgba(15,23,42,.06)}
-h1{font-size:20px;line-height:1.2;margin:0 0 18px}.field{display:grid;gap:6px;margin-bottom:12px}label{font-size:12px;color:var(--muted)}input{height:36px;border:1px solid var(--line);border-radius:6px;padding:0 10px;font:inherit}
-button{width:100%;height:36px;border:1px solid var(--accent);border-radius:6px;background:var(--accent);color:#fff;font:inherit;cursor:pointer}.debug{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}.debug button{background:#fff;color:var(--text);border-color:var(--line)}
-.status{min-height:20px;margin-top:12px;color:var(--muted)}.status.bad{color:var(--danger)}
-</style>
-</head>
-<body>
-<main class="login">
-  <h1>asio_owen Config Center</h1>
-  <form id="loginForm">
-    <div class="field"><label for="username">Username</label><input id="username" autocomplete="username" required></div>
-    <div class="field"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required></div>
-    <button type="submit">Log In</button>
-  </form>
-  <div class="debug">
-    <div class="field"><label for="token">Bearer token</label><input id="token" autocomplete="off"></div>
-    <button id="useToken" type="button">Use Token</button>
-  </div>
-  <div class="status" id="status"></div>
-</main>
-<script>
-const $=id=>document.getElementById(id);$("token").value=localStorage.getItem("adminToken")||"";
-function status(s,bad=false){$("status").textContent=s;$("status").classList.toggle("bad",bad)}
-$("loginForm").onsubmit=async e=>{e.preventDefault();status("Signing in");try{const r=await fetch("/api/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("username").value,password:$("password").value})});const j=await r.json();if(!r.ok||j.code!==0)throw new Error(j.msg||r.statusText);localStorage.setItem("adminToken",j.data.token);location.href="/admin/settings"}catch(err){status(err.message,true)}};
-$("useToken").onclick=()=>{const t=$("token").value.trim();if(!t){status("Token required",true);return}localStorage.setItem("adminToken",t);location.href="/admin/settings"};
-if(localStorage.getItem("adminToken"))status("Existing token found");
-</script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>asio_owen Admin Login</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fb;
+        --panel: #fff;
+        --line: #d8dee8;
+        --text: #18202f;
+        --muted: #687386;
+        --accent: #1463ff;
+        --danger: #b42318;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.45 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      .login {
+        width: min(100%, 360px);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 22px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+      }
+      h1 {
+        font-size: 20px;
+        line-height: 1.2;
+        margin: 0 0 18px;
+      }
+      .field {
+        display: grid;
+        gap: 6px;
+        margin-bottom: 12px;
+      }
+      label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      input {
+        height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 10px;
+        font: inherit;
+      }
+      button {
+        width: 100%;
+        height: 36px;
+        border: 1px solid var(--accent);
+        border-radius: 6px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      .debug {
+        margin-top: 14px;
+        border-top: 1px solid var(--line);
+        padding-top: 14px;
+      }
+      .debug button {
+        background: #fff;
+        color: var(--text);
+        border-color: var(--line);
+      }
+      .status {
+        min-height: 20px;
+        margin-top: 12px;
+        color: var(--muted);
+      }
+      .status.bad {
+        color: var(--danger);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="login">
+      <h1>asio_owen Config Center</h1>
+      <form id="loginForm">
+        <div class="field">
+          <label for="username">Username</label
+          ><input id="username" autocomplete="username" required />
+        </div>
+        <div class="field">
+          <label for="password">Password</label
+          ><input
+            id="password"
+            type="password"
+            autocomplete="current-password"
+            required
+          />
+        </div>
+        <button type="submit">Log In</button>
+      </form>
+      <div class="debug">
+        <div class="field">
+          <label for="token">Bearer token</label
+          ><input id="token" autocomplete="off" />
+        </div>
+        <button id="useToken" type="button">Use Token</button>
+      </div>
+      <div class="status" id="status"></div>
+    </main>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      $("token").value = localStorage.getItem("adminToken") || "";
+      function status(s, bad = false) {
+        $("status").textContent = s;
+        $("status").classList.toggle("bad", bad);
+      }
+      $("loginForm").onsubmit = async (e) => {
+        e.preventDefault();
+        status("Signing in");
+        try {
+          const r = await fetch("/api/admin/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username: $("username").value,
+              password: $("password").value,
+            }),
+          });
+          const j = await r.json();
+          if (!r.ok || j.code !== 0) throw new Error(j.msg || r.statusText);
+          localStorage.setItem("adminToken", j.data.token);
+          location.href = "/admin/settings";
+        } catch (err) {
+          status(err.message, true);
+        }
+      };
+      $("useToken").onclick = () => {
+        const t = $("token").value.trim();
+        if (!t) {
+          status("Token required", true);
+          return;
+        }
+        localStorage.setItem("adminToken", t);
+        location.href = "/admin/settings";
+      };
+      if (localStorage.getItem("adminToken")) status("Existing token found");
+    </script>
+  </body>
 </html>

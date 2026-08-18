@@ -19,6 +19,7 @@ struct HeaderParseState {
     bool invalid_content_length = false;
     bool is_chunked = false;
     bool has_transfer_encoding = false;
+    bool invalid_transfer_encoding = false;
     bool connection_close = false;
     bool connection_keep_alive = false;
 };
@@ -26,11 +27,6 @@ struct HeaderParseState {
 struct HeaderTokens {
     bool close = false;
     bool keep_alive = false;
-};
-
-struct HeaderListTokens {
-    bool has_token = false;
-    bool last_is_token = false;
 };
 
 inline std::string_view trim_view(std::string_view s) {
@@ -117,24 +113,6 @@ inline HeaderTokens split_connection_tokens(std::string_view value, std::vector<
     return tokens;
 }
 
-inline HeaderListTokens parse_header_list_token(std::string_view value, std::string_view expected) {
-    HeaderListTokens result;
-    size_t start = 0;
-    while (start <= value.size()) {
-        auto comma = value.find(',', start);
-        auto end = comma == std::string_view::npos ? value.size() : comma;
-        auto token = trim_view(value.substr(start, end - start));
-        if (!token.empty()) {
-            bool matched = header_iequals(token, expected);
-            result.has_token = result.has_token || matched;
-            result.last_is_token = matched;
-        }
-        if (comma == std::string_view::npos) break;
-        start = comma + 1;
-    }
-    return result;
-}
-
 inline void update_header_state(std::string_view k, std::string_view v, HeaderParseState& state) {
     k = trim_view(k);
     v = trim_view(v);
@@ -148,10 +126,32 @@ inline void update_header_state(std::string_view k, std::string_view v, HeaderPa
             state.content_length = *parsed;
         }
     } else if (header_iequals(k, "transfer-encoding")) {
+        if (state.has_transfer_encoding) {
+            state.invalid_transfer_encoding = true;
+        }
         state.has_transfer_encoding = true;
-        auto te = parse_header_list_token(v, "chunked");
-        if (te.last_is_token) {
-            state.is_chunked = true;
+        bool saw_token = false;
+        size_t start = 0;
+        while (start <= v.size()) {
+            auto comma = v.find(',', start);
+            auto end = comma == std::string_view::npos ? v.size() : comma;
+            auto token = trim_view(v.substr(start, end - start));
+            if (token.empty()) {
+                state.invalid_transfer_encoding = true;
+            } else {
+                saw_token = true;
+                if (!header_iequals(token, "chunked") || state.is_chunked) {
+                    state.invalid_transfer_encoding = true;
+                }
+                if (header_iequals(token, "chunked")) {
+                    state.is_chunked = true;
+                }
+            }
+            if (comma == std::string_view::npos) break;
+            start = comma + 1;
+        }
+        if (!saw_token) {
+            state.invalid_transfer_encoding = true;
         }
     } else if (header_iequals(k, "connection")) {
         auto tokens = split_connection_tokens(v);

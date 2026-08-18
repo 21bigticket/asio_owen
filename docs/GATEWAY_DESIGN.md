@@ -1,6 +1,6 @@
 # HTTP 网关设计（当前实现）
 
-> 当前状态更新于 2026-08-15。早期连接复用、probe、压测和故障排查记录保留在
+> 当前状态更新于 2026-08-18。早期连接复用、probe、压测和故障排查记录保留在
 > `docs/CONN_REUSE_PROBE_2026-07-10.md`、`docs/HTTP_POOL_PROBE_REMOVAL_2026-07-11.md`、
 > `docs/HTTP_LAYER_REVIEW_2026-07-11.md`、`docs/PERF_REPORT.md` 等文档中。
 > 本文是当前实现的总设计入口。
@@ -48,7 +48,7 @@ HttpServer
 3. 更新 `HeaderParseState`：
    - 非法 `Content-Length` 返回 400。
    - 冲突重复 `Content-Length` 返回 400。
-   - `Transfer-Encoding` 存在但不是 chunked 返回 400。
+   - `Transfer-Encoding` 只接受唯一的 `chunked` 编码；复合、重复或空编码返回 400。
    - chunked 请求会先 de-chunk，再向上游写入新的 `Content-Length`。
 4. 先完整消费请求 body，再执行安全规则、本地路由或代理路由。
 5. 对代理响应按上游 framing 读取完整 body，再构造下游响应。
@@ -108,10 +108,11 @@ HttpServer
 
 响应侧：
 
-1. `HEAD`、`1xx`、`204`、`304` 视为无 body。
-2. chunked 响应 de-chunk 后再发给客户端。
-3. Content-Length 响应精确读取 N 字节。
-4. 无长度 framing 时读到 EOF，且连接不复用。
+1. 最多消费 8 个上游临时 `1xx` 响应并继续读取最终响应；`101` 协议升级不支持。
+2. `HEAD`、`204`、`304` 视为无 body。
+3. chunked 响应 de-chunk 后再发给客户端。
+4. Content-Length 响应精确读取 N 字节。
+5. 无长度 framing 时读到 EOF，且连接不复用。
 
 上游响应非法状态行、非法 framing、超时、body 超限、header 超限、body 不完整都会标记上游连接为 bad。
 

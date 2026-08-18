@@ -138,84 +138,112 @@ inline asio::awaitable<ProxyResponse> read_proxy_response(
     ProxyResponse resp;
 
     std::string buf = std::move(conn.read_buffer);
+    HeaderParseState header_state;
+    std::string body_rest;
+    size_t informational_count = 0;
+    while (true) {
+        resp = ProxyResponse{};
+        while (buf.find("\r\n\r\n") == std::string::npos) {
+            if (buf.size() > kMaxHeaderSize) {
+                resp.error = "upstream_response_header_too_large";
+                conn.connection_close = true;
+                co_return resp;
+            }
+            char tmp[kHttpIoBufferSize];
+            auto read = co_await read_with_timeout(conn.socket, tmp, sizeof(tmp),
+                std::chrono::milliseconds(pool_cfg.read_timeout_ms));
+            if (!read.ok()) {
+                LOG_INFO("Proxy response header read failed: status=", io_status_name(read.status),
+                    ", error=", read.ec.message());
+                resp.error = "upstream_response_header_read_failed";
+                conn.connection_close = true;
+                co_return resp;
+            }
+            buf.append(tmp, read.bytes);
+        }
 
-    while (buf.find("\r\n\r\n") == std::string::npos) {
-        if (buf.size() > kMaxHeaderSize) {
+        auto header_end = buf.find("\r\n\r\n");
+        if (header_end > kMaxHeaderSize) {
             resp.error = "upstream_response_header_too_large";
             conn.connection_close = true;
             co_return resp;
         }
-        char tmp[kHttpIoBufferSize];
-        auto read = co_await read_with_timeout(conn.socket, tmp, sizeof(tmp),
-            std::chrono::milliseconds(pool_cfg.read_timeout_ms));
-        if (!read.ok()) {
-            LOG_INFO("Proxy response header read failed: status=", io_status_name(read.status),
-                ", error=", read.ec.message());
-            resp.error = "upstream_response_header_read_failed";
+        std::string header_part = buf.substr(0, header_end);
+        body_rest = buf.substr(header_end + 4);
+
+        auto first_line_end = header_part.find("\r\n");
+        auto status_line = first_line_end == std::string::npos ?
+            header_part : header_part.substr(0, first_line_end);
+        auto sp1 = status_line.find(' ');
+        auto sp2 = status_line.find(' ', sp1 + 1);
+        if (sp1 == std::string::npos || sp2 == std::string::npos) {
+            LOG_INFO("Proxy response invalid status line: ", sanitize_body_preview(status_line));
+            resp.error = "upstream_response_invalid_status_line";
             conn.connection_close = true;
             co_return resp;
         }
-        buf.append(tmp, read.bytes);
-    }
+        auto status_code = parse_decimal_size(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
+        if (!status_code || *status_code > 999) {
+            LOG_INFO("Proxy response invalid status code: status_line=",
+                sanitize_body_preview(status_line));
+            resp.error = "upstream_response_invalid_status_code";
+            conn.connection_close = true;
+            co_return resp;
+        }
+        resp.status_code = static_cast<int>(*status_code);
+        resp.status_text = status_line.substr(sp2 + 1);
 
-    auto header_end = buf.find("\r\n\r\n");
-    std::string header_part = buf.substr(0, header_end);
-    std::string body_rest = buf.substr(header_end + 4);
+        int upstream_minor_version = status_line.rfind("HTTP/1.0", 0) == 0 ? 0 : 1;
+        header_state = HeaderParseState{};
+        auto hdr = first_line_end == std::string::npos ?
+            std::string{} : header_part.substr(first_line_end + 2);
+        parse_header_fields(hdr, resp.headers, header_state);
+        LOG_DEBUG("Proxy response header parsed: status_line=", status_line,
+            ", status=", resp.status_code,
+            ", headers=[", describe_headers(resp.headers), "]",
+            ", invalid_cl=", header_state.invalid_content_length,
+            ", duplicate_cl=", header_state.duplicate_content_length,
+            ", invalid_te=", header_state.invalid_transfer_encoding,
+            ", has_te=", header_state.has_transfer_encoding,
+            ", is_chunked=", header_state.is_chunked,
+            ", content_length=",
+            (header_state.content_length ? std::to_string(*header_state.content_length) : "none"),
+            ", body_rest=", body_rest.size());
+        if (header_state.invalid_content_length || header_state.duplicate_content_length ||
+            header_state.invalid_transfer_encoding ||
+            (header_state.has_transfer_encoding && !header_state.is_chunked)) {
+            LOG_INFO("Proxy response framing invalid: status=", resp.status_code,
+                ", upstream body preview=", sanitize_body_preview(body_rest));
+            resp.error = "upstream_response_invalid_framing";
+            conn.connection_close = true;
+            co_return resp;
+        }
 
-    auto first_line_end = header_part.find("\r\n");
-    if (first_line_end == std::string::npos) {
-        resp.error = "upstream_response_missing_status_line";
-        conn.connection_close = true;
-        co_return resp;
-    }
-    auto status_line = header_part.substr(0, first_line_end);
-    auto sp1 = status_line.find(' ');
-    auto sp2 = status_line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) {
-        LOG_INFO("Proxy response invalid status line: ", sanitize_body_preview(status_line));
-        resp.error = "upstream_response_invalid_status_line";
-        conn.connection_close = true;
-        co_return resp;
-    }
-    auto status_code = parse_decimal_size(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
-    if (!status_code || *status_code > 999) {
-        LOG_INFO("Proxy response invalid status code: status_line=",
-            sanitize_body_preview(status_line));
-        resp.error = "upstream_response_invalid_status_code";
-        conn.connection_close = true;
-        co_return resp;
-    }
-    resp.status_code = static_cast<int>(*status_code);
-    resp.status_text = status_line.substr(sp2 + 1);
+        if (resp.status_code >= 100 && resp.status_code < 200) {
+            if (resp.status_code == 101 || header_state.has_transfer_encoding ||
+                header_state.content_length) {
+                resp.error = resp.status_code == 101 ?
+                    "upstream_protocol_upgrade_unsupported" :
+                    "upstream_informational_response_invalid_framing";
+                conn.connection_close = true;
+                co_return resp;
+            }
+            if (++informational_count > 8) {
+                resp.error = "too_many_upstream_informational_responses";
+                conn.connection_close = true;
+                co_return resp;
+            }
+            buf = std::move(body_rest);
+            continue;
+        }
 
-    int upstream_minor_version = status_line.rfind("HTTP/1.0", 0) == 0 ? 0 : 1;
-    HeaderParseState header_state;
-    auto hdr = header_part.substr(first_line_end + 2, header_end - first_line_end - 2);
-    parse_header_fields(hdr, resp.headers, header_state);
-    LOG_DEBUG("Proxy response header parsed: status_line=", status_line,
-        ", status=", resp.status_code,
-        ", headers=[", describe_headers(resp.headers), "]",
-        ", invalid_cl=", header_state.invalid_content_length,
-        ", duplicate_cl=", header_state.duplicate_content_length,
-        ", has_te=", header_state.has_transfer_encoding,
-        ", is_chunked=", header_state.is_chunked,
-        ", content_length=",
-        (header_state.content_length ? std::to_string(*header_state.content_length) : "none"),
-        ", body_rest=", body_rest.size());
-    if (header_state.invalid_content_length || header_state.duplicate_content_length ||
-        (header_state.has_transfer_encoding && !header_state.is_chunked)) {
-        LOG_INFO("Proxy response framing invalid: status=", resp.status_code,
-            ", upstream body preview=", sanitize_body_preview(body_rest));
-        resp.error = "upstream_response_invalid_framing";
-        conn.connection_close = true;
-        co_return resp;
+        conn.connection_close = header_state.connection_close ||
+            (upstream_minor_version == 0 && !header_state.connection_keep_alive);
+        break;
     }
-
-    conn.connection_close = header_state.connection_close ||
-        (upstream_minor_version == 0 && !header_state.connection_keep_alive);
 
     bool response_has_no_body = request_is_head || resp.status_code == 204 ||
-        resp.status_code == 304 || (resp.status_code >= 100 && resp.status_code < 200);
+        resp.status_code == 304;
     if (response_has_no_body) {
         resp.body.clear();
         if (!body_rest.empty()) {

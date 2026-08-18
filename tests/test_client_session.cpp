@@ -458,6 +458,19 @@ TEST_F(ClientSessionTest, DuplicateContentLengthReturns400) {
     EXPECT_TRUE(resp.rfind("HTTP/1.1 400", 0) == 0) << resp;
 }
 
+TEST_F(ClientSessionTest, CompoundTransferEncodingReturns400) {
+    start_server();
+    auto resp = read_response_with_timeout(port(),
+        "POST /api/echo HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Transfer-Encoding: gzip, chunked\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "0\r\n\r\n");
+
+    EXPECT_TRUE(resp.rfind("HTTP/1.1 400", 0) == 0) << resp;
+}
+
 TEST_F(ClientSessionTest, OversizedHeaderReturns431) {
     start_server();
     std::string request =
