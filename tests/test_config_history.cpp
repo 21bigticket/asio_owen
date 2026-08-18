@@ -269,3 +269,43 @@ TEST(ConfigHistoryService, CompatCanLeavePureLegacyStateUnmodified) {
     EXPECT_FALSE(stats.inconsistent);
     EXPECT_EQ(redis.calls.size(), 2u);
 }
+
+TEST(ConfigHistoryService, CompatAllowsOnlyPristineLegacyEmptyState) {
+    FakeRedis redis;
+    int calls = 0;
+    redis.handler = [&calls](const std::vector<std::string>& args) {
+        ++calls;
+        if (calls == 1) {
+            EXPECT_NE(args[1].find(
+                "no_history and current == 1 and redis.call('HLEN', KEYS[5]) == 0"),
+                std::string::npos);
+            EXPECT_NE(args[1].find("integrity = 'legacy-empty'"),
+                std::string::npos);
+            return array_reply({"1", "0", "1", "legacy-empty"});
+        }
+        EXPECT_NE(args[1].find("batch * 4"), std::string::npos);
+        return array_reply({});
+    };
+    ConfigHistoryConfig cfg;
+    cfg.read_mode = "compat";
+    cfg.auto_migrate_legacy = true;
+
+    auto stats = run_once(redis, cfg);
+    EXPECT_FALSE(stats.inconsistent);
+    EXPECT_EQ(redis.calls.size(), 2u);
+}
+
+TEST(ConfigHistoryService, RequiredRejectsPristineLegacyEmptyState) {
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>&) {
+        return array_reply({"1", "0", "1", "legacy-empty"});
+    };
+    ConfigHistoryConfig cfg;
+    cfg.read_mode = "required";
+    cfg.auto_migrate_legacy = true;
+
+    auto stats = run_once(redis, cfg);
+    EXPECT_TRUE(stats.inconsistent);
+    EXPECT_EQ(stats.inconsistent_checks, 1u);
+    EXPECT_EQ(redis.calls.size(), 1u);
+}

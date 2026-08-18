@@ -2,7 +2,7 @@
 
 **日期**：2026-08-18
 
-**阶段**：Phase 4 已完成代码实现和本地回归（Clang 286/286、Phase 4 相关 ASan 54/54）；生产迁移、真实 Redis 故障演练和 Ubuntu GCC 11 门禁待执行
+**阶段**：Phase 4 已完成代码实现和本地回归（Clang 291/291、Phase 4 相关 ASan 54/54）；生产迁移、真实 Redis 故障演练和本次修复后的 Ubuntu GCC 11 门禁待执行
 
 **依赖设计**：`docs/CONFIG_CENTER_DESIGN_2026-08-16.md`
 
@@ -272,6 +272,8 @@ auto_migrate_legacy = true
 | `required` | 回填完成后的稳态 | 只允许 §6.1 的 meta hash 校验降级并上报 partial；无法校验则拒绝应用 |
 
 `[config_history]` 必须加入 section 和文件级 never-sync 校验，保存 API、历史快照和回滚结果都不得包含它。`read_mode` 非法或缺失时始终采用代码安全默认值 `required`。`auto_migrate_legacy` 默认开启，但只识别 history index、meta 和当前 snapshot 全空且旧镜像非空的纯 legacy 状态；Lua 在写入前再次核对全空条件，迁移只新增 snapshot/meta/index/audit，不修改旧 version/files。任何 history 痕迹或并发冲突都 fail-closed，不能自动覆盖。
+
+兼容旧空首版时使用独立的 `legacy-empty` 状态，不能并入普通 legacy 自动迁移：只有 `current_version=1`，history index、meta、当前 snapshot 全部不存在且 `config:files` 为空时才成立。该状态仅允许 `read_mode=compat` 放行，不执行自动迁移；`required` 必须冻结。`current_version>1` 的全空状态以及存在任意 history 痕迹的部分状态仍判为 `incomplete`。compat 下首次保存有效非空配置时按正常 CAS 流程发布 v2，并生成完整 snapshot/meta/index，从而退出 `legacy-empty`。
 
 ## 7. 回滚设计
 
@@ -641,6 +643,7 @@ Phase 4 自身按以下顺序上线：
 - 完整高水位 orphan 仅可通过强确认恢复 version 指针；只有 snapshot/meta/index 部分残留的 current+1 orphan 可在无已发布证据时强确认删除。
 - 当前 snapshot 缺失时，镜像 hash 匹配只能 partial 降级；hash 不匹配拒绝应用。
 - `read_mode` 缺失或非法时默认为 required，保存和回滚均不能写入 never-sync 的 `[config_history]`。
+- 仅 `current=1` 且 history 三元组和镜像全空时返回 `legacy-empty`：compat 放行且不触发自动迁移，required 拒绝；`current>1` 全空仍冻结。
 - `status=ok` 的同版本轮询只读 version；仅 partial/降级状态持续复核 snapshot。
 - 当前 snapshot/meta/index 完整且 hash 正确时，`mirror-rebuild` 原子重建镜像且不修改 version/history/meta。
 - 分页游标、最大 limit 和不存在版本处理正确。

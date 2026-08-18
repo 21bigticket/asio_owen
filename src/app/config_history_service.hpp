@@ -183,7 +183,8 @@ private:
                     completion();
                     return;
                 }
-                if (reply.elements[3] == "legacy") {
+                const std::string& integrity = reply.elements[3];
+                if (integrity == "legacy") {
                     if (self->cfg_.auto_migrate_legacy) {
                         self->migrate_legacy(*current, std::move(completion));
                         return;
@@ -194,7 +195,14 @@ private:
                         completion();
                         return;
                     }
-                } else if (reply.elements[3] != "ok") {
+                } else if (integrity == "legacy-empty") {
+                    if (self->cfg_.read_mode != "compat") {
+                        self->mark_inconsistent(
+                            "legacy empty version requires compat read mode");
+                        completion();
+                        return;
+                    }
+                } else if (integrity != "ok") {
                     self->mark_inconsistent(
                         "current history snapshot/meta/index is incomplete or key type is invalid");
                     completion();
@@ -460,8 +468,11 @@ local integrity = 'ok'
 if current > 0 then
   local member = tostring(current)
   local current_snapshot_exists = redis.call('EXISTS', ARGV[1] .. member)
-  if redis.call('ZCARD', KEYS[2]) == 0 and redis.call('HLEN', KEYS[4]) == 0 and
-     current_snapshot_exists == 0 and redis.call('HLEN', KEYS[5]) > 0 then
+  local no_history = redis.call('ZCARD', KEYS[2]) == 0 and
+    redis.call('HLEN', KEYS[4]) == 0 and current_snapshot_exists == 0
+  if no_history and current == 1 and redis.call('HLEN', KEYS[5]) == 0 then
+    integrity = 'legacy-empty'
+  elseif no_history and redis.call('HLEN', KEYS[5]) > 0 then
     integrity = 'legacy'
   elseif index_high ~= current or not redis.call('ZSCORE', KEYS[2], member) or
      not redis.call('HGET', KEYS[4], member) or current_snapshot_exists ~= 1 then
