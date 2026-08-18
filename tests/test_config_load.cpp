@@ -71,6 +71,27 @@ TEST(ConfigLoad, ParsesBoolValues) {
     std::filesystem::remove_all(base);
 }
 
+TEST(ConfigLoad, LegacyHistoryAutoMigrationDefaultsOnAndCanBeDisabled) {
+    auto default_base = make_temp_config_dir();
+    write_file(default_base / "config.d" / "12-config-sync.ini",
+        "[config_history]\nread_mode = required\n");
+    Config default_cfg;
+    ASSERT_TRUE(default_cfg.load(default_base));
+    EXPECT_TRUE(app_config_from(default_cfg).config_sync.history.auto_migrate_legacy);
+    std::filesystem::remove_all(default_base);
+
+    auto disabled_base = make_temp_config_dir();
+    write_file(disabled_base / "config.d" / "12-config-sync.ini",
+        "[config_history]\n"
+        "read_mode = required\n"
+        "auto_migrate_legacy = false\n");
+    Config disabled_cfg;
+    ASSERT_TRUE(disabled_cfg.load(disabled_base));
+    EXPECT_FALSE(app_config_from(disabled_cfg)
+        .config_sync.history.auto_migrate_legacy);
+    std::filesystem::remove_all(disabled_base);
+}
+
 TEST(ConfigLoad, ParsesDownstreamWriteTimeout) {
     auto base = make_temp_config_dir();
     write_file(base / "config.d" / "00-server.ini",

@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <asio.hpp>
 
@@ -39,6 +40,7 @@ struct HttpServerState {
           client_body_read_timeout_ms(client_body_read_timeout_ms) {}
 
     std::unordered_map<std::string, Handler> routes;
+    std::vector<std::pair<std::string, Handler>> prefix_routes;
     std::atomic<bool> running{true};
     UpstreamManager upstreams;
     SecurityRules* security_rules = nullptr;
@@ -299,10 +301,27 @@ public:
                     }
                 }
 
-                auto it = state_->routes.find(path_str);
+                const auto query_pos = path_str.find('?');
+                const std::string local_route_path = path_str.substr(0, query_pos);
+                auto it = state_->routes.find(local_route_path);
                 if (!handled && it != state_->routes.end()) {
                     co_await it->second(ctx);
                     handled = true;
+                }
+                if (!handled) {
+                    const Handler* prefix_handler = nullptr;
+                    size_t matched_length = 0;
+                    for (const auto& [prefix, handler] : state_->prefix_routes) {
+                        if (prefix.size() > matched_length &&
+                            local_route_path.rfind(prefix, 0) == 0) {
+                            prefix_handler = &handler;
+                            matched_length = prefix.size();
+                        }
+                    }
+                    if (prefix_handler) {
+                        co_await (*prefix_handler)(ctx);
+                        handled = true;
+                    }
                 }
 
                 if (!handled) {

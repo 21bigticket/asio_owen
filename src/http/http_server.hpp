@@ -48,6 +48,16 @@ public:
         state_->routes[path] = std::move(handler);
     }
 
+    void route_prefix(const std::string& prefix, Handler handler) {
+        for (auto& [registered, existing] : state_->prefix_routes) {
+            if (registered == prefix) {
+                existing = std::move(handler);
+                return;
+            }
+        }
+        state_->prefix_routes.emplace_back(prefix, std::move(handler));
+    }
+
     UpstreamManager& upstreams() { return state_->upstreams; }
 
     unsigned short port() const { return acceptor_.local_endpoint().port(); }

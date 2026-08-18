@@ -152,6 +152,46 @@ ConfigSyncConfig admin_sync_config() {
     return cfg;
 }
 
+std::string snapshot_meta(
+    const std::map<std::string, std::string>& files) {
+    auto hash = config_history::content_sha256(files);
+    if (!hash) throw std::runtime_error("failed to hash test snapshot");
+    return "{\"content_sha256\":\"" + *hash + "\"}";
+}
+
+Reply snapshot_meta_reply(
+    std::initializer_list<std::pair<const std::string, std::string>> files) {
+    return string_reply(snapshot_meta(
+        std::map<std::string, std::string>(files)));
+}
+
+std::string snapshot_meta_json(
+    int64_t version,
+    const std::map<std::string, std::string>& files,
+    std::string_view action = "save") {
+    ConfigHistoryConfig cfg;
+    config_history::SnapshotInfo info;
+    auto error = config_history::validate_snapshot(files, cfg, info);
+    if (error) throw std::runtime_error(*error);
+    return config_history::metadata_json(
+        version, version > 0 ? version - 1 : 0, 1786880000,
+        "admin", action, "test reason", info);
+}
+
+Reply detail_reply(
+    int64_t current_version,
+    int64_t version,
+    const std::map<std::string, std::string>& files) {
+    std::vector<std::string> elements{
+        std::to_string(current_version), snapshot_meta_json(version, files)
+    };
+    for (const auto& [name, content] : files) {
+        elements.push_back(name);
+        elements.push_back(content);
+    }
+    return array_reply(std::move(elements));
+}
+
 std::string admin_token(const ConfigSyncConfig& cfg) {
     auto issued = config_admin::issue_admin_token(cfg.admin, "admin");
     if (!issued) throw std::runtime_error("failed to issue test admin token");
@@ -215,6 +255,33 @@ void run_admin_config(HttpContext& ctx, AppServices services) {
 void run_admin_machines(HttpContext& ctx, AppServices services) {
     asio::io_context ioc;
     run_awaitable(ioc, handle_api_admin_machines(ctx, std::move(services)));
+}
+
+void run_admin_history(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(ioc, handle_api_admin_history(ctx, std::move(services)));
+}
+
+void run_admin_history_path(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(ioc, handle_api_admin_history_path(ctx, std::move(services)));
+}
+
+void run_admin_rollback(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(ioc, handle_api_admin_rollback(ctx, std::move(services)));
+}
+
+void run_admin_snapshot_repair(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(
+        ioc, handle_api_admin_snapshot_repair(ctx, std::move(services)));
+}
+
+void run_admin_orphan_resolution(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(
+        ioc, handle_api_admin_orphan_resolution(ctx, std::move(services)));
 }
 
 void run_admin_page(HttpContext& ctx) {
@@ -320,7 +387,12 @@ TEST(AdminConfigRoutes, InsecureAdminPermitsLabMode) {
     FakeRedis redis;
     redis.handler = [](const std::vector<std::string>& args) {
         if (args.front() == "GET") return string_reply("3");
-        if (args.front() == "HGETALL") return array_reply({});
+        if (args.front() == "HGETALL") return array_reply({
+            "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+        });
+        if (args.front() == "HGET") return snapshot_meta_reply({
+            {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+        });
         return error_reply("unexpected command " + args.front());
     };
     HttpContext ctx;
@@ -331,6 +403,7 @@ TEST(AdminConfigRoutes, InsecureAdminPermitsLabMode) {
     EXPECT_EQ(ctx.status_code, 200);
     EXPECT_EQ(redis.count("GET"), 2u);
     EXPECT_EQ(redis.count("HGETALL"), 1u);
+    EXPECT_EQ(redis.count("HGET"), 1u);
 
     std::filesystem::remove_all(base);
 }
@@ -341,7 +414,12 @@ TEST(AdminConfigRoutes, AdminAuthRereadsLocalConfigInsteadOfStartupSnapshot) {
     FakeRedis redis;
     redis.handler = [](const std::vector<std::string>& args) {
         if (args.front() == "GET") return string_reply("7");
-        if (args.front() == "HGETALL") return array_reply({});
+        if (args.front() == "HGETALL") return array_reply({
+            "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+        });
+        if (args.front() == "HGET") return snapshot_meta_reply({
+            {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+        });
         return error_reply("unexpected command " + args.front());
     };
     HttpContext ctx;
@@ -353,6 +431,7 @@ TEST(AdminConfigRoutes, AdminAuthRereadsLocalConfigInsteadOfStartupSnapshot) {
     EXPECT_EQ(ctx.status_code, 200);
     EXPECT_EQ(redis.count("GET"), 2u);
     EXPECT_EQ(redis.count("HGETALL"), 1u);
+    EXPECT_EQ(redis.count("HGET"), 1u);
 
     std::filesystem::remove_all(base);
 }
@@ -481,6 +560,12 @@ TEST(AdminConfigRoutes, GetConfigReturnsVersionFilesAndRestartFlags) {
                 "10-mysql.ini", "[mysql]\nhost = 127.0.0.1\n"
             });
         }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"},
+                {"10-mysql.ini", "[mysql]\nhost = 127.0.0.1\n"}
+            });
+        }
         return error_reply("unexpected command " + args.front());
     };
     HttpContext ctx;
@@ -527,7 +612,12 @@ TEST(AdminConfigRoutes, GetConfigReturns409WhenVersionChangesDuringRead) {
             ++get_count;
             return string_reply(std::to_string(6 + get_count));
         }
-        if (args.front() == "HGETALL") return array_reply({});
+        if (args.front() == "HGETALL") return array_reply({
+            "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+        });
+        if (args.front() == "HGET") return snapshot_meta_reply({
+            {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+        });
         return error_reply("unexpected command " + args.front());
     };
     HttpContext ctx;
@@ -539,6 +629,7 @@ TEST(AdminConfigRoutes, GetConfigReturns409WhenVersionChangesDuringRead) {
     EXPECT_EQ(ctx.status_code, 409);
     EXPECT_EQ(redis.count("GET"), 4u);
     EXPECT_EQ(redis.count("HGETALL"), 2u);
+    EXPECT_EQ(redis.count("HGET"), 2u);
 
     std::filesystem::remove_all(base);
 }
@@ -642,10 +733,13 @@ TEST(AdminConfigRoutes, PostSaveSuccessRunsLuaAndReturnsNewVersion) {
     redis.handler = [](const std::vector<std::string>& args) {
         if (args.front() == "EVAL") {
             EXPECT_NE(args[1].find("return -4"), std::string::npos);
-            EXPECT_NE(args[1].find("if #ARGV < 4"), std::string::npos);
-            EXPECT_EQ(args[2], "4");
-            EXPECT_EQ(args[7], "7");
-            EXPECT_NE(args[8].find("admin"), std::string::npos);
+            EXPECT_NE(args[1].find("if #ARGV < 8"), std::string::npos);
+            EXPECT_NE(args[1].find("local published = redis.call('INCR'"),
+                std::string::npos);
+            EXPECT_EQ(args[2], "8");
+            EXPECT_EQ(args[11], "7");
+            EXPECT_NE(args[12].find("admin"), std::string::npos);
+            EXPECT_NE(args[13].find("\"version\":8"), std::string::npos);
             return integer_reply(8);
         }
         return error_reply("unexpected command " + args.front());
@@ -732,6 +826,255 @@ TEST(AdminConfigRoutes, MachinesReturnsHeartbeatRows) {
     EXPECT_NE(ctx.response_body.find("\"status\":\"partial\""), std::string::npos);
     EXPECT_NE(ctx.response_body.find("34-path_blacklist.ini"), std::string::npos);
 
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, HistoryListUsesOneBoundedRedisCall) {
+    auto base = make_temp_base("history_list");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"},
+        {"30-security.ini", "[security]\njwt_disabled = true\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>& args) {
+        EXPECT_EQ(args.front(), "EVAL");
+        EXPECT_EQ(args[2], "3");
+        EXPECT_EQ(args[6], "9");
+        EXPECT_EQ(args[7], "2");
+        EXPECT_EQ(args[8], config_history::kSnapshotPrefix);
+        return array_reply({
+            "10", "10", snapshot_meta_json(10, files),
+            "9", snapshot_meta_json(9, files)
+        });
+    };
+    HttpContext ctx;
+    ctx.method = "GET";
+    ctx.path = "/api/admin/config/history?before=9&limit=2";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_history(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"current_version\":10"),
+        std::string::npos);
+    EXPECT_NE(ctx.response_body.find("\"next_before\":9"),
+        std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, HistoryDetailValidatesSnapshotHash) {
+    auto base = make_temp_base("history_detail");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>& args) {
+        EXPECT_EQ(args[2], "4");
+        EXPECT_EQ(args.back(), "7");
+        return detail_reply(8, 7, files);
+    };
+    HttpContext ctx;
+    ctx.method = "GET";
+    ctx.path = "/api/admin/config/history/7";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_history_path(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"version\":7"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("20-upstream.ini"), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, HistoryDiffUsesPathVersionAsFrom) {
+    auto base = make_temp_base("history_diff");
+    write_never_sync(base);
+    const std::map<std::string, std::string> from_files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    const std::map<std::string, std::string> to_files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30002\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&from_files, &to_files](const std::vector<std::string>& args) {
+        if (args.back() == "7") return detail_reply(8, 7, from_files);
+        if (args.back() == "8") return detail_reply(8, 8, to_files);
+        return error_reply("unexpected history version");
+    };
+    HttpContext ctx;
+    ctx.method = "GET";
+    ctx.path = "/api/admin/config/history/7/diff?to=8";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_history_path(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"from\":7,\"to\":8"),
+        std::string::npos);
+    EXPECT_NE(ctx.response_body.find("\"type\":\"modified\""),
+        std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, RollbackPublishesNewVersionWithoutLoweringVersion) {
+    auto base = make_temp_base("history_rollback");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"},
+        {"30-security.ini", "[security]\njwt_disabled = true\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>& args) {
+        if (args[2] == "4") return detail_reply(8, 3, files);
+        EXPECT_EQ(args[2], "9");
+        EXPECT_NE(args[1].find("local source_version"), std::string::npos);
+        EXPECT_EQ(args[12], "8");
+        EXPECT_NE(args[13].find("\"new_version\":9"), std::string::npos);
+        EXPECT_NE(args[14].find("\"rollback_from\":3"), std::string::npos);
+        EXPECT_EQ(args[19], "3");
+        return integer_reply(9);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.path = "/api/admin/config/rollback";
+    ctx.body = R"({"base_version":8,"target_version":3,"reason":"restore known good"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_rollback(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"version\":9"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("\"rollback_from\":3"),
+        std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, SnapshotRepairRequiresMatchingMirrorMetadata) {
+    auto base = make_temp_base("snapshot_repair");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>& args) {
+        if (args.front() == "HGETALL") {
+            return array_reply({
+                "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+            });
+        }
+        if (args.front() == "HGET") {
+            return string_reply(snapshot_meta_json(8, files));
+        }
+        EXPECT_EQ(args.front(), "EVAL");
+        EXPECT_EQ(args[2], "7");
+        EXPECT_NE(args[1].find("redis.call('RENAME', KEYS[6], KEYS[5])"),
+            std::string::npos);
+        return integer_reply(8);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.path = "/api/admin/config/history/repair-snapshot";
+    ctx.body = R"({"version":8,"reason":"repair deleted current snapshot"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_snapshot_repair(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"action\":\"snapshot-repair\""),
+        std::string::npos);
+    EXPECT_EQ(redis.calls.size(), 3u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, OrphanRestoreRebuildsMirrorThenRestoresVersionPointer) {
+    auto base = make_temp_base("orphan_restore");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    const std::string meta = snapshot_meta_json(9, files);
+    FakeRedis redis;
+    redis.handler = [&files, &meta](const std::vector<std::string>& args) {
+        if (args[2] == "5") {
+            return array_reply({
+                "8", "9", "8", "1", meta, "1",
+                files.begin()->first, files.begin()->second
+            });
+        }
+        EXPECT_EQ(args[2], "8");
+        EXPECT_NE(args[1].find("redis.call('SET', KEYS[1], target)"),
+            std::string::npos);
+        EXPECT_EQ(args[11], "8");
+        EXPECT_EQ(args[12], "9");
+        return integer_reply(9);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.path = "/api/admin/config/history/resolve-orphan";
+    ctx.body = R"({"current_version":8,"target_version":9,"action":"restore-version","reason":"confirmed published from AOF","confirmation":"RESTORE_VERSION_POINTER"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_orphan_resolution(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"version\":9"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("\"action\":\"restore-version\""),
+        std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, OrphanDeleteAtomicallyRemovesConfirmedPartialTriple) {
+    auto base = make_temp_base("orphan_delete");
+    write_never_sync(base);
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>& args) {
+        if (args[2] == "5") {
+            return array_reply({
+                "8", "8", "8", "0", "__missing__", "1",
+                "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+            });
+        }
+        EXPECT_EQ(args[2], "6");
+        EXPECT_NE(args[1].find("redis.call('UNLINK', KEYS[4])"),
+            std::string::npos);
+        EXPECT_NE(args[1].find("target ~= current + 1"), std::string::npos);
+        return integer_reply(1);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.path = "/api/admin/config/history/resolve-orphan";
+    ctx.body = R"({"current_version":8,"target_version":9,"action":"delete-orphan","reason":"confirmed unpublished from logs","confirmation":"DELETE_UNPUBLISHED_ORPHAN"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_orphan_resolution(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"version\":8"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("\"action\":\"delete-orphan\""),
+        std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, OrphanResolutionRejectsWrongConfirmationBeforeRedis) {
+    auto base = make_temp_base("orphan_confirmation");
+    write_never_sync(base);
+    FakeRedis redis;
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"current_version":8,"target_version":9,"action":"delete-orphan","reason":"test","confirmation":"yes"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_orphan_resolution(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 400);
+    EXPECT_TRUE(redis.calls.empty());
     std::filesystem::remove_all(base);
 }
 

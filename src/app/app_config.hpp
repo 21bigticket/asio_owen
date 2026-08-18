@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -24,6 +25,25 @@ struct AdminConfig {
     bool insecure_no_auth = false;
 };
 
+struct ConfigHistoryConfig {
+    std::string read_mode = "required";
+    bool auto_migrate_legacy = true;
+    int retention_versions = 100;
+    int retention_days = 90;
+    size_t warn_snapshot_bytes = 256 * 1024;
+    size_t max_snapshot_bytes = 512 * 1024;
+    size_t warn_file_bytes = 64 * 1024;
+    size_t max_file_bytes = 128 * 1024;
+    size_t warn_files = 80;
+    size_t max_files = 100;
+    size_t max_reason_bytes = 512;
+    size_t history_page_size = 20;
+    size_t history_page_size_max = 50;
+    size_t max_diff_response_bytes = 2 * 1024 * 1024;
+    size_t gc_batch_size = 20;
+    int gc_interval_sec = 300;
+};
+
 struct ConfigSyncConfig {
     bool enabled = false;
     int sync_interval_sec = 5;
@@ -31,6 +51,7 @@ struct ConfigSyncConfig {
     std::string first_pull = "async";
     int first_pull_timeout_ms = 3000;
     AdminConfig admin;
+    ConfigHistoryConfig history;
 };
 
 struct AppConfig {
@@ -76,6 +97,66 @@ inline AdminConfig admin_config_from(const Config& cfg) {
         }
     }
     return admin;
+}
+
+inline ConfigHistoryConfig config_history_from(const Config& cfg) {
+    ConfigHistoryConfig history;
+    history.read_mode = cfg.get("config_history", "read_mode", "required");
+    std::transform(history.read_mode.begin(), history.read_mode.end(),
+        history.read_mode.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (history.read_mode != "compat" && history.read_mode != "required") {
+        LOG_WARN("invalid config_history.read_mode '", history.read_mode,
+            "', using required");
+        history.read_mode = "required";
+    }
+    history.auto_migrate_legacy = cfg.get_bool(
+        "config_history", "auto_migrate_legacy", true);
+
+    history.retention_versions = std::max(
+        1, cfg.get_int("config_history", "retention_versions", 100));
+    history.retention_days = std::max(
+        1, cfg.get_int("config_history", "retention_days", 90));
+    history.warn_snapshot_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "warn_snapshot_bytes", 256 * 1024),
+        1, 512 * 1024));
+    history.max_snapshot_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "max_snapshot_bytes", 512 * 1024),
+        1, 512 * 1024));
+    history.warn_file_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "warn_file_bytes", 64 * 1024),
+        1, 128 * 1024));
+    history.max_file_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "max_file_bytes", 128 * 1024),
+        1, 128 * 1024));
+    history.warn_files = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "warn_files", 80), 1, 100));
+    history.max_files = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "max_files", 100), 1, 100));
+    history.max_reason_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "max_reason_bytes", 512), 1, 512));
+    history.history_page_size = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "history_page_size", 20), 1, 50));
+    history.history_page_size_max = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "history_page_size_max", 50), 1, 50));
+    history.max_diff_response_bytes = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "max_diff_response_bytes", 2 * 1024 * 1024),
+        1, 2 * 1024 * 1024));
+    history.gc_batch_size = static_cast<size_t>(std::clamp(
+        cfg.get_int("config_history", "gc_batch_size", 20), 1, 20));
+    history.gc_interval_sec = std::max(
+        10, cfg.get_int("config_history", "gc_interval_sec", 300));
+
+    history.max_snapshot_bytes = std::max(
+        history.max_snapshot_bytes, history.max_file_bytes);
+    history.warn_snapshot_bytes = std::min(
+        history.warn_snapshot_bytes, history.max_snapshot_bytes);
+    history.warn_file_bytes = std::min(
+        history.warn_file_bytes, history.max_file_bytes);
+    history.max_files = std::max(history.max_files, history.warn_files);
+    history.history_page_size = std::min(
+        history.history_page_size, history.history_page_size_max);
+    return history;
 }
 
 // Parse the [http_pool] section into an HttpPool::Config. Factored out so the
@@ -165,5 +246,6 @@ inline AppConfig app_config_from(const Config& cfg) {
         .first_pull_timeout_ms = cfg.get_int("config_sync", "first_pull_timeout_ms", 3000)
     };
     app.config_sync.admin = admin_config_from(cfg);
+    app.config_sync.history = config_history_from(cfg);
     return app;
 }

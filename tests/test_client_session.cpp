@@ -281,6 +281,43 @@ TEST_F(ClientSessionTest, GetLocalRouteReturns200) {
     EXPECT_NE(resp.find("pong"), std::string::npos) << resp;
 }
 
+TEST_F(ClientSessionTest, QueryStringStillMatchesExactLocalRoute) {
+    start_server();
+    auto resp = read_response_with_timeout(port(),
+        "GET /api/ping?limit=20 HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    EXPECT_TRUE(resp.rfind("HTTP/1.1 200", 0) == 0) << resp;
+    EXPECT_NE(resp.find("pong"), std::string::npos) << resp;
+}
+
+TEST_F(ClientSessionTest, LongestPrefixRouteWinsAndIgnoresQueryString) {
+    server().route_prefix("/api/admin/config/history/",
+        [](HttpContext& ctx) -> asio::awaitable<void> {
+            ctx.status_code = 200;
+            ctx.response_body = "general-history";
+            co_return;
+        });
+    server().route_prefix("/api/admin/config/history/7/",
+        [](HttpContext& ctx) -> asio::awaitable<void> {
+            ctx.status_code = 200;
+            ctx.response_body = "version-seven";
+            co_return;
+        });
+    start_server();
+    auto resp = read_response_with_timeout(port(),
+        "GET /api/admin/config/history/7/diff?to=8 HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    EXPECT_TRUE(resp.rfind("HTTP/1.1 200", 0) == 0) << resp;
+    EXPECT_NE(resp.find("version-seven"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("general-history"), std::string::npos) << resp;
+}
+
 TEST_F(ClientSessionTest, PostContentLengthBodyEchoed) {
     start_server();
     auto resp = read_response_with_timeout(port(),

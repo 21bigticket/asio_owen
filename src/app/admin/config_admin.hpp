@@ -35,6 +35,7 @@
 #include "../../security/security_rules.hpp"
 #include "../app_config.hpp"
 #include "../config_sync_service.hpp"
+#include "config_history.hpp"
 #include "generated/admin_login_html.hpp"
 #include "generated/admin_settings_html.hpp"
 
@@ -55,6 +56,7 @@ struct ManagedFile {
 
 struct SaveRequest {
     int64_t base_version = 0;
+    std::string reason;
     std::vector<ManagedFile> files;
 };
 
@@ -72,6 +74,43 @@ struct LoginRequest {
 struct LoginParseResult {
     bool ok = false;
     LoginRequest request;
+    std::string error;
+};
+
+struct RollbackRequest {
+    int64_t base_version = 0;
+    int64_t target_version = 0;
+    std::string reason;
+};
+
+struct RollbackParseResult {
+    bool ok = false;
+    RollbackRequest request;
+    std::string error;
+};
+
+struct RepairRequest {
+    int64_t version = 0;
+    std::string reason;
+};
+
+struct RepairParseResult {
+    bool ok = false;
+    RepairRequest request;
+    std::string error;
+};
+
+struct OrphanResolutionRequest {
+    int64_t current_version = 0;
+    int64_t target_version = 0;
+    std::string action;
+    std::string reason;
+    std::string confirmation;
+};
+
+struct OrphanResolutionParseResult {
+    bool ok = false;
+    OrphanResolutionRequest request;
     std::string error;
 };
 
@@ -138,6 +177,10 @@ public:
                 if (!value || *value < 0) return fail("invalid base_version");
                 result.request.base_version = *value;
                 saw_base_version = true;
+            } else if (*key == "reason") {
+                auto value = parse_string();
+                if (!value) return fail("invalid reason");
+                result.request.reason = std::move(*value);
             } else if (*key == "files") {
                 auto files = parse_files_array();
                 if (!files) return fail("invalid files array");
@@ -159,6 +202,160 @@ public:
         return result;
     }
 
+    RollbackParseResult parse_rollback_request() {
+        RollbackParseResult result;
+        if (!consume('{')) return rollback_fail("expected object");
+        bool saw_base = false;
+        bool saw_target = false;
+        bool saw_reason = false;
+        while (true) {
+            skip_ws();
+            if (consume('}')) break;
+            auto key = parse_string();
+            if (!key) return rollback_fail("expected object key");
+            if (!consume(':')) return rollback_fail("expected ':'");
+            if (*key == "base_version") {
+                auto value = parse_int64();
+                if (!value || *value < 0) {
+                    return rollback_fail("invalid base_version");
+                }
+                result.request.base_version = *value;
+                saw_base = true;
+            } else if (*key == "target_version") {
+                auto value = parse_int64();
+                if (!value || *value <= 0) {
+                    return rollback_fail("invalid target_version");
+                }
+                result.request.target_version = *value;
+                saw_target = true;
+            } else if (*key == "reason") {
+                auto value = parse_string();
+                if (!value || value->empty()) {
+                    return rollback_fail("reason is required");
+                }
+                result.request.reason = std::move(*value);
+                saw_reason = true;
+            } else if (!skip_value()) {
+                return rollback_fail("invalid JSON value");
+            }
+            skip_ws();
+            if (consume(',')) continue;
+            if (consume('}')) break;
+            return rollback_fail("expected ',' or '}'");
+        }
+        skip_ws();
+        if (pos_ != input_.size()) return rollback_fail("trailing data");
+        if (!saw_base) return rollback_fail("missing base_version");
+        if (!saw_target) return rollback_fail("missing target_version");
+        if (!saw_reason) return rollback_fail("missing reason");
+        result.ok = true;
+        return result;
+    }
+
+    RepairParseResult parse_repair_request() {
+        RepairParseResult result;
+        if (!consume('{')) return repair_fail("expected object");
+        bool saw_version = false;
+        bool saw_reason = false;
+        while (true) {
+            skip_ws();
+            if (consume('}')) break;
+            auto key = parse_string();
+            if (!key) return repair_fail("expected object key");
+            if (!consume(':')) return repair_fail("expected ':'");
+            if (*key == "version") {
+                auto value = parse_int64();
+                if (!value || *value <= 0) return repair_fail("invalid version");
+                result.request.version = *value;
+                saw_version = true;
+            } else if (*key == "reason") {
+                auto value = parse_string();
+                if (!value || value->empty()) return repair_fail("reason is required");
+                result.request.reason = std::move(*value);
+                saw_reason = true;
+            } else if (!skip_value()) {
+                return repair_fail("invalid JSON value");
+            }
+            skip_ws();
+            if (consume(',')) continue;
+            if (consume('}')) break;
+            return repair_fail("expected ',' or '}'");
+        }
+        skip_ws();
+        if (pos_ != input_.size()) return repair_fail("trailing data");
+        if (!saw_version) return repair_fail("missing version");
+        if (!saw_reason) return repair_fail("missing reason");
+        result.ok = true;
+        return result;
+    }
+
+    OrphanResolutionParseResult parse_orphan_resolution_request() {
+        OrphanResolutionParseResult result;
+        if (!consume('{')) return orphan_fail("expected object");
+        bool saw_current = false;
+        bool saw_target = false;
+        bool saw_action = false;
+        bool saw_reason = false;
+        bool saw_confirmation = false;
+        while (true) {
+            skip_ws();
+            if (consume('}')) break;
+            auto key = parse_string();
+            if (!key) return orphan_fail("expected object key");
+            if (!consume(':')) return orphan_fail("expected ':'");
+            if (*key == "current_version") {
+                auto value = parse_int64();
+                if (!value || *value < 0) return orphan_fail("invalid current_version");
+                result.request.current_version = *value;
+                saw_current = true;
+            } else if (*key == "target_version") {
+                auto value = parse_int64();
+                if (!value || *value <= 0) return orphan_fail("invalid target_version");
+                result.request.target_version = *value;
+                saw_target = true;
+            } else if (*key == "action") {
+                auto value = parse_string();
+                if (!value || (*value != "restore-version" &&
+                               *value != "delete-orphan")) {
+                    return orphan_fail("invalid action");
+                }
+                result.request.action = std::move(*value);
+                saw_action = true;
+            } else if (*key == "reason") {
+                auto value = parse_string();
+                if (!value || value->empty()) return orphan_fail("reason is required");
+                result.request.reason = std::move(*value);
+                saw_reason = true;
+            } else if (*key == "confirmation") {
+                auto value = parse_string();
+                if (!value || value->empty()) {
+                    return orphan_fail("confirmation is required");
+                }
+                result.request.confirmation = std::move(*value);
+                saw_confirmation = true;
+            } else if (!skip_value()) {
+                return orphan_fail("invalid JSON value");
+            }
+            skip_ws();
+            if (consume(',')) continue;
+            if (consume('}')) break;
+            return orphan_fail("expected ',' or '}'");
+        }
+        skip_ws();
+        if (pos_ != input_.size()) return orphan_fail("trailing data");
+        if (!saw_current || !saw_target || !saw_action ||
+            !saw_reason || !saw_confirmation) {
+            return orphan_fail("missing orphan resolution field");
+        }
+        const std::string expected = result.request.action == "restore-version" ?
+            "RESTORE_VERSION_POINTER" : "DELETE_UNPUBLISHED_ORPHAN";
+        if (result.request.confirmation != expected) {
+            return orphan_fail("confirmation text does not match action");
+        }
+        result.ok = true;
+        return result;
+    }
+
 private:
     LoginParseResult login_fail(std::string message) const {
         LoginParseResult result;
@@ -168,6 +365,24 @@ private:
 
     ParseResult fail(std::string message) const {
         ParseResult result;
+        result.error = std::move(message);
+        return result;
+    }
+
+    RollbackParseResult rollback_fail(std::string message) const {
+        RollbackParseResult result;
+        result.error = std::move(message);
+        return result;
+    }
+
+    RepairParseResult repair_fail(std::string message) const {
+        RepairParseResult result;
+        result.error = std::move(message);
+        return result;
+    }
+
+    OrphanResolutionParseResult orphan_fail(std::string message) const {
+        OrphanResolutionParseResult result;
         result.error = std::move(message);
         return result;
     }
@@ -392,6 +607,19 @@ inline ParseResult parse_save_request(std::string_view body) {
 
 inline LoginParseResult parse_login_request(std::string_view body) {
     return JsonReader(body).parse_login_request();
+}
+
+inline RollbackParseResult parse_rollback_request(std::string_view body) {
+    return JsonReader(body).parse_rollback_request();
+}
+
+inline RepairParseResult parse_repair_request(std::string_view body) {
+    return JsonReader(body).parse_repair_request();
+}
+
+inline OrphanResolutionParseResult parse_orphan_resolution_request(
+    std::string_view body) {
+    return JsonReader(body).parse_orphan_resolution_request();
 }
 
 inline std::optional<int64_t> parse_int64(std::string_view value) {
@@ -829,9 +1057,12 @@ inline std::optional<std::string> dry_run_config_set(
 }
 
 inline std::string files_json(int64_t version,
-                              const std::map<std::string, std::string>& files) {
+                              const std::map<std::string, std::string>& files,
+                              bool degraded = false) {
     std::ostringstream out;
-    out << "{\"version\":" << version << ",\"files\":[";
+    out << "{\"version\":" << version
+        << ",\"degraded\":" << (degraded ? "true" : "false")
+        << ",\"files\":[";
     bool first = true;
     for (const auto& [name, content] : files) {
         if (!first) out << ",";
@@ -887,6 +1118,9 @@ inline std::string machines_json(const std::map<std::string, std::string>& machi
 }
 
 inline std::string audit_json(const Principal* principal, int64_t base_version,
+                              int64_t new_version,
+                              std::string_view action,
+                              std::string_view reason,
                               const std::vector<ManagedFile>& files) {
     std::ostringstream out;
     out << "{\"ts\":" << static_cast<int64_t>(std::time(nullptr))
@@ -894,6 +1128,9 @@ inline std::string audit_json(const Principal* principal, int64_t base_version,
         << json_escape(principal ? (principal->username.empty()
                 ? principal->subject : principal->username) : "insecure")
         << "\",\"base_version\":" << base_version
+        << ",\"new_version\":" << new_version
+        << ",\"action\":\"" << json_escape(std::string(action))
+        << "\",\"reason\":\"" << json_escape(std::string(reason)) << "\""
         << ",\"files\":[";
     for (size_t i = 0; i < files.size(); ++i) {
         if (i > 0) out << ",";
@@ -904,30 +1141,7 @@ inline std::string audit_json(const Principal* principal, int64_t base_version,
 }
 
 inline std::string save_script() {
-    return R"(
-if (#ARGV - 2) % 2 ~= 0 then return -2 end
-if #ARGV < 4 then return -2 end
-local base = tonumber(ARGV[1])
-if base == nil then return -2 end
-local t = redis.call('TYPE', KEYS[1]).ok
-if t ~= 'string' and t ~= 'none' then return -3 end
-t = redis.call('TYPE', KEYS[2]).ok
-if t ~= 'hash' and t ~= 'none' then return -3 end
-t = redis.call('TYPE', KEYS[3]).ok
-if t ~= 'list' and t ~= 'none' then return -3 end
-local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
-if cur == nil then return -4 end
-if cur ~= base then return -1 end
-redis.call('DEL', KEYS[4])
-redis.call('HSET', KEYS[4], unpack(ARGV, 3, #ARGV))
-redis.call('RENAME', KEYS[4], KEYS[2])
-local newv = redis.call('INCR', KEYS[1])
-pcall(function()
-  redis.call('LPUSH', KEYS[3], ARGV[2])
-  redis.call('LTRIM', KEYS[3], 0, 199)
-end)
-return newv
-)";
+    return config_history::save_script();
 }
 
 inline std::string admin_login_html() {

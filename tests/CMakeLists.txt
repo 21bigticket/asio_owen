@@ -21,6 +21,11 @@ add_executable(test_config_sync_service test_config_sync_service.cpp)
 target_link_libraries(test_config_sync_service PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_config_sync_service)
 
+# Immutable config history model, integrity guard and bounded GC
+add_executable(test_config_history test_config_history.cpp)
+target_link_libraries(test_config_history PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_config_history)
+
 # JSON key 转换
 add_executable(test_json_transform test_json_transform.cpp)
 target_link_libraries(test_json_transform PRIVATE gtest_main asio_owen_core)

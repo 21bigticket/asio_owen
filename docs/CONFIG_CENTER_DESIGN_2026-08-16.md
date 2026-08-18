@@ -1,6 +1,8 @@
 # 配置中心设计方案（asio_owen）
 
-**版本**：v1.5.3（2026-08-17，GCC 11.4 admin 路由兼容修订，见文末修订记录）
+**版本**：v1.6.0（2026-08-18，Phase 4 配置历史与单调回滚实现，见文末修订记录）
+
+> Phase 4 已实现。本文早期章节保留 Phase 1-3 的基线模型；不可变快照、meta/index、权威读取、容量限制、历史 API、单调回滚、修复和 GC 的现行规则以 `docs/CONFIG_HISTORY_DESIGN_2026-08-18.md` 为准。
 **状态**：已实施；本文记录当前代码语义与验收边界
 **前置阅读**：`docs/CONFIG_REFACTOR_PLAN.md`（section 与生效方式清单）、`docs/GATEWAY_DESIGN.md`、`DB_POOL_DESIGN.md`
 
@@ -139,10 +141,10 @@
 
 ```ini
 [config_sync]
-enabled = false               ; 渐进 rollout，确认无误后手动打开
+enabled = true                ; 交付配置直接开启，单 Pod 验收后原样扩容
 sync_interval_sec = 5         ; 轮询间隔
 machine_name =                ; 空 = hostname（稳定，不含 pid）
-first_pull = async            ; async(默认)=启动后异步首同步 | blocking=启动前阻塞首拉取(§5.3)
+first_pull = blocking         ; 新 Pod 启动前先同步，仍需 readiness 校验同步状态
 first_pull_timeout_ms = 3000  ; 仅 blocking 模式：池构建+首命令+同步的整体 deadline
 
 # admin 面独立信任域（v1.5，D8）：账号+密钥+签发参数，全部本地、永不同步。
@@ -167,7 +169,7 @@ path = /api/admin/
 
 ### 5.3 启动流程
 
-**默认（`first_pull = async`）——Phase 1 的实际语义是"运行期镜像同步"**：
+**非交付兼容模式（`first_pull = async`）——运行期镜像同步**：
 
 ```
 Application::initialize 内、ReloadService.start() 之前启动；
@@ -179,7 +181,7 @@ Application::initialize 内、ReloadService.start() 之前启动；
 - 首同步在 `ReloadService.start()` 种子 fingerprint 之前或之后均正确：之前则种子即最新；之后则 fingerprint diff 触发一次正常 reload
 - **漂移告警**：首同步及每次版本变化应用后，用落盘配置重新 `app_config_from` 并与运行中 `AppConfig` 比较启动期字段（server_port、mysql、redis），不一致 → `LOG_WARN "startup config drift detected, restart required"`（每版本一次，不刷屏）
 
-**可选（`first_pull = blocking`）——启动前阻塞首拉取（v1.2 修订超时语义）**：
+**交付默认（`first_pull = blocking`）——启动前阻塞首拉取（v1.2 修订超时语义）**：
 
 ```
 main 流程在 Config::load 之后、app_config_from 之前插入：
@@ -325,15 +327,15 @@ RENAME 后、SET version 前死亡，files 已建好但 version 仍不存在 →
 
 ### 6.5 新机器部署
 
-**默认 async 模式下，"裸启即用"不成立**——启动期配置先于首同步被消费。三种部署方式：
+交付配置默认使用 blocking，单 Pod 验收与扩容保持同一配置，新节点只调整副本数：
 
-1. **推荐**：从现有机器拷贝整份 `config.d`（含托管文件）→ 直接启动，后续以 Redis 为准
-2. 仅放置永不同步清单三件套启动 → 首同步拉全量（热加载面即刻生效）→ **手动重启一次**使启动期配置生效
-3. `first_pull = blocking` 模式：启动前阻塞拉取（direct 模式临时池 + 整体 deadline，§5.3），无需重启
+1. 新节点携带 `[redis]`、`[config_sync]`、`[config_history]` 和 Admin 凭证等 never-sync 本地配置。
+2. blocking 首拉在启动前从 Redis 获取托管文件（direct 模式临时池 + 整体 deadline，§5.3）。
+3. 只有明确选择非交付 async 兼容模式时，才需要预置完整托管文件或在首同步后重启一次。
 
 `AppConfig` 默认值可起服务（MysqlPool 连接惰性不阻塞），故方式 2 不会起不来，只是启动期配置要重启才正确。
 
-Rollout 顺序：首次开启 `enabled=true` 时，先在一台已具备完整托管配置且状态健康的机器上完成种子/同步，再扩到其他机器。空托管集只作为全新三件套机器的合法种子结果；已有托管文件的机器遇到远端空集会 fail-closed 为 partial，不会删除本地托管文件。
+Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具备完整本地配置的 Pod，完成种子/同步和业务验收；验收后不再改这些参数，只增加副本。空托管集只作为全新环境的合法种子结果；已有托管文件的机器遇到远端空集会 fail-closed 为 partial，不会删除本地托管文件。
 
 ---
 
@@ -469,9 +471,9 @@ Rollout 顺序：首次开启 `enabled=true` 时，先在一台已具备完整�
 | **Phase 1** | ConfigSyncService：Lua 原子种子（含播种资格判定、**空托管集分支**）、轮询（双读版本、**version 非数字判定**）、原子落盘、**部分失败不推进版本+partial 心跳**、删除检测、心跳、`[config_sync]` 配置、Application 接线（生命周期契约 §5.1）、保留路径校验（§6.3）、可选 blocking 首拉取（direct 临时池+整体 deadline）+ 漂移告警 | 机器侧闭环 | 单测 + 集成（本地 Redis）：种子（含并发种子竞争、**混合代机器拒绝播种**、**仅三件套新机器空集种子成功**）→ redis-cli 改 files+INCR → 本地文件更新 → 日志 "upstreams hot-reloaded" → curl 新路由生效；坏文件场景：版本不推进、心跳 partial、修复后收敛；**托管文件声明 /api/admin 黑名单规则 → 被同步层拒绝**；version key 写入 "abc" → ERROR 不误报 |
 | **Phase 2** | 手写 JSON parser + Admin API（整目录 dry-run+保留路径校验、Lua 前置校验+staging+RENAME+CAS 提交、audit pcall）——已实施（v1.4 语义）。**待实施 v1.5 增量（D8）**：admin 独立信任域（密钥对+issuer+裸 EVP 签发）、`/api/admin/login` + PBKDF2 账号、防爆破锁定、`insecure_no_auth` 替代 `allow_insecure_admin`、`ctx.client_ip` 管道、页面登录框 | 写路径闭环 + 管理凭证闭环 | API 级测试：非法配置被拦、乐观锁 409、audit key 类型破坏 → -3 拒绝且核心状态未动、**version key 非数字 → -4 不误报 409**、**空文件集 → API+脚本双层拒绝**、保存后 Redis 原子更新；**v1.5：业务公钥签的 token 带 `roles:["admin"]` → 401（提权回归测试）、登录成功/锁定/未配置 503、PBKDF2 正误+恒时、admin token 过期 401** |
 | **Phase 3** | 内嵌多 tab 页面（含 partial 状态展示、block-all 二次确认） | 管理界面 | 手工验收：双机同步演示、表单/源码双模式、机器状态条 |
-| Phase 4（后置可选） | 版本历史/一键回滚（audit 扩展为版本快照）、按机器分组灰度、pub/sub 即时推送（专用常连接订阅组件，现池架构无法承载，独立工程评估） | 增强 | 另行设计 |
+| **Phase 4（历史部分已实施）** | 版本历史/一键回滚（完整不可变快照、单调版本回滚、容量/保留/GC、缺失快照降级和人工修复，见 `docs/CONFIG_HISTORY_DESIGN_2026-08-18.md`）；按机器分组灰度、pub/sub 即时推送仍后置 | 增强 | 历史代码与本地测试已完成；生产迁移、真实 Redis 故障演练及 Ubuntu GCC 11 门禁后方可上线 |
 
-各阶段独立可交付、可单独回滚（Phase 1 有 `enabled=false` 默认关闭开关）。
+各阶段独立可交付、可单独回滚；`enabled=false` 保留为显式停用开关，但不作为生产交付配置。
 
 ---
 

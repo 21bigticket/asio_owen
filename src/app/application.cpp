@@ -167,6 +167,9 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     snapshot_service_ = std::make_unique<SnapshotService>(ioc_, *security_rules_);
     snapshot_service_->start(app_cfg.snapshot_interval_sec);
 
+    config_history_service_ = std::make_shared<ConfigHistoryService>(
+        ioc_, *redis_, app_cfg.config_sync.history, app_cfg.redis.cmd_timeout_ms);
+
     register_routes(*server_, AppServices{
         .mysql = mysql_.get(),
         .redis = redis_.get(),
@@ -175,6 +178,7 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
         .combo_deadline_ms = app_cfg.combo_deadline_ms,
         .config_base = config_base,
         .config_sync = app_cfg.config_sync,
+        .config_history_service = config_history_service_,
         .redis_command = [redis = redis_.get()](std::vector<std::string> args) {
             return redis->cmd_argv(std::move(args));
         }
@@ -188,6 +192,7 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     config_sync_service_ = std::make_shared<ConfigSyncService>(
         ioc_, *redis_, config_base, app_cfg.config_sync, app_cfg);
     config_sync_service_->start();
+    config_history_service_->start();
 
     reload_service_ = std::make_unique<ReloadService>(
         ioc_, config_base, *security_rules_, server_->upstreams());
@@ -213,6 +218,7 @@ void Application::request_stop() {
 }
 
 void Application::cleanup() {
+    if (config_history_service_) config_history_service_->stop();
     if (config_sync_service_) config_sync_service_->stop();
     if (reload_service_) reload_service_->stop();
     if (pool_stats_service_) pool_stats_service_->stop();
@@ -220,6 +226,7 @@ void Application::cleanup() {
     if (server_) server_->stop();
 
     signal_exit_.reset();
+    config_history_service_.reset();
     config_sync_service_.reset();
     reload_service_.reset();
     pool_stats_service_.reset();

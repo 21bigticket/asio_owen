@@ -32,6 +32,7 @@
 #include "../common/config.hpp"
 #include "../common/logger.hpp"
 #include "../db/redis_pool.hpp"
+#include "admin/config_history.hpp"
 #include "app_config.hpp"
 
 class ConfigSyncService : public std::enable_shared_from_this<ConfigSyncService> {
@@ -228,6 +229,9 @@ public:
         }
         if (contains_section(content, "config_sync")) {
             return {false, "managed file contains [config_sync] section"};
+        }
+        if (contains_section(content, "config_history")) {
+            return {false, "managed file contains [config_history] section"};
         }
         if (has_reserved_admin_rule(content)) {
             return {false, "managed file touches reserved admin path"};
@@ -465,14 +469,19 @@ private:
                 }
 
                 const int64_t remote_version = version.value;
-                const int64_t local_version = load_state(self->config_base_).synced_version;
+                const State local_state = load_state(self->config_base_);
+                const int64_t local_version = local_state.synced_version;
                 if (remote_version < local_version) {
                     LOG_ERROR("ConfigSync ignored version rollback: remote=", remote_version,
                         ", local=", local_version);
                     completion(false);
                     return;
                 }
-                if (remote_version == local_version) {
+                const bool history_recovery_pending =
+                    local_state.status == "partial" &&
+                    local_state.failures.find("history_snapshot") !=
+                        local_state.failures.end();
+                if (remote_version == local_version && !history_recovery_pending) {
                     self->heartbeat(heartbeat_payload(remote_version, "ok"),
                         [completion = std::move(completion)]() mutable {
                             completion(true);
@@ -486,35 +495,129 @@ private:
 
     void read_remote_files(int64_t remote_version, Completion completion) {
         auto self = shared_from_this();
-        run_command({"HGETALL", std::string(kFilesKey)},
+        run_command({"HGETALL", config_history::snapshot_key(remote_version)},
             [self, remote_version, completion = std::move(completion)](
                 Reply files_reply) mutable {
                 if (!files_reply.ok) {
-                    self->warn_limited("ConfigSync HGETALL failed: " + files_reply.error);
+                    self->warn_limited(
+                        "ConfigSync history HGETALL failed: " + files_reply.error);
                     completion(false);
                     return;
                 }
                 auto remote_files = parse_hgetall(files_reply);
                 if (!remote_files) {
-                    LOG_ERROR("ConfigSync HGETALL returned malformed field/value list");
+                    LOG_ERROR("ConfigSync history HGETALL returned malformed data");
                     completion(false);
                     return;
                 }
-                self->verify_remote_version(
-                    remote_version,
-                    std::make_shared<std::map<std::string, std::string>>(
-                        std::move(*remote_files)),
-                    std::move(completion));
+                auto files = std::make_shared<std::map<std::string, std::string>>(
+                    std::move(*remote_files));
+                if (files->empty()) {
+                    self->handle_missing_snapshot(
+                        remote_version, std::move(completion));
+                    return;
+                }
+                self->verify_snapshot_hash(
+                    remote_version, std::move(files), "", std::move(completion));
             });
+    }
+
+    void handle_missing_snapshot(int64_t remote_version, Completion completion) {
+        if (cfg_.history.read_mode == "compat") {
+            warn_limited("ConfigSync history snapshot missing in compat mode, version=" +
+                std::to_string(remote_version));
+            read_current_mirror(remote_version, false, std::move(completion));
+            return;
+        }
+        read_current_mirror(remote_version, true, std::move(completion));
+    }
+
+    void read_current_mirror(
+        int64_t remote_version, bool require_meta_hash, Completion completion) {
+        auto self = shared_from_this();
+        run_command({"HGETALL", std::string(kFilesKey)},
+            [self, remote_version, require_meta_hash,
+             completion = std::move(completion)](Reply reply) mutable {
+                if (!reply.ok) {
+                    self->record_history_failure(remote_version,
+                        "history_snapshot_missing_mirror_read_failed",
+                        std::move(completion));
+                    return;
+                }
+                auto mirror = parse_hgetall(reply);
+                if (!mirror || mirror->empty()) {
+                    self->record_history_failure(remote_version,
+                        "history_snapshot_and_mirror_missing",
+                        std::move(completion));
+                    return;
+                }
+                auto files = std::make_shared<std::map<std::string, std::string>>(
+                    std::move(*mirror));
+                if (!require_meta_hash) {
+                    self->verify_remote_version(
+                        remote_version, std::move(files), "",
+                        std::move(completion));
+                    return;
+                }
+                self->verify_snapshot_hash(remote_version, std::move(files),
+                    "history_snapshot_missing_fallback", std::move(completion));
+            });
+    }
+
+    void verify_snapshot_hash(
+        int64_t remote_version,
+        std::shared_ptr<std::map<std::string, std::string>> files,
+        std::string fallback_detail,
+        Completion completion) {
+        auto self = shared_from_this();
+        run_command({"HGET", std::string(config_history::kMetaKey),
+                     std::to_string(remote_version)},
+            [self, remote_version, files = std::move(files),
+             fallback_detail = std::move(fallback_detail),
+             completion = std::move(completion)](Reply reply) mutable {
+                if (!reply.ok || reply.type != "string") {
+                    self->record_history_failure(remote_version,
+                        "history_snapshot_meta_missing", std::move(completion));
+                    return;
+                }
+                auto expected = config_history::json_string_field(
+                    reply.str, "content_sha256");
+                auto actual = config_history::content_sha256(*files);
+                if (!expected || !actual || *expected != *actual) {
+                    self->record_history_failure(remote_version,
+                        "history_snapshot_hash_mismatch", std::move(completion));
+                    return;
+                }
+                self->verify_remote_version(remote_version, std::move(files),
+                    std::move(fallback_detail), std::move(completion));
+            });
+    }
+
+    void record_history_failure(
+        int64_t remote_version, std::string detail, Completion completion) {
+        State state = load_state(config_base_);
+        state.exists = true;
+        state.status = "partial";
+        state.failures["history_snapshot"] = detail;
+        if (!write_state(config_base_, state)) {
+            LOG_ERROR("ConfigSync failed to persist history partial state");
+        }
+        std::map<std::string, std::string> failures{
+            {"history_snapshot", std::move(detail)}
+        };
+        heartbeat(heartbeat_payload(remote_version, "partial", &failures),
+            [completion = std::move(completion)]() mutable { completion(false); });
     }
 
     void verify_remote_version(
         int64_t remote_version,
         std::shared_ptr<std::map<std::string, std::string>> remote_files,
+        std::string forced_partial_detail,
         Completion completion) {
         auto self = shared_from_this();
         run_command({"GET", std::string(kVersionKey)},
             [self, remote_version, remote_files = std::move(remote_files),
+             forced_partial_detail = std::move(forced_partial_detail),
              completion = std::move(completion)](Reply reply) mutable {
                 auto version_after = read_version_reply(reply);
                 if (version_after.status != VersionRead::Status::Value) {
@@ -533,7 +636,8 @@ private:
                 State state = load_state(self->config_base_);
                 std::map<std::string, std::string> failures;
                 const bool applied = self->apply_remote_files(
-                    remote_version, *remote_files, state, failures);
+                    remote_version, *remote_files, state, failures,
+                    forced_partial_detail);
                 std::string value = applied ?
                     heartbeat_payload(remote_version, "ok") :
                     heartbeat_payload(remote_version, "partial", &failures);
@@ -582,14 +686,9 @@ private:
             }
         }
 
-        std::vector<std::string> args{
-            "EVAL", seed_script(), "3",
-            std::string(kVersionKey), std::string(kFilesKey), std::string(kStagingKey)
-        };
         auto seeded_state = std::make_shared<State>();
-        size_t local_file_count = 0;
+        std::map<std::string, std::string> local_files;
         {
-            std::map<std::string, std::string> local_files;
             std::vector<std::string> errors;
             if (!collect_local_managed_files(config_base_, local_files, errors)) {
                 for (const auto& err : errors) {
@@ -602,14 +701,44 @@ private:
             seeded_state->exists = true;
             seeded_state->synced_version = 1;
             seeded_state->status = "ok";
-            local_file_count = local_files.size();
             for (const auto& [name, content] : local_files) {
-                args.push_back(name);
-                args.push_back(content);
                 seeded_state->managed_files[name] = content_hash(content);
                 seeded_state->last_ok[name] = seeded_state->managed_files[name];
             }
         }
+        config_history::SnapshotInfo snapshot_info;
+        if (auto error = config_history::validate_snapshot(
+                local_files, cfg_.history, snapshot_info, false)) {
+            LOG_ERROR("ConfigSync seed refused: ", *error);
+            completion(false);
+            return;
+        }
+        if (local_files.empty() && cfg_.history.read_mode == "required") {
+            LOG_ERROR("ConfigSync seed refused: required history mode cannot publish "
+                "an empty snapshot");
+            completion(false);
+            return;
+        }
+        const int64_t timestamp = static_cast<int64_t>(std::time(nullptr));
+        std::vector<std::string> args{
+            "EVAL", seed_script(), "7",
+            std::string(kVersionKey), std::string(kFilesKey), std::string(kStagingKey),
+            std::string(config_history::kMetaKey),
+            std::string(config_history::kIndexKey),
+            config_history::snapshot_key(1),
+            std::string(config_history::kSnapshotStagingKey),
+            config_history::metadata_json(
+                1, 0, timestamp, machine_name(), "seed",
+                "initial configuration seed", snapshot_info),
+            std::to_string(cfg_.history.max_files),
+            std::to_string(cfg_.history.max_file_bytes),
+            std::to_string(cfg_.history.max_snapshot_bytes)
+        };
+        for (const auto& [name, content] : local_files) {
+            args.push_back(name);
+            args.push_back(content);
+        }
+        const size_t local_file_count = local_files.size();
         auto self = shared_from_this();
         run_command(std::move(args),
             [self, seeded_state = std::move(seeded_state), local_file_count,
@@ -677,7 +806,8 @@ private:
     bool apply_remote_files(int64_t version,
                             const std::map<std::string, std::string>& remote_files,
                             const State& previous_state,
-                            std::map<std::string, std::string>& failures) {
+                            std::map<std::string, std::string>& failures,
+                            const std::string& forced_partial_detail = {}) {
         State next = previous_state;
         next.status = "partial";
         next.failures.clear();
@@ -740,13 +870,22 @@ private:
         State clean;
         clean.exists = true;
         clean.synced_version = version;
-        clean.status = "ok";
+        clean.status = forced_partial_detail.empty() ? "ok" : "partial";
         for (const auto& [name, content] : remote_files) {
             clean.managed_files[name] = content_hash(content);
             clean.last_ok[name] = clean.managed_files[name];
         }
+        if (!forced_partial_detail.empty()) {
+            clean.failures["history_snapshot"] = forced_partial_detail;
+        }
         if (!write_state(config_base_, clean)) {
             LOG_ERROR("ConfigSync failed to write ok state");
+            return false;
+        }
+        if (!forced_partial_detail.empty()) {
+            failures = clean.failures;
+            LOG_ERROR("ConfigSync applied verified mirror fallback for version ",
+                version, ", snapshot remains unhealthy");
             return false;
         }
         LOG_INFO("ConfigSync applied version ", version, ", files=", remote_files.size());
@@ -1064,22 +1203,7 @@ private:
     }
 
     static std::string seed_script() {
-        return R"(
-if redis.call('TYPE', KEYS[1]).ok ~= 'none' then return 0 end
-local files_type = redis.call('TYPE', KEYS[2]).ok
-if files_type ~= 'hash' and files_type ~= 'none' then return -3 end
-if (#ARGV) % 2 ~= 0 then return -2 end
-if #ARGV == 0 then
-  redis.call('DEL', KEYS[2])
-  redis.call('SET', KEYS[1], 1)
-  return 1
-end
-redis.call('DEL', KEYS[3])
-redis.call('HSET', KEYS[3], unpack(ARGV))
-redis.call('RENAME', KEYS[3], KEYS[2])
-redis.call('SET', KEYS[1], 1)
-return 1
-)";
+        return config_history::seed_script();
     }
 
     asio::io_context& ioc_;

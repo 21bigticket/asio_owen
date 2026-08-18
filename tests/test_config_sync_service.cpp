@@ -125,7 +125,21 @@ ConfigSyncConfig sync_config() {
     cfg.machine_name = "test-machine";
     cfg.first_pull = "async";
     cfg.first_pull_timeout_ms = 3000;
+    cfg.history.read_mode = "compat";
     return cfg;
+}
+
+std::string snapshot_meta(
+    const std::map<std::string, std::string>& files) {
+    auto hash = config_history::content_sha256(files);
+    if (!hash) throw std::runtime_error("failed to hash test snapshot");
+    return "{\"content_sha256\":\"" + *hash + "\"}";
+}
+
+Reply snapshot_meta_reply(
+    std::initializer_list<std::pair<const std::string, std::string>> files) {
+    return string_reply(snapshot_meta(
+        std::map<std::string, std::string>(files)));
 }
 
 AppConfig app_config() {
@@ -134,7 +148,8 @@ AppConfig app_config() {
     return cfg;
 }
 
-bool run_sync_once(const std::filesystem::path& base, FakeRedis& redis) {
+bool run_sync_once(const std::filesystem::path& base, FakeRedis& redis,
+                   ConfigSyncConfig cfg = sync_config()) {
     asio::io_context ioc;
     ConfigSyncService::Command command =
         [&ioc, &redis](std::vector<std::string> args,
@@ -146,7 +161,7 @@ bool run_sync_once(const std::filesystem::path& base, FakeRedis& redis) {
                 });
         };
     auto service = std::make_shared<ConfigSyncService>(
-        ioc, std::move(command), base, sync_config(), app_config());
+        ioc, std::move(command), base, std::move(cfg), app_config());
 
     bool result = false;
     bool completed = false;
@@ -170,6 +185,14 @@ TEST(ConfigSyncService, ParsesConfigSection) {
         "machine_name = node-a\n"
         "first_pull = blocking\n"
         "first_pull_timeout_ms = 1234\n"
+        "[config_history]\n"
+        "read_mode = COMPAT\n"
+        "retention_versions = 12\n"
+        "max_snapshot_bytes = 9999999\n"
+        "max_file_bytes = 9999999\n"
+        "history_page_size = 49\n"
+        "history_page_size_max = 7\n"
+        "gc_interval_sec = 1\n"
         "[admin]\n"
         "admin = pbkdf2_sha256$100000$YXNpb19vd2VuX2FkbWlu$FQidl7NTJAglmXo5_SZL7LC2T_ikCZhweAE8Wg6FIPI\n"
         "jwt_private_key = jwt_keys/admin-private-key.pem\n"
@@ -185,6 +208,13 @@ TEST(ConfigSyncService, ParsesConfigSection) {
     EXPECT_EQ(app.config_sync.machine_name, "node-a");
     EXPECT_EQ(app.config_sync.first_pull, "blocking");
     EXPECT_EQ(app.config_sync.first_pull_timeout_ms, 1234);
+    EXPECT_EQ(app.config_sync.history.read_mode, "compat");
+    EXPECT_EQ(app.config_sync.history.retention_versions, 12);
+    EXPECT_EQ(app.config_sync.history.max_snapshot_bytes, 512u * 1024u);
+    EXPECT_EQ(app.config_sync.history.max_file_bytes, 128u * 1024u);
+    EXPECT_EQ(app.config_sync.history.history_page_size, 7u);
+    EXPECT_EQ(app.config_sync.history.history_page_size_max, 7u);
+    EXPECT_EQ(app.config_sync.history.gc_interval_sec, 10);
     ASSERT_EQ(app.config_sync.admin.accounts.size(), 1u);
     EXPECT_EQ(app.config_sync.admin.accounts[0].username, "admin");
     EXPECT_EQ(app.config_sync.admin.jwt_private_key, "jwt_keys/admin-private-key.pem");
@@ -205,6 +235,8 @@ TEST(ConfigSyncService, RejectsNeverSyncRedisAndReservedAdminRules) {
     EXPECT_FALSE(ConfigSyncService::validate_managed_file(
         "20-sync.ini", "[config_sync]\nenabled = true\n").ok);
     EXPECT_FALSE(ConfigSyncService::validate_managed_file(
+        "20-history.ini", "[config_history]\nread_mode = compat\n").ok);
+    EXPECT_FALSE(ConfigSyncService::validate_managed_file(
         "31-auth.ini", "[auth_whitelist]\npath = /admin\n").ok);
     EXPECT_FALSE(ConfigSyncService::validate_managed_file(
         "32-path_blacklist.ini", "[path_blacklist]\n/api/admin/ =\n").ok);
@@ -222,8 +254,9 @@ TEST(ConfigSyncService, EmptyManagedSetCanSeedNewMachine) {
     redis.handler = [](const std::vector<std::string>& args) {
         if (args.front() == "GET") return nil_reply();
         if (args.front() == "EVAL") {
-            EXPECT_EQ(args.size(), 6u);
-            EXPECT_NE(args[1].find("if #ARGV == 0"), std::string::npos);
+            EXPECT_EQ(args.size(), 14u);
+            EXPECT_EQ(args[2], "7");
+            EXPECT_NE(args[1].find("if file_count == 0"), std::string::npos);
             return integer_reply(1);
         }
         if (args.front() == "HSET") return integer_reply(1);
@@ -240,6 +273,65 @@ TEST(ConfigSyncService, EmptyManagedSetCanSeedNewMachine) {
     EXPECT_EQ(state.status, "ok");
     EXPECT_TRUE(state.managed_files.empty());
     EXPECT_TRUE(state.last_ok.empty());
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, RequiredModeRejectsEmptyInitialSnapshot) {
+    auto base = make_temp_base("required_empty_seed");
+    write_never_sync_files(base);
+
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return nil_reply();
+        return error_reply("unexpected command " + args.front());
+    };
+    auto cfg = sync_config();
+    cfg.history.read_mode = "required";
+
+    EXPECT_FALSE(run_sync_once(base, redis, std::move(cfg)));
+    EXPECT_EQ(redis.count("EVAL"), 0u);
+    EXPECT_FALSE(ConfigSyncService::load_state(base).exists);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, RequiredModeSeedsLocalDefaultsAsVersionOneHistory) {
+    auto base = make_temp_base("required_local_seed");
+    write_never_sync_files(base);
+    const std::string content =
+        "[upstream]\nzebra-config = 127.0.0.1:30001\n";
+    write_file(base / "config.d" / "20-upstream.ini", content);
+
+    FakeRedis redis;
+    redis.handler = [&content](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return nil_reply();
+        if (args.front() == "EVAL") {
+            EXPECT_EQ(args[2], "7");
+            EXPECT_EQ(args[3], "asio_owen:config:version");
+            EXPECT_EQ(args[4], "asio_owen:config:files");
+            EXPECT_EQ(args[8], "asio_owen:config:history:1");
+            EXPECT_NE(args[10].find("\"action\":\"seed\""),
+                std::string::npos);
+            EXPECT_EQ(args[14], "20-upstream.ini");
+            EXPECT_EQ(args[15], content);
+            return integer_reply(1);
+        }
+        if (args.front() == "HSET") return integer_reply(1);
+        return error_reply("unexpected command " + args.front());
+    };
+    auto cfg = sync_config();
+    cfg.history.read_mode = "required";
+
+    EXPECT_TRUE(run_sync_once(base, redis, std::move(cfg)));
+    auto state = ConfigSyncService::load_state(base);
+    EXPECT_TRUE(state.exists);
+    EXPECT_EQ(state.synced_version, 1);
+    EXPECT_EQ(state.status, "ok");
+    ASSERT_EQ(state.managed_files.size(), 1u);
+    EXPECT_EQ(state.managed_files.count("20-upstream.ini"), 1u);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
+    EXPECT_EQ(redis.count("HSET"), 1u);
 
     std::filesystem::remove_all(base);
 }
@@ -328,6 +420,11 @@ TEST(ConfigSyncService, VersionDoubleReadMismatchDoesNotWriteFiles) {
                 "[upstream]\nzebra = 127.0.0.1:30001\n"
             });
         }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+            });
+        }
         return error_reply("unexpected command " + args.front());
     };
 
@@ -359,6 +456,12 @@ TEST(ConfigSyncService, BadManagedFileWritesPartialWithoutVersionAdvance) {
                 "[upstream]\nzebra = 127.0.0.1:30001\n",
                 "32-path_blacklist.ini",
                 "[path_blacklist]\n/api/admin/ =\n"
+            });
+        }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"},
+                {"32-path_blacklist.ini", "[path_blacklist]\n/api/admin/ =\n"}
             });
         }
         if (args.front() == "HSET") {
@@ -405,6 +508,12 @@ TEST(ConfigSyncService, AdminAndConfigSyncSectionsWritePartialWithoutFiles) {
                 "[config_sync]\nenabled = true\n"
             });
         }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-admin.ini", "[admin]\ninsecure_no_auth = true\n"},
+                {"21-config-sync.ini", "[config_sync]\nenabled = true\n"}
+            });
+        }
         if (args.front() == "HSET") {
             EXPECT_NE(args[3].find("|partial|"), std::string::npos);
             EXPECT_NE(args[3].find("20-admin.ini"), std::string::npos);
@@ -427,7 +536,7 @@ TEST(ConfigSyncService, AdminAndConfigSyncSectionsWritePartialWithoutFiles) {
     std::filesystem::remove_all(base);
 }
 
-TEST(ConfigSyncService, EmptyRemoteSetDoesNotDeleteExistingManagedFiles) {
+TEST(ConfigSyncService, MissingHistoryAndMirrorDoNotDeleteExistingManagedFiles) {
     auto base = make_temp_base("empty_remote_guard");
     write_never_sync_files(base);
     const std::string upstream = "[upstream]\nzebra = 127.0.0.1:30001\n";
@@ -452,7 +561,7 @@ TEST(ConfigSyncService, EmptyRemoteSetDoesNotDeleteExistingManagedFiles) {
         if (args.front() == "HGETALL") return array_reply({});
         if (args.front() == "HSET") {
             EXPECT_NE(args[3].find("|partial|"), std::string::npos);
-            EXPECT_NE(args[3].find("remote_files"), std::string::npos);
+            EXPECT_NE(args[3].find("history_snapshot"), std::string::npos);
             return integer_reply(1);
         }
         return error_reply("unexpected command " + args.front());
@@ -465,7 +574,7 @@ TEST(ConfigSyncService, EmptyRemoteSetDoesNotDeleteExistingManagedFiles) {
     auto state = ConfigSyncService::load_state(base);
     EXPECT_EQ(state.synced_version, 1);
     EXPECT_EQ(state.status, "partial");
-    EXPECT_TRUE(state.failures.count("remote_files"));
+    EXPECT_TRUE(state.failures.count("history_snapshot"));
     EXPECT_EQ(state.last_ok, previous.last_ok);
 
     std::filesystem::remove_all(base);
@@ -493,6 +602,11 @@ TEST(ConfigSyncService, CleanSyncAdvancesVersionAndDeletesStaleFiles) {
             return array_reply({
                 "20-upstream.ini",
                 "[upstream]\nzebra = 127.0.0.1:30002\n"
+            });
+        }
+        if (args.front() == "HGET") {
+            return snapshot_meta_reply({
+                {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30002\n"}
             });
         }
         if (args.front() == "HSET") {
