@@ -58,7 +58,8 @@ public:
 
     ConfigSyncService(asio::io_context& ioc, RedisPool& redis,
                       std::filesystem::path config_base,
-                      ConfigSyncConfig cfg, AppConfig running_app_cfg)
+                      ConfigSyncConfig cfg, AppConfig running_app_cfg,
+                      asio::thread_pool* file_workers = nullptr)
         : ConfigSyncService(
               ioc,
               [&ioc, &redis](std::vector<std::string> args,
@@ -76,17 +77,20 @@ public:
                       (*done)(exception_reply(std::current_exception()));
                   }
               },
-              std::move(config_base), std::move(cfg), std::move(running_app_cfg)) {}
+              std::move(config_base), std::move(cfg), std::move(running_app_cfg),
+              file_workers) {}
 
     ConfigSyncService(asio::io_context& ioc, Command command,
                       std::filesystem::path config_base,
-                      ConfigSyncConfig cfg, AppConfig running_app_cfg)
+                      ConfigSyncConfig cfg, AppConfig running_app_cfg,
+                      asio::thread_pool* file_workers = nullptr)
         : ioc_(ioc),
           timer_(ioc),
           command_(std::move(command)),
           config_base_(std::move(config_base)),
           cfg_(normalize_config(std::move(cfg))),
-          running_app_cfg_(std::move(running_app_cfg)) {}
+          running_app_cfg_(std::move(running_app_cfg)),
+          file_workers_(file_workers) {}
 
     void start() {
         if (!cfg_.enabled || cfg_.sync_interval_sec <= 0) return;
@@ -100,6 +104,8 @@ public:
             timer_.cancel();
         } catch (...) {
         }
+
+        if (ioc_.stopped()) return;
 
         std::unique_lock lock(in_flight_mu_);
         const auto wait_ms = std::chrono::milliseconds(effective_drain_timeout_ms());
@@ -339,20 +345,35 @@ public:
         auto path = state_path(config_base);
         auto tmp = path;
         tmp += ".tmp";
+
+        std::ostringstream serialized;
+        serialized << "synced_version=" << state.synced_version << "\n";
+        serialized << "status=" << state.status << "\n";
+        for (const auto& [name, hash] : state.managed_files) {
+            serialized << "file." << name << "=" << hash << "\n";
+        }
+        for (const auto& [name, hash] : state.last_ok) {
+            serialized << "last_ok." << name << "=" << hash << "\n";
+        }
+        for (const auto& [name, reason] : state.failures) {
+            serialized << "failure." << name << "=" << reason << "\n";
+        }
+        const std::string content = serialized.str();
+
+        {
+            std::ifstream current(path, std::ios::binary);
+            if (current.is_open()) {
+                std::ostringstream existing;
+                existing << current.rdbuf();
+                if (current.good() || current.eof()) {
+                    if (existing.str() == content) return true;
+                }
+            }
+        }
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out.is_open()) return false;
-            out << "synced_version=" << state.synced_version << "\n";
-            out << "status=" << state.status << "\n";
-            for (const auto& [name, hash] : state.managed_files) {
-                out << "file." << name << "=" << hash << "\n";
-            }
-            for (const auto& [name, hash] : state.last_ok) {
-                out << "last_ok." << name << "=" << hash << "\n";
-            }
-            for (const auto& [name, reason] : state.failures) {
-                out << "failure." << name << "=" << reason << "\n";
-            }
+            out << content;
         }
         return std::rename(tmp.string().c_str(), path.string().c_str()) == 0;
     }
@@ -442,7 +463,13 @@ private:
         }
         in_flight_cv_.notify_all();
         if (running_.load(std::memory_order_acquire)) {
-            schedule_after(std::chrono::seconds(cfg_.sync_interval_sec));
+            auto self = shared_from_this();
+            asio::post(ioc_, [self]() {
+                if (self->running_.load(std::memory_order_acquire)) {
+                    self->schedule_after(
+                        std::chrono::seconds(self->cfg_.sync_interval_sec));
+                }
+            });
         }
     }
 
@@ -945,30 +972,56 @@ private:
     }
 
     void run_command(std::vector<std::string> args, CommandCompletion completion) {
+        auto self = shared_from_this();
         auto done = std::make_shared<CommandCompletion>(std::move(completion));
         auto callback_started = std::make_shared<std::atomic<bool>>(false);
         try {
             command_(std::move(args),
-                [done, callback_started](Reply reply) mutable {
-                    callback_started->store(true, std::memory_order_release);
-                    try {
-                        (*done)(std::move(reply));
-                    } catch (const std::exception& e) {
-                        try {
-                            LOG_ERROR("ConfigSync command callback failed: ", e.what());
-                        } catch (...) {
-                        }
-                    } catch (...) {
-                        try {
-                            LOG_ERROR("ConfigSync command callback failed with unknown exception");
-                        } catch (...) {
-                        }
-                    }
+                [self, done, callback_started](Reply reply) mutable {
+                    self->dispatch_command_completion(
+                        done, callback_started, std::move(reply));
                 });
         } catch (...) {
             if (!callback_started->load(std::memory_order_acquire)) {
-                (*done)(exception_reply(std::current_exception()));
+                self->dispatch_command_completion(
+                    done, callback_started,
+                    exception_reply(std::current_exception()));
             }
+        }
+    }
+
+    void dispatch_command_completion(
+        std::shared_ptr<CommandCompletion> done,
+        std::shared_ptr<std::atomic<bool>> callback_started,
+        Reply reply) {
+        auto invoke =
+            [done = std::move(done),
+             callback_started = std::move(callback_started),
+             reply = std::move(reply)]() mutable {
+                callback_started->store(true, std::memory_order_release);
+                try {
+                    (*done)(std::move(reply));
+                } catch (const std::exception& e) {
+                    try {
+                        LOG_ERROR("ConfigSync command callback failed: ", e.what());
+                    } catch (...) {
+                    }
+                } catch (...) {
+                    try {
+                        LOG_ERROR(
+                            "ConfigSync command callback failed with unknown exception");
+                    } catch (...) {
+                    }
+                }
+            };
+        if (!file_workers_) {
+            invoke();
+            return;
+        }
+        try {
+            asio::post(*file_workers_, invoke);
+        } catch (...) {
+            invoke();
         }
     }
 
@@ -1233,6 +1286,7 @@ private:
     std::filesystem::path config_base_;
     ConfigSyncConfig cfg_;
     AppConfig running_app_cfg_;
+    asio::thread_pool* file_workers_ = nullptr;
     std::atomic<bool> running_{false};
 
     std::mutex in_flight_mu_;

@@ -107,7 +107,7 @@
 | `asio_owen:config:files` | HASH | field=文件名（如 `20-upstream.ini`），value=ini 文本 | 托管文件全集；保存脚本内经 staging key `RENAME` 整体替换，删除文件=新集合无该 field |
 | `asio_owen:config:files:staging` | HASH | 脚本内暂存 | 脚本先在此构建完整文件集，成功后 `RENAME` 到 files；正常态不驻留（每次脚本开头 DEL） |
 | `asio_owen:config:version` | STRING | 十进制整数 | 保存脚本内 `INCR`；单调递增，各机以此判断是否需要拉取 |
-| `asio_owen:config:machines` | HASH | field=**稳定 machine_name**（配置或 hostname，不含 pid），value=`<版本>\|<unix秒>\|<pid>\|<status:ok\|partial>` | 心跳。field 稳定 → 重启复用同一 field 不累积残留；陈旧由页面按 ts 判定；partial 携带失败文件与原因 |
+| `asio_owen:config:machines` | HASH | field=**稳定 machine_name**（配置或 hostname，不含 pid），value=`<版本>\|<unix秒>\|<pid>\|<status:ok\|partial>` | 心跳。field 稳定 → 重启复用同一 field；健康检查按 `machine_ttl_sec` 删除陈旧或格式错误的 field；partial 携带失败文件与原因 |
 | `asio_owen:config:audit` | LIST | JSON 行：`{ts, user, base_version, new_version, files:[...]}` | 保存脚本内 `pcall` 尽力而为写入（LPUSH+LTRIM 200 条）；audit 失败不阻断核心提交（Phase 2） |
 
 **与现有 Redis 的关系**：复用现有 RedisPool（`[redis]` 配置的实例与 db）；`GET`/`HGETALL` 均在只读重试白名单内（redis_pool.hpp:459-473），连接级故障自动换连接重试，天然适合轮询。`EVAL` 属写命令不在重试白名单——对 CAS 语义正好正确（失败由调用方决策）。
@@ -211,16 +211,23 @@ tick():
      │   本周期不播种不同步（注意：此时 TYPE=string，种子脚本会判"已存在"，
      │   必须由本判定拦住），等人工修复
      ├─ v1 < 本地已同步版本 → 忽略 + 告警（防回滚倒灌）
-     ├─ v1 == 本地已同步版本 → 仅刷新心跳(status=ok) → 结束
+     ├─ v1 == 本地已同步版本且本地文件 hash 与 last_ok 一致
+     │   → 刷新心跳(status=ok) → 结束
+     ├─ v1 == 本地已同步版本但本地漂移或 state=partial
+     │   → 继续读取并重放当前版本快照
      └─ v1 > 本地已同步版本 → 继续
-  2. files = HGETALL asio_owen:config:files
+  2. files = HGETALL asio_owen:config:history:<v1>
+     ├─ snapshot 存在 → 校验 meta 中的 content_sha256
+     ├─ required 模式下 snapshot 缺失 → 仅当 config:files 镜像 hash 与 meta
+     │   一致时允许 partial 降级；否则保留本地好版本
+     └─ compat 模式下纯 legacy 状态可读取 config:files，并记录迁移告警
   3. v2 = GET version；v1 ≠ v2 → 放弃本次（读到写方原子替换的跨界快照），
      不写任何文件/状态，下周期重试
      （写方是单脚本原子替换，故任一 HGETALL 结果内部自洽；
        双读只为给文件集钉上正确的版本标签）
-  4. 空远端集保护（v1.4）：若 files 为空，且本地文件系统或状态文件中仍有
+  4. 空远端集保护（v1.4）：若 snapshot/受校验镜像为空，且本地文件系统或状态文件中仍有
      托管文件 → 视为异常，不写不删不推进；状态/心跳 partial，失败项
-     remote_files。空托管集只允许出现在"仅三件套新机器"的种子结果。
+     history_snapshot。空托管集只允许出现在"仅三件套新机器"的种子结果。
   5. 逐文件校验（§6）+ 差异落盘：
      文件名白名单不过 / 含 [redis] 节 / 违反保留路径规则(§6.3)
        → 记入 failed，保留本地旧文件
@@ -349,7 +356,8 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 | `/api/admin/config` | GET | 返回 `{version, files:[{name, content, restart_required}]}`（读 Redis） |
 | `/api/admin/config` | POST | 保存：`{base_version, files:[{name, content}]}` |
 | `/api/admin/config/machines` | GET | 心跳 hash → 各机器 `{machine, version, ts, pid, status}` |
-| `/admin` | GET | 内嵌 HTML 页（登录框 + 机器状态条）。放行：本地 never-sync 的 `12-config-sync.ini` `[auth_whitelist]`（`/admin` + `/api/admin/` 前缀，§5.2）——业务 JWT 对 admin 面退出，授权由 admin handler 用 admin 密钥独立验证（D8）；删掉白名单条目即整体封死 admin 面，操作者自选 |
+| `/api/admin/config/history...`、`/api/admin/config/rollback` | GET/POST | 历史列表、详情、diff、回滚、迁移及显式修复操作；详见历史设计 §8.1 |
+| `/admin`、`/admin/login`、`/admin/settings` | GET | 内嵌登录页与设置页。放行：本地 never-sync 的 `12-config-sync.ini` `[auth_whitelist]`（`/admin` + `/api/admin/` 前缀，§5.2）——业务 JWT 对 admin 面退出，授权由 admin handler 用 admin 密钥独立验证（D8）；删掉白名单条目即整体封死 admin 面，操作者自选 |
 
 **POST 流水线（全部通过才触碰 Redis；最终提交为单个 Lua 原子脚本）**：
 
@@ -368,55 +376,18 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
       UpstreamManager::prepare_reload(cfg, http_pool_config_from(cfg))
    注：upstream 条目为强校验（A14）；[http_pool] 参数仅类型级把关
      （get_int/get_bool 非法值抛错 + 有限 clamp），无语义范围校验
-4. Lua 原子提交（v1.2 强化：前置校验 + staging + RENAME + audit pcall）：
-   KEYS: version, files, audit, staging
-   ARGV: base_version, audit_json, 文件名,内容...
-
-   -- 返回: >0 新版本 | -1 CAS 冲突 | -2 ARGV 错(奇偶/非数字/空集)
-   --       | -3 key 类型异常 | -4 version 内容非数字
-   if (#ARGV - 2) % 2 ~= 0 then return -2 end
-   if #ARGV < 4 then return -2 end        -- 空文件集：API 层已拒，脚本双层拒绝
-   local base = tonumber(ARGV[1])
-   if base == nil then return -2 end
-   local t = redis.call('TYPE', KEYS[1]).ok
-   if t ~= 'string' and t ~= 'none' then return -3 end
-   t = redis.call('TYPE', KEYS[2]).ok
-   if t ~= 'hash' and t ~= 'none' then return -3 end
-   t = redis.call('TYPE', KEYS[3]).ok
-   if t ~= 'list' and t ~= 'none' then return -3 end
-   local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
-   if cur == nil then return -4 end       -- key 是 string 但内容如 "abc"
-   if cur ~= base then return -1 end
-   redis.call('DEL', KEYS[4])
-   redis.call('HSET', KEYS[4], unpack(ARGV, 3, #ARGV))     -- 先建完整集
-   redis.call('RENAME', KEYS[4], KEYS[2])                   -- 原子替换核心状态
-   local newv = redis.call('INCR', KEYS[1])
-   pcall(function()                                          -- audit 尽力而为
-     redis.call('LPUSH', KEYS[3], ARGV[2])
-     redis.call('LTRIM', KEYS[3], 0, 199)
-   end)
-   return newv
-
-   设计要点（"原子执行"不等于"出错回滚"，Redis Lua 后续命令报错时
-   先前的写不回滚，故把报错面消灭在写核心状态之前）：
-   - 三个 key 的 TYPE 前置校验：audit 被误改成 string 这类错误在
-     任何写发生之前就以 -3 拒绝（需要人工修 key，API 回 500+原因）
-   - **-4 独立错误码（v1.3）**：TYPE=string 但内容非数字（如 "abc"）时
-     tonumber 为 nil——v1.2 写法会落入 `nil ~= base` 被误报成 CAS 冲突
-     （-1/409），管理员会无休止重试一个永远"冲突"的假象；
-     -4 → 500 + "version key 内容非数字，需人工修复"，与冲突彻底区分
-   - **空文件集双层拒绝（v1.3）**：`#ARGV < 4 → -2`——API 层已拒空集，
-     脚本侧兜底；空托管集只可能合法来自种子脚本（§5.5 显式分支），
-     保存永远不允许清空全部托管文件
-   - staging 先建完整文件集再 RENAME：files 永远不会出现半写态
-     （DEL+逐条 HSET 的旧写法在 OOM 中断时会留半写 hash）
-   - audit 用 pcall 且排在核心状态之后：audit 失败不阻断提交
-   - 残余（可接受）：OOM 类错误若发生在 RENAME 之后、INCR 之前，
-     状态为 "files 新 / version 旧"——对读者不可见（版本门未动），
-     且管理员 base_version 仍有效、重试即自愈；危险方向
-     "version 新 / files 旧" 在此写法下不可能出现
-   - API 返回码映射：-1 → 409（另行 GET 当前 version 回给页面）；
-     -2/-3/-4 → 500 + 原因；EVAL 不在重试白名单，正合 CAS 语义
+4. Lua 原子提交（当前历史版实现）：
+   - 9 个 key：version、当前镜像、audit、当前镜像 staging、history meta、
+     history index、新版本 snapshot、新 snapshot staging、当前版本 snapshot。
+   - ARGV 包含 base_version、audit、meta、容量上限和文件名/内容对。
+   - 写前校验全部 key 类型、容量上限、当前 snapshot/meta/index 三元组、
+     CAS base_version 及新版本不存在；任何核心写发生前先 fail-closed。
+   - 先用 staging+RENAME 发布不可变 snapshot 及当前镜像，再写 meta/index，
+     最后 INCR version；audit 仍以 pcall 尽力而为。
+   - 返回码：`>0` 新版本；`-1` CAS 冲突；`-2` 参数错误；`-3` key 类型错误；
+     `-4` version 非数字；`-5` 当前历史不一致；`-6` 目标历史已存在；
+     `-7` 发布版本异常；`-8` 快照超过容量限制。`-1/-5/-6` 映射 409，
+     `-8` 映射 400，其余映射 500；EVAL 不做命令级重试。
 5. 本机同样走轮询路径收敛（写侧与同步侧统一，无特权快路径）
 ```
 
@@ -425,10 +396,10 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 > v1.2-v1.4 实现信任业务公钥验证的 principal（`ctx.principal`）+ `role:admin`——但现有 JWT 是**业务 token**（pixiu 体系签发，网关只持公钥），业务系统的角色词汇表与网关管理角色无关：任何业务 token 只要 claims 撞上 `role:admin`/`roles:["admin"]` 即可改写网关全部配置。v1.5 起业务凭证对 admin 面一律无效。
 
 1. **独立密钥对与 issuer**：`jwt_keys/admin-private-key.pem`（仅签发）+ `jwt_keys/admin-public-key.pem`（验证），issuer 常量 `asio-owen-admin`（与业务 `pixiu-gateway` 不同——业务 token 即使角色撞名，issuer/签名也不匹配 → 401）。admin key 路径相对 `config_base`（server 所在目录）解析；验证直接复用 `JWTAuth`（RS256 裸 EVP + claims 提取，jwt_auth.hpp:142/167/322-353）；**签发**镜像 `verify_rs256` 的裸 EVP 模式实现 `sign_rs256`（EVP_PKEY 启动加载一次 + EVP_DigestSign）——不用 jwt-cpp 的 PEM 签名路径（其 PEM 处理在 macOS Homebrew OpenSSL 3.x 有已知问题，A25）
-2. **登录端点 `POST /api/admin/login`**：账号在 never-sync 本地文件 `[admin]` 节（§5.2），PBKDF2-SHA256 口令哈希（`PKCS5_PBKDF2_HMAC`，OpenSSL::Crypto 已链接；格式内嵌迭代数，默认 100k）+ `CRYPTO_memcmp` 恒时比较 + 未知用户/密码错统一 401；每次登录尝试重读本地 admin 配置（登录低频，无热加载需求），admin API 鉴权也每请求重读同一份本地配置，保证账号/密钥/逃生口语义一致
-3. **签发 token**：`iss=asio-owen-admin, sub/name=<username>, roles=["admin"], exp=now+token_ttl_min, iat`；页面登录框获取后存 localStorage（原"token 粘贴框"保留为调试入口）。口令轮换不会让已签发的 stateless token 立即失效；立即失效需轮换 admin 密钥对或等待 `exp`
+2. **登录端点 `POST /api/admin/login`**：账号在 never-sync 本地文件 `[admin]` 节（§5.2），PBKDF2-SHA256 口令哈希（`PKCS5_PBKDF2_HMAC`，OpenSSL::Crypto 已链接；格式内嵌迭代数，默认 100k）+ `CRYPTO_memcmp` 恒时比较 + 未知用户/密码错统一 401；口令校验和签名进入 2 线程专用 worker，最多 16 个在途任务，超限返回 429；失败按客户端 IP 锁定，轮换用户名不能绕过；每次登录尝试重读本地 admin 配置（登录低频，无热加载需求），admin API 鉴权也每请求重读同一份本地配置，保证账号/密钥/逃生口语义一致
+3. **签发 token**：`iss=asio-owen-admin, sub/name=<username>, roles=["admin"], exp=now+token_ttl_min, iat, av=<账号口令哈希版本>`；页面登录框获取后存 localStorage（原"token 粘贴框"保留为调试入口）。每次鉴权比较本地账号计算出的 `av`，因此改密或删除账号会立即撤销该账号旧 token；轮换密钥对仍可全局撤销全部 token
 4. **authorize_admin 新判定序**：本地 admin 配置不可读取 → **503 fail-closed**；`insecure_no_auth=true` → 放行（实验室逃生口，与业务 `jwt_disabled` 脱钩）；非 insecure 且未配置（无账号或无密钥）→ **503 fail-closed**；Bearer 缺失/验证失败 → **401**；无 admin 角色 → 403（自签 token 必有 role，纯防御）。`ctx.principal`（业务链路管道）保留但**不再用于 admin 授权**
-5. **防爆破**（叠加在现有 IP/全局限流之上，A24）：内存锁定表 `<(client_ip, username), {失败数, 锁定截止}>`，5 次失败锁 15 分钟，成功清零，容量上限 + 过期清扫；`client_ip` 复用安全链路 real-IP（XFF+trusted proxies）——`CheckResult` 增加 `client_ip` 字段（check_snapshot 已算出，暴露即可），client_session 存入 `ctx.client_ip`（principal 同模式）；登录成功/失败 LOG（用户名+IP）进审计
+5. **防爆破**（叠加在现有 IP/全局限流之上，A24）：内存锁定表 `<client_ip, {失败数, 锁定截止}>`，5 次失败锁 15 分钟，成功清零，容量上限 + 过期清扫；因此轮换用户名不能绕过锁定。`client_ip` 复用安全链路 real-IP（XFF+trusted proxies）；登录成功/失败 LOG（用户名+IP）进审计
 6. **业务链路对 admin 面退出**：本地 `[auth_whitelist]` 放行 `/admin` 与 `/api/admin/` 前缀（§5.2）——业务 JWT 不再拦在 admin handler 之前；托管文件仍被 §6.3 保留路径规则禁止触碰这些条目；限流/IP 黑名单在白名单之前照常生效
 7. **运维配套**（根目录，沿用 bench.sh 惯例）：`gen_admin_keys.sh`（openssl 生成密钥对，私钥 chmod 600）、`hash_admin_password.py`（python3 stdlib pbkdf2，无 pip 依赖）
 
@@ -529,7 +500,7 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 | A24 | 安全链路顺序：IP 黑名单 → **限流** → OPTIONS → **白名单** → JWT → 路径黑名单——白名单路径仍被限流，登录端点天然有 IP/全局限流兜底 | `src/security/security_rules.hpp:246-302` |
 | A25 | jwt-cpp 已链接进主程序（可签名），但其 PEM 处理在 macOS Homebrew OpenSSL 3.x 有已知问题（RS256 验证因此绕开 jwt-cpp 用裸 EVP）——admin token 签发须镜像同模式；`JWTAuth` 类可直接复用做 admin token 验证 | `CMakeLists.txt:97-117, 216-225`；`src/security/jwt_auth.hpp:239-265, 322-353` |
 | A26 | 现有 JWT 为业务 token：公钥自 pixiu/dubbo-go-pixiu 拷入、issuer `pixiu-gateway`、登录端点在业务侧（zebra-passport）——网关公钥-only 是部署现状，非文档化设计；admin 凭证与业务凭证必须分家（D8 依据） | `jwt_keys/README.md:7-8`、`config.d/30-security.ini:10`、`config.d/33-auth_whitelist.ini:16` |
-| A27 | OpenSSL::SSL/Crypto 已 PUBLIC 链接进 core；admin 密钥路径相对 `config_base` 解析，CMake 在 build 阶段拷贝可选 `jwt_keys/` 到 build 目录；业务 JWT 密钥路径仍沿用安全链路既有 CWD 语义 | `CMakeLists.txt`；`src/app/admin/config_admin.hpp:554-563`；`src/security/security_rules.hpp:440-455` |
+| A27 | OpenSSL::SSL/Crypto 已 PUBLIC 链接进 core；admin 密钥路径相对 `config_base` 解析，私钥由部署系统直接放入运行目录且不会在 build 阶段复制；业务 JWT 密钥路径仍沿用安全链路既有 CWD 语义 | `CMakeLists.txt`；`src/app/admin/config_admin.hpp:554-563`；`src/security/security_rules.hpp:440-455` |
 | A28 | 仓库无 tools/ 目录，运维脚本惯例在根目录（bench.sh 等）——admin 密钥生成/口令哈希脚本放根目录 | 仓库根 |
 
 ---
@@ -538,7 +509,7 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 
 - **v1.5.3（2026-08-17）**：GCC 11.4 在 ConfigSyncService 回调化后继续于 `handle_api_admin_config` 复杂协程触发同一 `build_special_member_call` ICE。管理配置 GET 双读、POST CAS/冲突查询及 machines 查询改为普通 `AdminRequestOperation` 回调状态机；HTTP handler 通过 `async_initiate(use_awaitable)` 返回框架所需 awaitable，本身不再是 C++ coroutine。Redis 仍在请求 executor 上 `co_spawn` 既有 `cmd_argv`，不阻塞 io_context。
 - **v1.5.2（2026-08-17）**：Ubuntu 22.04 / GCC 11.4 兼容修订。ConfigSyncService 的复杂 helper coroutine 两次触发 `build_special_member_call, cp/call.c:10200` ICE；按仓库既有 GCC 11 规避经验改为普通回调状态机，仅通过 `co_spawn` 直接调用已验证的 `RedisPool::cmd_argv`，并移除 admin Redis 调用的无意义包装协程、把同步登录逻辑移出协程帧。业务顺序、双读、seed、heartbeat 与生命周期语义不变。
-- **v1.5.1（2026-08-17）**：实现复核修订。①托管文件新增禁止 `[admin]`、`[config_sync]`，与既有 `[redis]` 禁止一起保护配置源与 admin 信任域；API 保存与同步落盘双侧校验 ②`authorize_admin` 与登录端点统一每请求重读本地 admin 配置，消除登录签发与 API 验签的热变更不一致 ③admin key 相对路径改为按 `config_base` 解析，`jwt_keys/` 改 build 阶段拷贝，补充 stateless token 失效边界
+- **v1.5.1（2026-08-17）**：实现复核修订。①托管文件新增禁止 `[admin]`、`[config_sync]`，与既有 `[redis]` 禁止一起保护配置源与 admin 信任域；API 保存与同步落盘双侧校验 ②`authorize_admin` 与登录端点统一每请求重读本地 admin 配置，消除登录签发与 API 验签的热变更不一致 ③admin key 相对路径改为按 `config_base` 解析，私钥由部署系统直接放入运行目录，补充 stateless token 失效边界
 - **v1.5（2026-08-17）**：admin 鉴权重设计（用户指出业务 token 与网关管理凭证是两套体系；选定"完整登录端点"方案）。①新增 D8：admin 独立信任域——独立 RS256 密钥对 + issuer `asio-owen-admin`，业务 JWT 的 token 一律 401，修复 v1.2-v1.4 信任业务公钥 principal 导致的**跨信任域提权**（业务 token 撞名 `role:admin` 即可改网关配置）②§7.1 认证段重写：`POST /api/admin/login`（PBKDF2-SHA256 账号、恒时比较、统一 401、(IP,账号) 5 次锁 15 分钟）、裸 EVP 签发（镜像 verify_rs256，避开 jwt-cpp PEM 已知问题 A25）、`ctx.client_ip` 管道、未配置 503 fail-closed③§5.2：`[config_sync].allow_insecure_admin` 移除，改为 `[admin] insecure_no_auth`（与业务 jwt_disabled 脱钩）；本地白名单增 `/api/admin/` 前缀——业务 JWT 对 admin 面整体退出④§8 Phase 2 列 v1.5 增量与提权回归验收⑤新增 A23-A28。
 - **v1.4（2026-08-16）**：实现评审修订。空远端托管集保护：`HGETALL files` 为空且本地文件系统或状态文件仍有托管文件时，不执行删除、不推进 `synced_version`，写 partial 状态并通过心跳暴露 `remote_files` 失败项；补 rollout 顺序说明，要求首次开启先由满配置机器种子，空托管集仅保留为全新三件套机器的合法种子结果。
 - **v1.3（2026-08-16）**：第三轮评审修订。①种子脚本空托管集分支：`#ARGV==0` 时 staging 从未创建，直接 RENAME 会因 source key 不存在报错中断——显式 `DEL files + SET version 1 + return 1`（仅三件套新机器是合法空集场景）；保存脚本反向加 `#ARGV < 4 → -2` 空集双层拒绝（保存不允许清空全部托管文件）②`/admin` 页面放行策略统一（§5.2/§6.3/§7.1）：本地 never-sync 的 12-config-sync.ini 出厂自带 `[auth_whitelist] path = /admin`，消除 v1.2 中 §6.3（禁托管 whitelist）与 §7.1（"whitelist 放行"）的矛盾；删除该条即连页面一起封③SAVE 脚本新增 -4 invalid_version：version key TYPE=string 但内容非数字时 tonumber 为 nil，v1.2 写法会误报 CAS 冲突（-1/409 假象）；同步侧 §5.4 增加"非数字 → ERROR 不播种不同步"判定（此时 TYPE=string，种子脚本会误判"已存在"，须由该判定拦住）④Phase 1/2 验收项补充对应场景

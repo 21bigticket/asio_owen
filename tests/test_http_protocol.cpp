@@ -90,6 +90,16 @@ TEST(HttpProtocol, UpdateHeaderStateTransferEncodingChunked) {
     EXPECT_FALSE(state.invalid_transfer_encoding);
 }
 
+TEST(HttpProtocol, HeaderNameWhitespaceIsInvalidEvenWhenFramingIsDetected) {
+    HeaderParseState state;
+
+    update_header_state("Transfer-Encoding ", "chunked", state);
+
+    EXPECT_TRUE(state.invalid_header_name);
+    EXPECT_TRUE(state.has_transfer_encoding);
+    EXPECT_TRUE(state.is_chunked);
+}
+
 TEST(HttpProtocol, UpdateHeaderStateTransferEncodingGzipOnly) {
     HeaderParseState state;
     update_header_state("Transfer-Encoding", "gzip", state);

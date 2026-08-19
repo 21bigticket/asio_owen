@@ -31,7 +31,7 @@ The runtime is a **single `asio::io_context` driven by N threads** (N = `std::th
 
 - `HttpServer` accepts with `async_accept` and `co_spawn`s a `handle_connection` coroutine per connection. Each coroutine loops over `async_read_some` to support **HTTP keep-alive** — one TCP connection serves multiple requests.
 - HTTP requests are parsed with `picohttpparser.c/h` (vendored at repo root, compiled into the `server` target).
-- Routes are a flat `unordered_map<string, Handler>` keyed by exact path. Handlers are `asio::awaitable<std::string>(body, path)` and return the JSON body only — the server wraps it in `HTTP/1.1 200 ... Content-Length` regardless of handler outcome, so error codes live inside the JSON envelope (`response.hpp`'s `HttpCode` enum), not in HTTP status.
+- Routes are stored in exact and prefix route tables. Handlers receive a mutable `HttpContext`, return `asio::awaitable<void>`, and set the response body, headers, and real HTTP status. JSON responses also retain the application-level code from `response.hpp`; transport failures and authorization errors use matching HTTP status lines such as 401, 429, and 502.
 
 ### DB layer (`src/db/`)
 

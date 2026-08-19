@@ -50,14 +50,17 @@ add_custom_command(
 )
 add_custom_target(asio_owen_generated_assets
     DEPENDS ${ASIO_OWEN_ADMIN_LOGIN_HEADER} ${ASIO_OWEN_ADMIN_SETTINGS_HEADER})
-add_custom_target(asio_owen_runtime_files
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_DIR=${PROJECT_SOURCE_DIR}/jwt_keys
-        -DDEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/jwt_keys
-        -P ${PROJECT_SOURCE_DIR}/cmake/copy_optional_dir.cmake
-    COMMENT "Copying optional runtime jwt_keys"
-    VERBATIM
-)
+
+# The business JWT verification key is public and remains part of the local
+# runtime bundle. Admin signing/verification keys are deployment-owned and are
+# deliberately never copied from the source tree.
+if(EXISTS ${PROJECT_SOURCE_DIR}/jwt_keys/public-key.pem)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/jwt_keys)
+    configure_file(
+        ${PROJECT_SOURCE_DIR}/jwt_keys/public-key.pem
+        ${CMAKE_CURRENT_BINARY_DIR}/jwt_keys/public-key.pem
+        COPYONLY)
+endif()
 
 # ==================== 通用编译选项 ====================
 add_library(asio_owen_options INTERFACE)
@@ -255,7 +258,7 @@ add_executable(server
 )
 target_link_libraries(server PRIVATE asio_owen_core)
 target_compile_options(server PRIVATE $<$<CONFIG:Release>:-g>)
-add_dependencies(server asio_owen_generated_assets asio_owen_runtime_files)
+add_dependencies(server asio_owen_generated_assets)
 
 # 复制 config.d/ 目录（如果存在），排除本地覆盖文件
 if(EXISTS ${PROJECT_SOURCE_DIR}/config.d)

@@ -93,3 +93,23 @@ TEST(ProxyForwarder, RejectsControlCharInHeaderName) {
         "POST", "/config.ConfigService/Get", cfg, ctx, request_header_state);
     EXPECT_TRUE(request.empty());
 }
+
+TEST(ProxyForwarder, WhitespaceTransferEncodingCannotSurviveChunkDecoding) {
+    UpstreamManager::UpstreamConfig cfg{"127.0.0.1", 30001};
+    HttpContext ctx;
+    ctx.body = "decoded";
+    ctx.headers = {
+        {"Transfer-Encoding ", "chunked"},
+        {"Content-Length", "99"}
+    };
+    HeaderParseState request_header_state;
+    update_header_state(
+        "Transfer-Encoding ", "chunked", request_header_state);
+
+    auto request = build_proxy_request(
+        "POST", "/config.ConfigService/Get", cfg, ctx, request_header_state);
+
+    EXPECT_EQ(request.find("Transfer-Encoding"), std::string::npos) << request;
+    EXPECT_NE(request.find("Content-Length: 7\r\n"), std::string::npos) << request;
+    EXPECT_EQ(request.find("Content-Length: 99"), std::string::npos) << request;
+}

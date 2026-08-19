@@ -67,8 +67,9 @@ auto_migrate_legacy = true
 
 ### 2.3 Admin 凭证
 
-- 上线前必须替换仓库示例中的默认 `admin/admin` 账号口令。
-- 使用 `hash_admin_password.py` 生成强口令哈希。
+- 仓库默认不启用管理员账号；上线前使用 `hash_admin_password.py <username>` 交互式生成强口令哈希，并仅写入本地覆盖配置（口令不会出现在进程参数中）。
+- admin 私钥必须在运行目录挂载或生成，构建过程不会复制私钥目录。
+- Ubuntu 的 `rebuild_deploy.sh` 默认在 `/etc/asio-owen/admin` 首次生成并持久化 Admin 密钥，同时交互创建固定 `admin` 账号；后续部署复用同一凭证，并在 candidate 的 `99-local.ini` 中注入账号及密钥绝对路径，不复制私钥。可通过 `ADMIN_SECRET_DIR` 和 `ADMIN_USERNAME` 修改固定目录与账号名。
 - 所有 Pod 必须挂载同一套 admin 公私钥和相同账号配置。
 - 私钥权限保持 `600`，不得写入镜像、日志或 Git。
 - 若各 Pod 使用不同密钥，登录 Pod 签发的 token 到其他 Pod 会验证失败，表现为随机 `401`。
@@ -219,7 +220,7 @@ strategy:
 - [ ] 仅部署一个 Pod
 - [ ] 首个 Pod 本地托管配置完整
 - [ ] Redis 环境和 DB 隔离正确
-- [ ] 默认 admin 口令已替换
+- [ ] 已在本地覆盖配置中启用强口令 admin 账号
 - [ ] 所有副本将使用同一套 admin 密钥
 - [ ] `config.d/` 和 `.config-sync-state` 每 Pod 独立可写
 - [ ] Redis version/files 正确

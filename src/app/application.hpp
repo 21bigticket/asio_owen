@@ -37,6 +37,8 @@ private:
     asio::io_context ioc_;
     std::unique_ptr<MysqlPool> mysql_;
     std::unique_ptr<RedisPool> redis_;
+    std::unique_ptr<asio::thread_pool> admin_auth_workers_;
+    std::unique_ptr<asio::thread_pool> config_file_workers_;
     std::shared_ptr<ComboQueryLimiter> combo_query_limiter_;
     std::unique_ptr<HttpServer> server_;
     std::unique_ptr<SecurityRules> security_rules_;

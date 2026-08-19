@@ -28,6 +28,7 @@ struct AppServices {
     ConfigSyncConfig config_sync;
     std::shared_ptr<ConfigHistoryService> config_history_service;
     std::function<asio::awaitable<RedisPool::Reply>(std::vector<std::string>)> redis_command;
+    asio::thread_pool* admin_auth_workers = nullptr;
 };
 
 std::shared_ptr<ComboBackend> make_pool_combo_backend(MysqlPool* mysql, RedisPool* redis);

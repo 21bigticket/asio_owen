@@ -64,6 +64,13 @@ Reply integer_reply(int64_t value) {
     return reply;
 }
 
+Reply nil_reply() {
+    Reply reply;
+    reply.ok = true;
+    reply.type = "nil";
+    return reply;
+}
+
 Reply array_reply(std::vector<std::string> values) {
     Reply reply;
     reply.ok = true;
@@ -278,6 +285,18 @@ void run_admin_snapshot_repair(HttpContext& ctx, AppServices services) {
         ioc, handle_api_admin_snapshot_repair(ctx, std::move(services)));
 }
 
+void run_admin_mirror_rebuild(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(
+        ioc, handle_api_admin_mirror_rebuild(ctx, std::move(services)));
+}
+
+void run_admin_history_migration(HttpContext& ctx, AppServices services) {
+    asio::io_context ioc;
+    run_awaitable(
+        ioc, handle_api_admin_history_migration(ctx, std::move(services)));
+}
+
 void run_admin_orphan_resolution(HttpContext& ctx, AppServices services) {
     asio::io_context ioc;
     run_awaitable(
@@ -454,6 +473,18 @@ TEST(AdminConfigRoutes, LoginIssuesAdminTokenForAdminPassword) {
     std::filesystem::remove_all(base);
 }
 
+TEST(AdminConfigRoutes, PasswordRotationRevokesPreviouslyIssuedToken) {
+    auto cfg = admin_sync_config();
+    auto issued = config_admin::issue_admin_token(cfg.admin, "admin");
+    ASSERT_TRUE(issued);
+    cfg.admin.accounts[0].password_hash =
+        config_admin::pbkdf2_sha256_hash_string(
+            "rotated", std::vector<unsigned char>{'n', 'e', 'w'}, 1000);
+
+    EXPECT_FALSE(config_admin::verify_admin_token(
+        cfg.admin, "Bearer " + issued->token));
+}
+
 TEST(AdminConfigRoutes, LoginRereadsLocalAdminConfigEachAttempt) {
     auto base = make_temp_base("login_reread");
     write_never_sync(base);
@@ -548,6 +579,51 @@ TEST(AdminConfigRoutes, LoginLocksAfterRepeatedFailures) {
     std::filesystem::remove_all(base);
 }
 
+TEST(AdminConfigRoutes, LoginLockCannotBeBypassedByRotatingUsernames) {
+    auto base = make_temp_base("login_lock_ip");
+    write_never_sync(base);
+    FakeRedis redis;
+
+    for (int i = 0; i < 5; ++i) {
+        HttpContext ctx;
+        ctx.method = "POST";
+        ctx.client_ip = "10.0.0.17";
+        ctx.body = "{\"username\":\"unknown" + std::to_string(i) +
+            "\",\"password\":\"wrong\"}";
+        run_admin_login(ctx, services_for(base, redis));
+        EXPECT_EQ(ctx.status_code, 401);
+    }
+
+    HttpContext locked;
+    locked.method = "POST";
+    locked.client_ip = "10.0.0.17";
+    locked.body = R"({"username":"admin","password":"admin"})";
+    run_admin_login(locked, services_for(base, redis));
+
+    EXPECT_EQ(locked.status_code, 401);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, LoginRunsWithDedicatedAuthWorker) {
+    auto base = make_temp_base("login_worker");
+    write_never_sync(base);
+    FakeRedis redis;
+    asio::thread_pool workers(1);
+    auto services = services_for(base, redis);
+    services.admin_auth_workers = &workers;
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.client_ip = "10.0.0.18";
+    ctx.body = R"({"username":"admin","password":"admin"})";
+
+    run_admin_login(ctx, std::move(services));
+    workers.join();
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"token\":\""), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
 TEST(AdminConfigRoutes, GetConfigReturnsVersionFilesAndRestartFlags) {
     auto base = make_temp_base("get");
     write_never_sync(base);
@@ -579,6 +655,96 @@ TEST(AdminConfigRoutes, GetConfigReturnsVersionFilesAndRestartFlags) {
     EXPECT_NE(ctx.response_body.find("20-upstream.ini"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("\"restart_required\":true"), std::string::npos);
 
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, ConfigRequestRunsWithDedicatedAuthWorker) {
+    auto base = make_temp_base("config_worker");
+    write_never_sync(base);
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("7");
+        if (args.front() == "HGETALL") return array_reply({
+            "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+        });
+        if (args.front() == "HGET") return snapshot_meta_reply({
+            {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+        });
+        return error_reply("unexpected command " + args.front());
+    };
+    asio::thread_pool workers(1);
+    auto services = services_for(base, redis);
+    services.admin_auth_workers = &workers;
+    HttpContext ctx;
+    ctx.method = "GET";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_config(ctx, std::move(services));
+    workers.join();
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_EQ(redis.count("GET"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, CompatModeUsesVerifiedMirrorFallback) {
+    auto base = make_temp_base("compat_mirror");
+    write_never_sync(base);
+    FakeRedis redis;
+    int hgetall_calls = 0;
+    redis.handler = [&hgetall_calls](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("7");
+        if (args.front() == "HGETALL") {
+            ++hgetall_calls;
+            if (hgetall_calls == 1) return array_reply({});
+            return array_reply({
+                "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+            });
+        }
+        return error_reply("unexpected command " + args.front());
+    };
+    auto cfg = admin_sync_config();
+    cfg.history.read_mode = "compat";
+    HttpContext ctx;
+    ctx.method = "GET";
+    set_admin_bearer(ctx, cfg);
+
+    run_admin_config(ctx, services_for(base, redis, cfg));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"degraded\":true"), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, RequiredModeVerifiesMirrorHashBeforeFallback) {
+    auto base = make_temp_base("required_mirror");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    FakeRedis redis;
+    int hgetall_calls = 0;
+    redis.handler = [&hgetall_calls, &files](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("7");
+        if (args.front() == "HGETALL") {
+            ++hgetall_calls;
+            if (hgetall_calls == 1) return array_reply({});
+            return array_reply({files.begin()->first, files.begin()->second});
+        }
+        if (args.front() == "HGET") return string_reply(snapshot_meta(files));
+        return error_reply("unexpected command " + args.front());
+    };
+    auto cfg = admin_sync_config();
+    cfg.history.read_mode = "required";
+    HttpContext ctx;
+    ctx.method = "GET";
+    set_admin_bearer(ctx, cfg);
+
+    run_admin_config(ctx, services_for(base, redis, cfg));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("\"degraded\":true"), std::string::npos);
+    EXPECT_EQ(redis.count("HGET"), 1u);
     std::filesystem::remove_all(base);
 }
 
@@ -736,10 +902,11 @@ TEST(AdminConfigRoutes, PostSaveSuccessRunsLuaAndReturnsNewVersion) {
             EXPECT_NE(args[1].find("if #ARGV < 8"), std::string::npos);
             EXPECT_NE(args[1].find("local published = redis.call('INCR'"),
                 std::string::npos);
-            EXPECT_EQ(args[2], "8");
-            EXPECT_EQ(args[11], "7");
-            EXPECT_NE(args[12].find("admin"), std::string::npos);
-            EXPECT_NE(args[13].find("\"version\":8"), std::string::npos);
+            EXPECT_EQ(args[2], "9");
+            EXPECT_EQ(args[11], config_history::snapshot_key(7));
+            EXPECT_EQ(args[12], "7");
+            EXPECT_NE(args[13].find("admin"), std::string::npos);
+            EXPECT_NE(args[14].find("\"version\":8"), std::string::npos);
             return integer_reply(8);
         }
         return error_reply("unexpected command " + args.front());
@@ -889,6 +1056,51 @@ TEST(AdminConfigRoutes, HistoryDetailValidatesSnapshotHash) {
     std::filesystem::remove_all(base);
 }
 
+TEST(AdminConfigRoutes, HistoryDetailRejectsSnapshotHashMismatch) {
+    auto base = make_temp_base("history_hash_mismatch");
+    write_never_sync(base);
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>&) {
+        return array_reply({
+            "8", "{\"content_sha256\":\"bad\"}",
+            "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+        });
+    };
+    HttpContext ctx;
+    ctx.method = "GET";
+    ctx.path = "/api/admin/config/history/7";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_history_path(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 409);
+    EXPECT_NE(ctx.response_body.find("hash mismatch"), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, MirrorRedisFailureReturns500InsteadOfMissingSnapshot409) {
+    auto base = make_temp_base("mirror_redis_failure");
+    write_never_sync(base);
+    FakeRedis redis;
+    int hgetall_calls = 0;
+    redis.handler = [&hgetall_calls](const std::vector<std::string>& args) {
+        if (args.front() == "GET") return string_reply("7");
+        if (args.front() == "HGETALL" && ++hgetall_calls == 1) {
+            return array_reply({});
+        }
+        return error_reply("redis unavailable");
+    };
+    HttpContext ctx;
+    ctx.method = "GET";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_config(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 500);
+    EXPECT_NE(ctx.response_body.find("redis unavailable"), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
 TEST(AdminConfigRoutes, HistoryDiffUsesPathVersionAsFrom) {
     auto base = make_temp_base("history_diff");
     write_never_sync(base);
@@ -930,12 +1142,13 @@ TEST(AdminConfigRoutes, RollbackPublishesNewVersionWithoutLoweringVersion) {
     FakeRedis redis;
     redis.handler = [&files](const std::vector<std::string>& args) {
         if (args[2] == "4") return detail_reply(8, 3, files);
-        EXPECT_EQ(args[2], "9");
+        EXPECT_EQ(args[2], "10");
         EXPECT_NE(args[1].find("local source_version"), std::string::npos);
-        EXPECT_EQ(args[12], "8");
-        EXPECT_NE(args[13].find("\"new_version\":9"), std::string::npos);
-        EXPECT_NE(args[14].find("\"rollback_from\":3"), std::string::npos);
-        EXPECT_EQ(args[19], "3");
+        EXPECT_EQ(args[12], config_history::snapshot_key(8));
+        EXPECT_EQ(args[13], "8");
+        EXPECT_NE(args[14].find("\"new_version\":9"), std::string::npos);
+        EXPECT_NE(args[15].find("\"rollback_from\":3"), std::string::npos);
+        EXPECT_EQ(args[20], "3");
         return integer_reply(9);
     };
     HttpContext ctx;
@@ -951,6 +1164,71 @@ TEST(AdminConfigRoutes, RollbackPublishesNewVersionWithoutLoweringVersion) {
     EXPECT_NE(ctx.response_body.find("\"rollback_from\":3"),
         std::string::npos);
     EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, RollbackRejectsCasConflictBeforePublish) {
+    auto base = make_temp_base("rollback_cas");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>&) {
+        return detail_reply(9, 3, files);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"base_version":8,"target_version":3,"reason":"stale base"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_rollback(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 409);
+    EXPECT_NE(ctx.response_body.find("\"current_version\":9"), std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, RollbackRejectsNeverSyncFileFromHistory) {
+    auto base = make_temp_base("rollback_never_sync");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"11-redis.ini", "[redis]\nmode = direct\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>&) {
+        return detail_reply(8, 3, files);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"base_version":8,"target_version":3,"reason":"invalid old snapshot"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_rollback(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 409);
+    EXPECT_NE(ctx.response_body.find("never-sync"), std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, RollbackReturns404WhenGcDeletedSource) {
+    auto base = make_temp_base("rollback_gc");
+    write_never_sync(base);
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>&) {
+        return array_reply({});
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"base_version":8,"target_version":3,"reason":"deleted source"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_rollback(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 404);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
     std::filesystem::remove_all(base);
 }
 
@@ -988,6 +1266,64 @@ TEST(AdminConfigRoutes, SnapshotRepairRequiresMatchingMirrorMetadata) {
     EXPECT_NE(ctx.response_body.find("\"action\":\"snapshot-repair\""),
         std::string::npos);
     EXPECT_EQ(redis.calls.size(), 3u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, MirrorRebuildUsesValidatedCurrentSnapshot) {
+    auto base = make_temp_base("mirror_rebuild");
+    write_never_sync(base);
+    const std::map<std::string, std::string> files{
+        {"20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"}
+    };
+    FakeRedis redis;
+    redis.handler = [&files](const std::vector<std::string>& args) {
+        if (args[2] == "4") return detail_reply(8, 8, files);
+        EXPECT_EQ(args[2], "7");
+        EXPECT_NE(args[1].find("redis.call('RENAME', KEYS[6], KEYS[2])"),
+            std::string::npos);
+        return integer_reply(8);
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"version":8,"reason":"rebuild mirror"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_mirror_rebuild(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("mirror-rebuild"), std::string::npos);
+    EXPECT_EQ(redis.count("EVAL"), 2u);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AdminConfigRoutes, HistoryMigrationPublishesLegacyMirrorInCompatMode) {
+    auto base = make_temp_base("history_migration");
+    write_never_sync(base);
+    FakeRedis redis;
+    redis.handler = [](const std::vector<std::string>& args) {
+        if (args.front() == "HGETALL") {
+            return array_reply({
+                "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+            });
+        }
+        EXPECT_EQ(args.front(), "EVAL");
+        EXPECT_NE(args[1].find("redis.call('ZCARD', KEYS[4]) ~= 0"),
+            std::string::npos);
+        return integer_reply(8);
+    };
+    auto cfg = admin_sync_config();
+    cfg.history.read_mode = "compat";
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"version":8,"reason":"migrate legacy history"})";
+    set_admin_bearer(ctx, cfg);
+
+    run_admin_history_migration(ctx, services_for(base, redis, cfg));
+
+    EXPECT_EQ(ctx.status_code, 200);
+    EXPECT_NE(ctx.response_body.find("migration"), std::string::npos);
+    EXPECT_EQ(redis.count("HGETALL"), 1u);
+    EXPECT_EQ(redis.count("EVAL"), 1u);
     std::filesystem::remove_all(base);
 }
 
@@ -1062,6 +1398,34 @@ TEST(AdminConfigRoutes, OrphanDeleteAtomicallyRemovesConfirmedPartialTriple) {
     std::filesystem::remove_all(base);
 }
 
+TEST(AdminConfigRoutes, OrphanNilScriptReplyReturns500WithoutDereference) {
+    auto base = make_temp_base("orphan_nil");
+    write_never_sync(base);
+    FakeRedis redis;
+    int calls = 0;
+    redis.handler = [&calls](const std::vector<std::string>& args) {
+        ++calls;
+        if (calls == 1) {
+            return array_reply({
+                "8", "8", "8", "0", "__missing__", "1",
+                "20-upstream.ini", "[upstream]\nzebra = 127.0.0.1:30001\n"
+            });
+        }
+        EXPECT_EQ(args[2], "6");
+        return nil_reply();
+    };
+    HttpContext ctx;
+    ctx.method = "POST";
+    ctx.body = R"({"current_version":8,"target_version":9,"action":"delete-orphan","reason":"nil regression","confirmation":"DELETE_UNPUBLISHED_ORPHAN"})";
+    set_admin_bearer(ctx, admin_sync_config());
+
+    run_admin_orphan_resolution(ctx, services_for(base, redis));
+
+    EXPECT_EQ(ctx.status_code, 500);
+    EXPECT_NE(ctx.response_body.find("non-integer"), std::string::npos);
+    std::filesystem::remove_all(base);
+}
+
 TEST(AdminConfigRoutes, OrphanResolutionRejectsWrongConfirmationBeforeRedis) {
     auto base = make_temp_base("orphan_confirmation");
     write_never_sync(base);
@@ -1086,6 +1450,9 @@ TEST(AdminConfigRoutes, AdminPageReturnsLoginPage) {
 
     EXPECT_EQ(ctx.status_code, 200);
     ASSERT_FALSE(ctx.response_headers.empty());
+    EXPECT_EQ(get_header_value(ctx.response_headers, "Cache-Control"), "no-store");
+    EXPECT_FALSE(get_header_value(
+        ctx.response_headers, "Content-Security-Policy").empty());
     EXPECT_NE(ctx.response_body.find("asio_owen Config Center"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/api/admin/login"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("adminToken"), std::string::npos);
@@ -1099,6 +1466,7 @@ TEST(AdminConfigRoutes, AdminSettingsPageReturnsEmbeddedSinglePageApp) {
 
     EXPECT_EQ(ctx.status_code, 200);
     ASSERT_FALSE(ctx.response_headers.empty());
+    EXPECT_EQ(get_header_value(ctx.response_headers, "Cache-Control"), "no-store");
     EXPECT_NE(ctx.response_body.find("/api/admin/config"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("function render"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/admin/login"), std::string::npos);
@@ -1107,5 +1475,11 @@ TEST(AdminConfigRoutes, AdminSettingsPageReturnsEmbeddedSinglePageApp) {
     EXPECT_NE(ctx.response_body.find("if (!reason) return"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("from the saved configuration:"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("Save these configuration changes as a new version?"),
+        std::string::npos);
+    EXPECT_NE(ctx.response_body.find("const selectedFile = files[selected]"),
+        std::string::npos);
+    EXPECT_NE(ctx.response_body.find("await load();"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("while (names.has(name))"), std::string::npos);
+    EXPECT_NE(ctx.response_body.find("if (append && !historyBefore) return"),
         std::string::npos);
 }

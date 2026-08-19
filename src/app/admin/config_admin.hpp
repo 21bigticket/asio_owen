@@ -885,12 +885,36 @@ struct IssuedToken {
     int expires_in = 0;
 };
 
+inline std::optional<std::string> admin_auth_version(
+    const AdminConfig& admin,
+    std::string_view username) {
+    const AdminAccountConfig* account = nullptr;
+    for (const auto& item : admin.accounts) {
+        if (item.username == username) {
+            account = &item;
+            break;
+        }
+    }
+    if (!account || account->password_hash.empty()) return std::nullopt;
+    const std::string material =
+        std::string(username) + "\n" + account->password_hash;
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_len = 0;
+    if (EVP_Digest(material.data(), material.size(), digest.data(),
+            &digest_len, EVP_sha256(), nullptr) != 1 || digest_len == 0) {
+        return std::nullopt;
+    }
+    return base64url_encode(digest.data(), digest_len);
+}
+
 inline std::optional<IssuedToken> issue_admin_token(
     const AdminConfig& admin,
     const std::string& username,
     const std::filesystem::path& base = {}) {
     auto private_key = load_pem_or_file(admin.jwt_private_key, base);
     if (!private_key) return std::nullopt;
+    auto auth_version = admin_auth_version(admin, username);
+    if (!auth_version) return std::nullopt;
     const int ttl_sec = std::max(1, admin.token_ttl_min) * 60;
     const auto now = static_cast<int64_t>(std::time(nullptr));
     const auto exp = now + ttl_sec;
@@ -899,7 +923,8 @@ inline std::optional<IssuedToken> issue_admin_token(
     payload << "{\"iss\":\"" << kAdminIssuer
             << "\",\"sub\":\"" << json_escape(username)
             << "\",\"name\":\"" << json_escape(username)
-            << "\",\"roles\":[\"admin\"],\"iat\":" << now
+            << "\",\"roles\":[\"admin\"],\"av\":\""
+            << *auth_version << "\",\"iat\":" << now
             << ",\"exp\":" << exp << "}";
     auto signing_input = base64url_encode(header) + "." +
         base64url_encode(payload.str());
@@ -922,6 +947,25 @@ inline std::optional<Principal> verify_admin_token(
             std::string(kAdminIssuer), "RS256", *public_key);
         auto claims = auth.verify(auth_header);
         if (!claims) return std::nullopt;
+        const std::string username = claims->username.empty() ?
+            claims->subject : claims->username;
+        auto expected_auth_version = admin_auth_version(admin, username);
+        if (!expected_auth_version) return std::nullopt;
+        static constexpr std::string_view bearer = "Bearer ";
+        if (auth_header.size() <= bearer.size() ||
+            !std::equal(bearer.begin(), bearer.end(), auth_header.begin(),
+                [](char a, char b) {
+                    return std::tolower(static_cast<unsigned char>(a)) ==
+                        std::tolower(static_cast<unsigned char>(b));
+                })) {
+            return std::nullopt;
+        }
+        auto decoded = jwt::decode(auth_header.substr(bearer.size()));
+        if (!decoded.has_payload_claim("av") ||
+            decoded.get_payload_claim("av").as_string() !=
+                *expected_auth_version) {
+            return std::nullopt;
+        }
         Principal principal{
             .subject = claims->subject,
             .username = claims->username,

@@ -248,7 +248,7 @@ v1 == v2 -> 校验并应用 files
 6. 降级应用时本地 state 记录 `synced_version=current_version,status=partial`，下一轮即使版本相等也继续健康复核。
 7. 由 Admin 修复操作把已验证镜像重建为同版本历史快照；操作前执行 §5.3 同款高水位检查，并且只允许目标 snapshot 确实不存在、镜像 hash 等于 meta，不能覆盖已有快照。修复完成后 Pod 才恢复 `ok`。
 
-只有本地 `state.status=partial` 或处于降级恢复流程的 Pod，才在同版本轮询中持续复核当前历史快照；`status=ok` 的 Pod 保持现有轻量路径，只执行 `GET version`，版本变化时才读取快照。partial Pod 不能只因 `remote_version == synced_version` 就恢复 `ok`。
+`state.status=partial` 或处于降级恢复流程的 Pod，在同版本轮询中持续复核当前历史快照。`status=ok` 的 Pod 每轮仍会采集本地托管文件并与 `last_ok` hash 比较；一致时只刷新心跳，发现漂移时重新读取并应用当前快照。partial Pod 不能只因 `remote_version == synced_version` 就恢复 `ok`。
 
 ### 6.2 当前镜像维护约束
 
@@ -644,7 +644,7 @@ Phase 4 自身按以下顺序上线：
 - 当前 snapshot 缺失时，镜像 hash 匹配只能 partial 降级；hash 不匹配拒绝应用。
 - `read_mode` 缺失或非法时默认为 required，保存和回滚均不能写入 never-sync 的 `[config_history]`。
 - 仅 `current=1` 且 history 三元组和镜像全空时返回 `legacy-empty`：compat 放行且不触发自动迁移，required 拒绝；`current>1` 全空仍冻结。
-- `status=ok` 的同版本轮询只读 version；仅 partial/降级状态持续复核 snapshot。
+- `status=ok` 的同版本轮询校验本地文件与 `last_ok`，一致时只刷新心跳；漂移或 partial/降级状态持续复核 snapshot。
 - 当前 snapshot/meta/index 完整且 hash 正确时，`mirror-rebuild` 原子重建镜像且不修改 version/history/meta。
 - 分页游标、最大 limit 和不存在版本处理正确。
 - 历史列表一次 Redis 调用批量验证 snapshot/meta/index 三元组。
@@ -730,5 +730,6 @@ Ubuntu 22.04、GCC/G++ 11.4.0 目标机已完成完整构建和 `ctest`，291/29
 | `history_page_size_max` | 50 |
 | `max_diff_response_bytes` | 2 MiB |
 | `gc_batch_size` | 20 |
+| `machine_ttl_sec` | 3600 |
 
-`read_mode` 和 `auto_migrate_legacy` 必须放在 never-sync 本地配置，其余参数可按职责放入本地或托管配置；所有容量参数都应设置代码硬上限，管理页面不能自行放宽。
+`read_mode`、`auto_migrate_legacy` 和 `machine_ttl_sec` 必须放在 never-sync 本地配置。健康检查忽略并删除超过 TTL 或格式错误的机器心跳，防止已销毁实例永久抬高版本高水位并冻结保存、回滚和 GC。其余参数可按职责放入本地或托管配置；所有容量参数都应设置代码硬上限，管理页面不能自行放宽。

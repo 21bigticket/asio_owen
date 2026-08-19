@@ -459,7 +459,10 @@
           files[selected].content = $("editor").value;
       }
       function render() {
+        const selectedFile = files[selected];
         files.sort((a, b) => a.name.localeCompare(b.name));
+        selected = selectedFile ? files.indexOf(selectedFile) : 0;
+        if (selected < 0) selected = 0;
         $("version").textContent = "v" + version;
         $("files").innerHTML = files
           .map(
@@ -618,7 +621,14 @@
       function renderHistoryRows() {
         const seen = new Set();
         const options = historyRows
-          .filter((row) => !seen.has(row.version) && seen.add(row.version))
+          .map((row) => ({ ...row, version: Number.parseInt(row.version, 10) }))
+          .filter(
+            (row) =>
+              Number.isSafeInteger(row.version) &&
+              row.version >= 0 &&
+              !seen.has(row.version) &&
+              seen.add(row.version),
+          )
           .map(
             (row) =>
               `<option value="${row.version}" ${row.version === version ? "selected" : ""}>v${row.version}</option>`,
@@ -627,12 +637,17 @@
         $("compareTo").innerHTML = options;
         $("historyRows").innerHTML = historyRows
           .map((row) => {
+            const rowVersion = Number.parseInt(row.version, 10);
+            if (!Number.isSafeInteger(rowVersion) || rowVersion < 0) return "";
             const when = row.ts ? new Date(row.ts * 1000).toLocaleString() : "";
-            return `<button class="history-row ${row.version === historySelected ? "active" : ""} ${row.version === version ? "current" : ""}" onclick="selectHistory(${row.version})"><strong>v${row.version}</strong> ${esc(row.action || "")}<small>${esc(row.user || "")} - ${esc(when)} - ${esc(row.reason || "")} - ${row.file_count || 0} files - ${row.total_bytes || 0} B</small></button>`;
+            const fileCount = Number.parseInt(row.file_count, 10) || 0;
+            const totalBytes = Number.parseInt(row.total_bytes, 10) || 0;
+            return `<button class="history-row ${rowVersion === historySelected ? "active" : ""} ${rowVersion === version ? "current" : ""}" onclick="selectHistory(${rowVersion})"><strong>v${rowVersion}</strong> ${esc(row.action || "")}<small>${esc(row.user || "")} - ${esc(when)} - ${esc(row.reason || "")} - ${fileCount} files - ${totalBytes} B</small></button>`;
           })
           .join("");
       }
       async function loadHistory(append) {
+        if (append && !historyBefore) return;
         status("Loading history");
         const query = new URLSearchParams({ limit: "20" });
         if (append && historyBefore) query.set("before", historyBefore);
@@ -642,6 +657,7 @@
         if (!append) historyRows = [];
         historyRows.push(...(data.versions || []));
         historyBefore = data.next_before;
+        $("moreHistory").disabled = !historyBefore;
         renderHistoryRows();
         status("History loaded");
       }
@@ -713,13 +729,12 @@
           }),
         });
         if (!data) return;
-        version = data.version;
+        const resultMessage = `Rolled back as v${data.version}${data.restart_required ? "; restart required" : ""}`;
         historyRows = [];
         historyDetail = null;
-        status(
-          `Rolled back as v${version}${data.restart_required ? "; restart required" : ""}`,
-        );
+        await load();
         await loadHistory(false);
+        status(resultMessage);
       }
       $("logout").onclick = () => {
         localStorage.removeItem("adminToken");
@@ -742,8 +757,12 @@
         rollbackHistory().catch((e) => status(e.message, true));
       $("add").onclick = () => {
         syncEditor();
+        const names = new Set(files.map((f) => f.name));
+        let suffix = 1;
+        let name = "20-new.ini";
+        while (names.has(name)) name = `20-new-${++suffix}.ini`;
         files.push({
-          name: "20-new.ini",
+          name,
           content: "[upstream]\nservice = 127.0.0.1:30001\n",
           restart_required: false,
         });

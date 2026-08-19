@@ -5,13 +5,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -193,6 +196,7 @@ TEST(ConfigSyncService, ParsesConfigSection) {
         "history_page_size = 49\n"
         "history_page_size_max = 7\n"
         "gc_interval_sec = 1\n"
+        "machine_ttl_sec = 30\n"
         "[admin]\n"
         "admin = pbkdf2_sha256$100000$YXNpb19vd2VuX2FkbWlu$FQidl7NTJAglmXo5_SZL7LC2T_ikCZhweAE8Wg6FIPI\n"
         "jwt_private_key = jwt_keys/admin-private-key.pem\n"
@@ -215,6 +219,7 @@ TEST(ConfigSyncService, ParsesConfigSection) {
     EXPECT_EQ(app.config_sync.history.history_page_size, 7u);
     EXPECT_EQ(app.config_sync.history.history_page_size_max, 7u);
     EXPECT_EQ(app.config_sync.history.gc_interval_sec, 10);
+    EXPECT_EQ(app.config_sync.history.machine_ttl_sec, 60);
     ASSERT_EQ(app.config_sync.admin.accounts.size(), 1u);
     EXPECT_EQ(app.config_sync.admin.accounts[0].username, "admin");
     EXPECT_EQ(app.config_sync.admin.jwt_private_key, "jwt_keys/admin-private-key.pem");
@@ -222,6 +227,81 @@ TEST(ConfigSyncService, ParsesConfigSection) {
     EXPECT_EQ(app.config_sync.admin.token_ttl_min, 30);
     EXPECT_TRUE(app.config_sync.admin.insecure_no_auth);
 
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, IdenticalStateDoesNotRewriteStateFile) {
+    auto base = make_temp_base("state_no_rewrite");
+    ConfigSyncService::State state;
+    state.synced_version = 7;
+    state.status = "partial";
+    state.failures["history_snapshot"] = "mirror unavailable";
+    ASSERT_TRUE(ConfigSyncService::write_state(base, state));
+
+    const auto path = base / ".config-sync-state";
+    const auto old_time = std::filesystem::file_time_type::clock::now() -
+        std::chrono::hours(24);
+    std::filesystem::last_write_time(path, old_time);
+
+    ASSERT_TRUE(ConfigSyncService::write_state(base, state));
+    EXPECT_EQ(std::filesystem::last_write_time(path), old_time);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, StopDoesNotWaitAfterIoContextStopped) {
+    auto base = make_temp_base("stop_after_ioc");
+    asio::io_context ioc;
+    auto service = std::make_shared<ConfigSyncService>(
+        ioc,
+        [](std::vector<std::string>,
+           ConfigSyncService::CommandCompletion) {},
+        base, sync_config(), app_config());
+    service->start();
+    ioc.poll();
+    ioc.stop();
+
+    const auto started = std::chrono::steady_clock::now();
+    service->stop();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_LT(elapsed, std::chrono::milliseconds(50));
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigSyncService, RedisCompletionProcessingUsesFileWorker) {
+    auto base = make_temp_base("file_worker");
+    asio::io_context ioc;
+    asio::thread_pool workers(1);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool completed = false;
+    std::thread::id completion_thread;
+    const auto caller_thread = std::this_thread::get_id();
+    auto service = std::make_shared<ConfigSyncService>(
+        ioc,
+        [](std::vector<std::string>,
+           ConfigSyncService::CommandCompletion completion) {
+            completion(error_reply("redis unavailable"));
+        },
+        base, sync_config(), app_config(), &workers);
+
+    service->sync_once_for_test([&](bool) {
+        {
+            std::lock_guard lock(mu);
+            completion_thread = std::this_thread::get_id();
+            completed = true;
+        }
+        cv.notify_one();
+    });
+    {
+        std::unique_lock lock(mu);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+            [&] { return completed; }));
+    }
+    workers.join();
+
+    EXPECT_NE(completion_thread, caller_thread);
     std::filesystem::remove_all(base);
 }
 

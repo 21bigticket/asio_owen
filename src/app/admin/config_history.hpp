@@ -431,7 +431,7 @@ for i = 7, #ARGV, 2 do
   total_bytes = total_bytes + file_bytes
   if total_bytes > max_total_bytes then return -8 end
 end
-local expected = {'string', 'hash', 'list', 'hash', 'hash', 'zset', 'hash', 'hash'}
+local expected = {'string', 'hash', 'list', 'hash', 'hash', 'zset', 'hash', 'hash', 'hash'}
 for i = 1, #KEYS do
   local t = redis.call('TYPE', KEYS[i]).ok
   if t ~= expected[i] and t ~= 'none' then return -3 end
@@ -440,9 +440,14 @@ local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
 if cur == nil then return -4 end
 if cur ~= base then return -1 end
 local top = redis.call('ZREVRANGE', KEYS[6], 0, 0)
-if top[1] ~= nil then
-  local high = tonumber(top[1])
-  if high == nil or high > cur then return -5 end
+if cur > 0 then
+  local current_member = tostring(cur)
+  if top[1] == nil or tonumber(top[1]) ~= cur or
+     not redis.call('HGET', KEYS[5], current_member) or
+     redis.call('EXISTS', KEYS[9]) ~= 1 then return -5 end
+elseif top[1] ~= nil or redis.call('ZCARD', KEYS[6]) ~= 0 or
+   redis.call('HLEN', KEYS[5]) ~= 0 then
+  return -5
 end
 local newv = base + 1
 local member = tostring(newv)
@@ -487,7 +492,7 @@ for i = 9, #ARGV, 2 do
   total_bytes = total_bytes + file_bytes
   if total_bytes > max_total_bytes then return -8 end
 end
-local expected = {'string', 'hash', 'list', 'hash', 'hash', 'zset', 'hash', 'hash', 'hash'}
+local expected = {'string', 'hash', 'list', 'hash', 'hash', 'zset', 'hash', 'hash', 'hash', 'hash'}
 for i = 1, #KEYS do
   local t = redis.call('TYPE', KEYS[i]).ok
   if t ~= expected[i] and t ~= 'none' then return -3 end
@@ -496,9 +501,14 @@ local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
 if cur == nil then return -4 end
 if cur ~= base then return -1 end
 local top = redis.call('ZREVRANGE', KEYS[6], 0, 0)
-if top[1] ~= nil then
-  local high = tonumber(top[1])
-  if high == nil or high > cur then return -5 end
+if cur > 0 then
+  local current_member = tostring(cur)
+  if top[1] == nil or tonumber(top[1]) ~= cur or
+     not redis.call('HGET', KEYS[5], current_member) or
+     redis.call('EXISTS', KEYS[10]) ~= 1 then return -5 end
+elseif top[1] ~= nil or redis.call('ZCARD', KEYS[6]) ~= 0 or
+   redis.call('HLEN', KEYS[5]) ~= 0 then
+  return -5
 end
 local source_member = tostring(source_version)
 if source_version > cur or redis.call('EXISTS', KEYS[9]) ~= 1 or
@@ -834,13 +844,16 @@ for i = 5, #ARGV, 2 do
   if total_bytes > max_total_bytes then return -8 end
 end
 if file_count == 0 then
+  if redis.call('ZCARD', KEYS[5]) ~= 0 or
+     redis.call('HLEN', KEYS[4]) ~= 0 or
+     redis.call('EXISTS', KEYS[6]) ~= 0 then return -6 end
   redis.call('DEL', KEYS[2])
   redis.call('SET', KEYS[1], 1)
   return 1
 end
-if redis.call('EXISTS', KEYS[6]) ~= 0 or
-   redis.call('HEXISTS', KEYS[4], '1') ~= 0 or
-   redis.call('ZSCORE', KEYS[5], '1') ~= false then return -6 end
+if redis.call('ZCARD', KEYS[5]) ~= 0 or
+   redis.call('HLEN', KEYS[4]) ~= 0 or
+   redis.call('EXISTS', KEYS[6]) ~= 0 then return -6 end
 redis.call('DEL', KEYS[7])
 redis.call('HSET', KEYS[7], unpack(ARGV, 5, #ARGV))
 redis.call('RENAME', KEYS[7], KEYS[6])

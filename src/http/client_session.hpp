@@ -135,8 +135,8 @@ public:
                 for (size_t i = 0; i < num_headers; ++i) {
                     std::string_view name(headers[i].name, headers[i].name_len);
                     std::string_view value(headers[i].value, headers[i].value_len);
-                    update_header_state(name, value, request_header_state);
-                    ctx.headers.emplace_back(std::string(name), std::string(value));
+                    parse_header_pair_into(
+                        name, value, &ctx.headers, request_header_state);
                 }
                 client_preread.clear();
 
@@ -151,12 +151,14 @@ public:
                 bool proxy_response = false;
 
                 std::string& preread = body_buffer;
-                if (request_header_state.invalid_content_length ||
+                if (request_header_state.invalid_header_name ||
+                    request_header_state.invalid_content_length ||
                     request_header_state.duplicate_content_length ||
                     request_header_state.invalid_transfer_encoding ||
                     (request_header_state.has_transfer_encoding && !request_header_state.is_chunked)) {
                     LOG_INFO("Reject request framing: method=", method_str,
                         ", path=", path_str,
+                        ", invalid_header_name=", request_header_state.invalid_header_name,
                         ", invalid_cl=", request_header_state.invalid_content_length,
                         ", duplicate_cl=", request_header_state.duplicate_content_length,
                         ", has_te=", request_header_state.has_transfer_encoding,

@@ -140,13 +140,75 @@ TEST(ConfigHistory, PublishScriptsKeepVersionAsLastCoreWrite) {
     ASSERT_NE(audit, std::string::npos);
     EXPECT_LT(rename, publish);
     EXPECT_LT(publish, audit);
-    EXPECT_NE(save.find("high > cur"), std::string::npos);
+    EXPECT_NE(save.find("redis.call('EXISTS', KEYS[9]) ~= 1"),
+        std::string::npos);
+    EXPECT_NE(config_history::rollback_script().find(
+        "redis.call('EXISTS', KEYS[10]) ~= 1"), std::string::npos);
     EXPECT_NE(config_history::migration_script().find(
         "redis.call('ZCARD', KEYS[4]) ~= 0"), std::string::npos);
     EXPECT_NE(config_history::migration_script().find(
         "redis.call('HLEN', KEYS[3]) ~= 0"), std::string::npos);
+    EXPECT_NE(config_history::seed_script().find(
+        "redis.call('ZCARD', KEYS[5]) ~= 0"), std::string::npos);
     EXPECT_NE(config_history::rollback_script().find("return -9"),
         std::string::npos);
+}
+
+TEST(ConfigHistoryService, StartsFailClosedUntilFirstHealthCheck) {
+    asio::io_context ioc;
+    auto service = std::make_shared<ConfigHistoryService>(
+        ioc,
+        [](std::vector<std::string>,
+           ConfigHistoryService::CommandCompletion) {},
+        ConfigHistoryConfig{}, 50);
+
+    EXPECT_TRUE(service->inconsistent());
+}
+
+TEST(ConfigHistoryService, StopDoesNotWaitAfterIoContextStopped) {
+    asio::io_context ioc;
+    auto service = std::make_shared<ConfigHistoryService>(
+        ioc,
+        [](std::vector<std::string>,
+           ConfigHistoryService::CommandCompletion) {},
+        ConfigHistoryConfig{}, 500);
+    service->start();
+    ioc.poll();
+    ioc.stop();
+
+    const auto started = std::chrono::steady_clock::now();
+    service->stop();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_LT(elapsed, std::chrono::milliseconds(50));
+}
+
+TEST(ConfigHistoryService, SerializesOverlappingRefreshChecks) {
+    asio::io_context ioc;
+    std::vector<ConfigHistoryService::CommandCompletion> pending;
+    auto service = std::make_shared<ConfigHistoryService>(
+        ioc,
+        [&pending](std::vector<std::string>,
+                   ConfigHistoryService::CommandCompletion completion) {
+            pending.push_back(std::move(completion));
+        },
+        ConfigHistoryConfig{}, 50);
+    bool first_done = false;
+    bool second_done = false;
+
+    service->refresh([&first_done]() { first_done = true; });
+    service->refresh([&second_done]() { second_done = true; });
+    ASSERT_EQ(pending.size(), 1u);
+
+    auto first = std::move(pending[0]);
+    first(array_reply({"1", "1", "1", "incomplete"}));
+    EXPECT_TRUE(first_done);
+    EXPECT_FALSE(second_done);
+    ASSERT_EQ(pending.size(), 2u);
+
+    auto second = std::move(pending[1]);
+    second(array_reply({"1", "1", "1", "incomplete"}));
+    EXPECT_TRUE(second_done);
 }
 
 TEST(ConfigHistoryService, HealthyStateRunsBoundedCandidateQuery) {
@@ -154,7 +216,10 @@ TEST(ConfigHistoryService, HealthyStateRunsBoundedCandidateQuery) {
     redis.handler = [](const std::vector<std::string>& args) {
         if (args.size() > 1 && args[1].find("machine_high") != std::string::npos) {
             EXPECT_EQ(args[2], "5");
-            EXPECT_EQ(args.back(), config_history::kSnapshotPrefix);
+            EXPECT_EQ(args[8], config_history::kSnapshotPrefix);
+            EXPECT_EQ(args.back(), "3600");
+            EXPECT_NE(args[1].find("redis.call('HDEL', KEYS[3], machines[i])"),
+                std::string::npos);
             return array_reply({"12", "12", "12", "ok"});
         }
         EXPECT_NE(args[1].find("batch * 4"), std::string::npos);
@@ -202,6 +267,24 @@ TEST(ConfigHistoryService, GcDeletesEachTripleWithShortAtomicLua) {
     EXPECT_FALSE(stats.inconsistent);
     EXPECT_EQ(stats.gc_deleted, 2u);
     EXPECT_EQ(redis.calls.size(), 4u);
+}
+
+TEST(ConfigHistoryService, GcCandidatesRequireCountAndAgeRetention) {
+    FakeRedis redis;
+    int phase = 0;
+    redis.handler = [&phase](const std::vector<std::string>& args) {
+        ++phase;
+        if (phase == 1) return array_reply({"150", "150", "150", "ok"});
+        EXPECT_NE(args[1].find("local eligible = count - retain"),
+            std::string::npos);
+        EXPECT_NE(args[1].find("ts < cutoff"), std::string::npos);
+        return array_reply({});
+    };
+
+    auto stats = run_once(redis);
+
+    EXPECT_FALSE(stats.inconsistent);
+    EXPECT_EQ(redis.calls.size(), 2u);
 }
 
 TEST(ConfigHistoryService, MissingCurrentTripleFreezesBeforeGc) {

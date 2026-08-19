@@ -154,6 +154,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
                              const std::filesystem::path& config_base) {
     mysql_ = std::make_unique<MysqlPool>(ioc_, app_cfg.mysql);
     redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
+    admin_auth_workers_ = std::make_unique<asio::thread_pool>(2);
+    config_file_workers_ = std::make_unique<asio::thread_pool>(1);
     combo_query_limiter_ = std::make_shared<ComboQueryLimiter>(
         app_cfg.combo_max_in_flight_queries);
     server_ = std::make_unique<HttpServer>(
@@ -181,7 +183,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
         .config_history_service = config_history_service_,
         .redis_command = [redis = redis_.get()](std::vector<std::string> args) {
             return redis->cmd_argv(std::move(args));
-        }
+        },
+        .admin_auth_workers = admin_auth_workers_.get()
     });
 
     register_upstreams(cfg, app_cfg.http_pool);
@@ -190,7 +193,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     pool_stats_service_->start(app_cfg.http_pool_stats_interval_sec);
 
     config_sync_service_ = std::make_shared<ConfigSyncService>(
-        ioc_, *redis_, config_base, app_cfg.config_sync, app_cfg);
+        ioc_, *redis_, config_base, app_cfg.config_sync, app_cfg,
+        config_file_workers_.get());
     config_sync_service_->start();
     config_history_service_->start();
 
@@ -224,6 +228,8 @@ void Application::cleanup() {
     if (pool_stats_service_) pool_stats_service_->stop();
     if (snapshot_service_) snapshot_service_->stop();
     if (server_) server_->stop();
+    if (admin_auth_workers_) admin_auth_workers_->join();
+    if (config_file_workers_) config_file_workers_->join();
 
     signal_exit_.reset();
     config_history_service_.reset();
@@ -232,6 +238,8 @@ void Application::cleanup() {
     pool_stats_service_.reset();
     snapshot_service_.reset();
     server_.reset();
+    admin_auth_workers_.reset();
+    config_file_workers_.reset();
 
     if (mysql_) mysql_->shutdown();
     if (redis_) redis_->shutdown();

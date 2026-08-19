@@ -90,8 +90,12 @@ asio::awaitable<void> api_redis(HttpContext& ctx, AppServices services) {
 }
 
 void set_json(HttpContext& ctx) {
-    if (!get_header_value(ctx.response_headers, "Content-Type").empty()) return;
-    ctx.response_headers.emplace_back("Content-Type", "application/json");
+    if (get_header_value(ctx.response_headers, "Content-Type").empty()) {
+        ctx.response_headers.emplace_back("Content-Type", "application/json");
+    }
+    if (get_header_value(ctx.response_headers, "Cache-Control").empty()) {
+        ctx.response_headers.emplace_back("Cache-Control", "no-store");
+    }
 }
 
 asio::awaitable<RedisPool::Reply> run_redis_command(
@@ -108,26 +112,26 @@ bool redis_command_available(const AppServices& services) {
 
 class AdminLoginThrottle {
 public:
-    bool locked(const std::string& client_ip, const std::string& username) {
+    bool locked(const std::string& client_ip) {
         std::lock_guard<std::mutex> lock(mu_);
         sweep_expired_locked();
-        auto it = entries_.find(key(client_ip, username));
+        auto it = entries_.find(client_ip);
         return it != entries_.end() && it->second.locked_until > Clock::now();
     }
 
-    void record_failure(const std::string& client_ip, const std::string& username) {
+    void record_failure(const std::string& client_ip) {
         std::lock_guard<std::mutex> lock(mu_);
         sweep_expired_locked();
-        auto& entry = entries_[key(client_ip, username)];
+        auto& entry = entries_[client_ip];
         ++entry.failures;
         if (entry.failures >= kMaxFailures) {
             entry.locked_until = Clock::now() + kLockDuration;
         }
     }
 
-    void record_success(const std::string& client_ip, const std::string& username) {
+    void record_success(const std::string& client_ip) {
         std::lock_guard<std::mutex> lock(mu_);
-        entries_.erase(key(client_ip, username));
+        entries_.erase(client_ip);
     }
 
 private:
@@ -139,10 +143,6 @@ private:
         int failures = 0;
         Clock::time_point locked_until{};
     };
-
-    static std::string key(const std::string& client_ip, const std::string& username) {
-        return client_ip + '\n' + username;
-    }
 
     void sweep_expired_locked() {
         if (entries_.size() <= kMaxEntries) {
@@ -170,6 +170,50 @@ AdminLoginThrottle& admin_login_throttle() {
     static AdminLoginThrottle throttle;
     return throttle;
 }
+
+class AdminAuthWorkLimiter {
+public:
+    bool try_acquire() {
+        size_t current = in_flight_.load(std::memory_order_relaxed);
+        while (current < kMaxInFlight) {
+            if (in_flight_.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void release() {
+        in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+private:
+    static constexpr size_t kMaxInFlight = 16;
+    std::atomic<size_t> in_flight_{0};
+};
+
+AdminAuthWorkLimiter& admin_auth_work_limiter() {
+    static AdminAuthWorkLimiter limiter;
+    return limiter;
+}
+
+class AdminAuthWorkPermit {
+public:
+    explicit AdminAuthWorkPermit(AdminAuthWorkLimiter& limiter)
+        : limiter_(&limiter) {}
+
+    AdminAuthWorkPermit(const AdminAuthWorkPermit&) = delete;
+    AdminAuthWorkPermit& operator=(const AdminAuthWorkPermit&) = delete;
+
+    ~AdminAuthWorkPermit() {
+        if (limiter_) limiter_->release();
+    }
+
+private:
+    AdminAuthWorkLimiter* limiter_;
+};
 
 std::optional<AdminConfig> load_effective_admin_config(
     const AppServices& services,
@@ -199,6 +243,11 @@ bool authorize_admin(HttpContext& ctx, const AppServices& services) {
     }
     const auto& admin = *current_admin;
     if (admin.insecure_no_auth) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_acq_rel)) {
+            LOG_ERROR("SECURITY WARNING: admin API authentication is disabled by "
+                "admin.insecure_no_auth=true");
+        }
         ctx.admin_principal.reset();
         return true;
     }
@@ -235,48 +284,67 @@ void admin_login_failed(HttpContext& ctx) {
     ctx.response_body = resp_err(401, "invalid credentials");
 }
 
-void handle_api_admin_login_sync(HttpContext& ctx, const AppServices& services) {
+asio::awaitable<void> handle_api_admin_login_impl(
+    HttpContext& ctx, AppServices services) {
     set_json(ctx);
     if (ctx.method != "POST") {
         method_not_allowed(ctx, "POST");
-        return;
+        co_return;
     }
 
     std::string admin_config_error;
     auto current_admin = load_effective_admin_config(services, &admin_config_error);
-    if (!current_admin ||
-        !config_admin::admin_configured(*current_admin, services.config_base)) {
+    if (!current_admin || current_admin->accounts.empty() ||
+        current_admin->jwt_private_key.empty() ||
+        current_admin->jwt_public_key.empty()) {
         if (!admin_config_error.empty()) {
             LOG_WARN("admin login config reload failed: ", admin_config_error);
         }
         ctx.status_code = 503;
         ctx.response_body = resp_err(SERVER_ERROR, "admin API is not configured");
-        return;
+        co_return;
     }
 
     auto parsed = config_admin::parse_login_request(ctx.body);
     if (!parsed.ok) {
         ctx.status_code = 400;
         ctx.response_body = resp_err(PARAM_ERROR, parsed.error);
-        return;
+        co_return;
     }
 
     const auto client_ip = ctx.client_ip.empty() ? std::string("unknown") : ctx.client_ip;
     auto& throttle = admin_login_throttle();
-    if (throttle.locked(client_ip, parsed.request.username)) {
+    if (throttle.locked(client_ip)) {
         LOG_WARN("admin login rejected: locked username=", parsed.request.username,
             ", ip=", client_ip);
         admin_login_failed(ctx);
-        return;
+        co_return;
     }
 
+    auto& work_limiter = admin_auth_work_limiter();
+    if (!work_limiter.try_acquire()) {
+        ctx.status_code = 429;
+        ctx.response_headers.emplace_back("Retry-After", "1");
+        ctx.response_body = resp_err(429, "too many login attempts");
+        co_return;
+    }
+    AdminAuthWorkPermit permit(work_limiter);
+    if (services.admin_auth_workers) {
+        co_await asio::post(*services.admin_auth_workers, asio::use_awaitable);
+    }
+
+    if (!config_admin::admin_configured(*current_admin, services.config_base)) {
+        ctx.status_code = 503;
+        ctx.response_body = resp_err(SERVER_ERROR, "admin API is not configured");
+        co_return;
+    }
     if (!config_admin::verify_admin_password(
             *current_admin, parsed.request.username, parsed.request.password)) {
-        throttle.record_failure(client_ip, parsed.request.username);
+        throttle.record_failure(client_ip);
         LOG_WARN("admin login failed: username=", parsed.request.username,
             ", ip=", client_ip);
         admin_login_failed(ctx);
-        return;
+        co_return;
     }
 
     auto issued = config_admin::issue_admin_token(
@@ -284,15 +352,16 @@ void handle_api_admin_login_sync(HttpContext& ctx, const AppServices& services) 
     if (!issued) {
         ctx.status_code = 503;
         ctx.response_body = resp_err(SERVER_ERROR, "admin token signer is unavailable");
-        return;
+        co_return;
     }
 
-    throttle.record_success(client_ip, parsed.request.username);
+    throttle.record_success(client_ip);
     LOG_INFO("admin login succeeded: username=", parsed.request.username,
         ", ip=", client_ip);
     ctx.status_code = 200;
     ctx.response_body = resp_ok("{\"token\":\"" + json_escape(issued->token) +
         "\",\"expires_in\":" + std::to_string(issued->expires_in) + "}");
+    co_return;
 }
 
 class AdminRequestOperation : public std::enable_shared_from_this<AdminRequestOperation> {
@@ -309,6 +378,21 @@ public:
           kind_(kind) {}
 
     void start() noexcept {
+        if (services_.admin_auth_workers) {
+            auto self = shared_from_this();
+            try {
+                asio::post(*services_.admin_auth_workers,
+                    [self]() { self->start_blocking(); });
+            } catch (...) {
+                fail(std::current_exception());
+            }
+            return;
+        }
+        start_blocking();
+    }
+
+private:
+    void start_blocking() noexcept {
         try {
             if (!authorize_admin(ctx_, services_)) {
                 complete();
@@ -335,7 +419,6 @@ public:
         }
     }
 
-private:
     using ReplyCallback = std::function<void(RedisPool::Reply)>;
 
     void read_config_version(int attempt) {
@@ -390,6 +473,12 @@ private:
         auto self = shared_from_this();
         run_command({"HGETALL", std::string(config_admin::kFilesKey)},
             [self, version, attempt](RedisPool::Reply reply) {
+                if (!reply.ok) {
+                    self->ctx_.status_code = 500;
+                    self->ctx_.response_body = resp_err(DB_ERROR, reply.error);
+                    self->complete();
+                    return;
+                }
                 auto files = config_admin::parse_hgetall(reply);
                 if (!files || files->empty()) {
                     self->ctx_.status_code = 409;
@@ -550,7 +639,7 @@ private:
             parsed.request.reason, snapshot_info);
 
         std::vector<std::string> args{
-            "EVAL", config_admin::save_script(), "8",
+            "EVAL", config_admin::save_script(), "9",
             std::string(config_admin::kVersionKey),
             std::string(config_admin::kFilesKey),
             std::string(config_admin::kAuditKey),
@@ -559,6 +648,7 @@ private:
             std::string(config_history::kIndexKey),
             config_history::snapshot_key(new_version),
             std::string(config_history::kSnapshotStagingKey),
+            config_history::snapshot_key(parsed.request.base_version),
             std::to_string(parsed.request.base_version),
             config_admin::audit_json(
                 ctx_.admin_principal ? &*ctx_.admin_principal : nullptr,
@@ -691,11 +781,25 @@ private:
             asio::co_spawn(executor_, std::move(command),
                 [self, callback = std::move(callback)](
                     std::exception_ptr ep, RedisPool::Reply reply) mutable {
-                    try {
-                        if (ep) reply = redis_exception_reply(ep);
-                        callback(std::move(reply));
-                    } catch (...) {
-                        self->fail(std::current_exception());
+                    if (ep) reply = redis_exception_reply(ep);
+                    auto invoke =
+                        [self, callback = std::move(callback),
+                         reply = std::move(reply)]() mutable {
+                            try {
+                                callback(std::move(reply));
+                            } catch (...) {
+                                self->fail(std::current_exception());
+                            }
+                        };
+                    if (self->services_.admin_auth_workers) {
+                        try {
+                            asio::post(*self->services_.admin_auth_workers,
+                                std::move(invoke));
+                        } catch (...) {
+                            self->fail(std::current_exception());
+                        }
+                    } else {
+                        invoke();
                     }
                 });
         } catch (...) {
@@ -804,6 +908,21 @@ public:
           kind_(kind) {}
 
     void start() noexcept {
+        if (services_.admin_auth_workers) {
+            auto self = shared_from_this();
+            try {
+                asio::post(*services_.admin_auth_workers,
+                    [self]() { self->start_blocking(); });
+            } catch (...) {
+                fail(std::current_exception());
+            }
+            return;
+        }
+        start_blocking();
+    }
+
+private:
+    void start_blocking() noexcept {
         try {
             if (!authorize_admin(ctx_, services_)) {
                 complete();
@@ -841,7 +960,6 @@ public:
         }
     }
 
-private:
     using ReplyCallback = std::function<void(RedisPool::Reply)>;
     using DetailCallback =
         std::function<void(std::optional<config_history::SnapshotRecord>)>;
@@ -1155,7 +1273,7 @@ private:
             static_cast<int64_t>(std::time(nullptr)), user, "rollback",
             rollback_request_.reason, info, rollback_request_.target_version);
         std::vector<std::string> args{
-            "EVAL", config_history::rollback_script(), "9",
+            "EVAL", config_history::rollback_script(), "10",
             std::string(config_admin::kVersionKey),
             std::string(config_admin::kFilesKey),
             std::string(config_admin::kAuditKey),
@@ -1165,6 +1283,7 @@ private:
             config_history::snapshot_key(new_version),
             std::string(config_history::kSnapshotStagingKey),
             config_history::snapshot_key(rollback_request_.target_version),
+            config_history::snapshot_key(rollback_request_.base_version),
             std::to_string(rollback_request_.base_version),
             config_admin::audit_json(
                 ctx_.admin_principal ? &*ctx_.admin_principal : nullptr,
@@ -1422,7 +1541,8 @@ private:
         }
         LOG_ERROR("restoring config version pointer after explicit confirmation: current=",
             orphan_request_.current_version, ", target=",
-            orphan_request_.target_version, ", reason=", orphan_request_.reason);
+            orphan_request_.target_version, ", reason=",
+            sanitize_body_preview(orphan_request_.reason));
         auto self = shared_from_this();
         run_command(std::move(args), [self](RedisPool::Reply result) {
             self->handle_orphan_resolution_reply(
@@ -1452,7 +1572,8 @@ private:
         }
         LOG_ERROR("deleting confirmed unpublished config orphan: current=",
             orphan_request_.current_version, ", target=",
-            orphan_request_.target_version, ", reason=", orphan_request_.reason);
+            orphan_request_.target_version, ", reason=",
+            sanitize_body_preview(orphan_request_.reason));
         auto self = shared_from_this();
         run_command(std::move(args), [self](RedisPool::Reply result) {
             self->handle_orphan_resolution_reply(
@@ -1466,9 +1587,11 @@ private:
         if (!code || *code <= 0) {
             ctx_.status_code = (!reply.ok || !code || *code == -2 ||
                 *code == -3 || *code == -4) ? 500 : 409;
-            ctx_.response_body = json_resp(ctx_.status_code,
-                !reply.ok ? reply.error :
-                    "orphan resolution refused with code " + std::to_string(*code));
+            const std::string message = !reply.ok ? reply.error :
+                (!code ? "orphan resolution returned non-integer" :
+                    "orphan resolution refused with code " +
+                        std::to_string(*code));
+            ctx_.response_body = json_resp(ctx_.status_code, message);
             complete();
             return;
         }
@@ -1573,7 +1696,7 @@ private:
         }
         LOG_WARN("config history repair requested: action=", action,
             ", version=", repair_request_.version,
-            ", reason=", repair_request_.reason);
+            ", reason=", sanitize_body_preview(repair_request_.reason));
         auto self = shared_from_this();
         run_command(std::move(args),
             [self, action = std::move(action)](RedisPool::Reply reply) {
@@ -1666,11 +1789,25 @@ private:
             asio::co_spawn(executor_, std::move(command),
                 [self, callback = std::move(callback)](
                     std::exception_ptr ep, RedisPool::Reply reply) mutable {
-                    try {
-                        if (ep) reply = redis_exception_reply(ep);
-                        callback(std::move(reply));
-                    } catch (...) {
-                        self->fail(std::current_exception());
+                    if (ep) reply = redis_exception_reply(ep);
+                    auto invoke =
+                        [self, callback = std::move(callback),
+                         reply = std::move(reply)]() mutable {
+                            try {
+                                callback(std::move(reply));
+                            } catch (...) {
+                                self->fail(std::current_exception());
+                            }
+                        };
+                    if (self->services_.admin_auth_workers) {
+                        try {
+                            asio::post(*self->services_.admin_auth_workers,
+                                std::move(invoke));
+                        } catch (...) {
+                            self->fail(std::current_exception());
+                        }
+                    } else {
+                        invoke();
                     }
                 });
         } catch (...) {
@@ -1866,8 +2003,7 @@ asio::awaitable<void> api_build(HttpContext& ctx) {
 }
 
 asio::awaitable<void> handle_api_admin_login(HttpContext& ctx, AppServices services) {
-    handle_api_admin_login_sync(ctx, services);
-    co_return;
+    return handle_api_admin_login_impl(ctx, std::move(services));
 }
 
 asio::awaitable<void> handle_api_admin_config(HttpContext& ctx, AppServices services) {
@@ -1929,6 +2065,12 @@ asio::awaitable<void> handle_admin_page(HttpContext& ctx) {
     }
     ctx.status_code = 200;
     ctx.response_headers.emplace_back("Content-Type", "text/html; charset=utf-8");
+    ctx.response_headers.emplace_back("Cache-Control", "no-store");
+    ctx.response_headers.emplace_back("Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'");
     ctx.response_body = config_admin::admin_login_html();
     co_return;
 }
@@ -1942,6 +2084,12 @@ asio::awaitable<void> handle_admin_settings_page(HttpContext& ctx) {
     }
     ctx.status_code = 200;
     ctx.response_headers.emplace_back("Content-Type", "text/html; charset=utf-8");
+    ctx.response_headers.emplace_back("Cache-Control", "no-store");
+    ctx.response_headers.emplace_back("Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'");
     ctx.response_body = config_admin::admin_settings_html();
     co_return;
 }

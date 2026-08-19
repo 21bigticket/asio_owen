@@ -62,7 +62,8 @@ public:
 
     ConfigHistoryService(asio::io_context& ioc, Command command,
                          ConfigHistoryConfig cfg, int redis_cmd_timeout_ms)
-        : timer_(ioc),
+        : ioc_(ioc),
+          timer_(ioc),
           command_(std::move(command)),
           cfg_(std::move(cfg)),
           redis_cmd_timeout_ms_(redis_cmd_timeout_ms) {}
@@ -78,6 +79,7 @@ public:
             timer_.cancel();
         } catch (...) {
         }
+        if (ioc_.stopped()) return;
         std::unique_lock lock(in_flight_mu_);
         const int timeout = (redis_cmd_timeout_ms_ <= 0 ? 30000 :
             redis_cmd_timeout_ms_) + 500;
@@ -105,11 +107,11 @@ public:
     }
 
     void run_once_for_test(std::function<void()> completion) {
-        run_health_check(std::move(completion));
+        request_health_check(std::move(completion));
     }
 
     void refresh(std::function<void()> completion) {
-        run_health_check(std::move(completion));
+        request_health_check(std::move(completion));
     }
 
 private:
@@ -119,22 +121,66 @@ private:
         auto self = shared_from_this();
         timer_.async_wait([self](std::error_code ec) {
             if (ec || !self->running_.load(std::memory_order_acquire)) return;
-            {
-                std::lock_guard lock(self->in_flight_mu_);
-                self->in_flight_ = true;
-            }
-            self->run_health_check([self]() { self->finish_tick(); });
+            self->request_health_check([self]() {
+                if (self->running_.load(std::memory_order_acquire)) {
+                    self->schedule_after(
+                        std::chrono::seconds(self->cfg_.gc_interval_sec));
+                }
+            });
         });
     }
 
-    void finish_tick() {
+    void request_health_check(std::function<void()> completion) {
+        bool launch = false;
         {
             std::lock_guard lock(in_flight_mu_);
-            in_flight_ = false;
+            pending_health_checks_.push_back(std::move(completion));
+            if (!in_flight_) {
+                in_flight_ = true;
+                launch = true;
+            }
         }
-        in_flight_cv_.notify_all();
-        if (running_.load(std::memory_order_acquire)) {
-            schedule_after(std::chrono::seconds(cfg_.gc_interval_sec));
+        if (launch) launch_health_check();
+    }
+
+    void launch_health_check() {
+        std::vector<std::function<void()>> completions;
+        {
+            std::lock_guard lock(in_flight_mu_);
+            completions.swap(pending_health_checks_);
+        }
+        auto self = shared_from_this();
+        run_health_check(
+            [self, completions = std::move(completions)]() mutable {
+                self->finish_health_check(std::move(completions));
+            });
+    }
+
+    void finish_health_check(
+        std::vector<std::function<void()>> completions) {
+        for (auto& completion : completions) {
+            try {
+                if (completion) completion();
+            } catch (const std::exception& e) {
+                LOG_ERROR("ConfigHistory completion failed: ", e.what());
+            } catch (...) {
+                LOG_ERROR("ConfigHistory completion failed with unknown exception");
+            }
+        }
+
+        bool launch = false;
+        {
+            std::lock_guard lock(in_flight_mu_);
+            if (pending_health_checks_.empty()) {
+                in_flight_ = false;
+            } else {
+                launch = true;
+            }
+        }
+        if (launch) {
+            launch_health_check();
+        } else {
+            in_flight_cv_.notify_all();
         }
     }
 
@@ -147,7 +193,9 @@ private:
                      "asio_owen:config:machines",
                      std::string(config_history::kMetaKey),
                      "asio_owen:config:files",
-                     std::string(config_history::kSnapshotPrefix)},
+                     std::string(config_history::kSnapshotPrefix),
+                     std::to_string(static_cast<int64_t>(std::time(nullptr))),
+                     std::to_string(cfg_.machine_ttl_sec)},
             [self, completion = std::move(completion)](Reply reply) mutable {
                 if (!reply.ok || reply.type != "array" ||
                     reply.elements.size() != 4) {
@@ -459,10 +507,18 @@ local index_high = 0
 local top = redis.call('ZREVRANGE', KEYS[2], 0, 0)
 if top[1] ~= nil then index_high = tonumber(top[1]) or -1 end
 local machine_high = 0
-local machines = redis.call('HVALS', KEYS[3])
-for _, value in ipairs(machines) do
-  local version = tonumber(string.match(value, '^([^|]+)'))
-  if version ~= nil and version > machine_high then machine_high = version end
+local now = tonumber(ARGV[2]) or 0
+local machine_ttl = tonumber(ARGV[3]) or 3600
+local machines = redis.call('HGETALL', KEYS[3])
+for i = 1, #machines, 2 do
+  local value = machines[i + 1]
+  local timestamp = tonumber(string.match(value, '^[^|]+|([^|]+)'))
+  if timestamp == nil or now - timestamp > machine_ttl then
+    redis.call('HDEL', KEYS[3], machines[i])
+  else
+    local version = tonumber(string.match(value, '^([^|]+)'))
+    if version ~= nil and version > machine_high then machine_high = version end
+  end
 end
 local integrity = 'ok'
 if current > 0 then
@@ -535,12 +591,13 @@ return 1
 )";
     }
 
+    asio::io_context& ioc_;
     asio::steady_timer timer_;
     Command command_;
     ConfigHistoryConfig cfg_;
     int redis_cmd_timeout_ms_ = 500;
     std::atomic<bool> running_{false};
-    std::atomic<bool> inconsistent_{false};
+    std::atomic<bool> inconsistent_{true};
     std::atomic<int64_t> max_observed_version_{0};
     std::atomic<uint64_t> checks_{0};
     std::atomic<uint64_t> inconsistent_checks_{0};
@@ -548,5 +605,6 @@ return 1
     std::atomic<uint64_t> gc_failures_{0};
     std::mutex in_flight_mu_;
     std::condition_variable in_flight_cv_;
+    std::vector<std::function<void()>> pending_health_checks_;
     bool in_flight_ = false;
 };

@@ -42,6 +42,7 @@ struct ConfigHistoryConfig {
     size_t max_diff_response_bytes = 2 * 1024 * 1024;
     size_t gc_batch_size = 20;
     int gc_interval_sec = 300;
+    int machine_ttl_sec = 3600;
 };
 
 struct ConfigSyncConfig {
@@ -84,6 +85,10 @@ inline AdminConfig admin_config_from(const Config& cfg) {
             continue;
         }
         if (key.empty() || value.empty()) {
+            continue;
+        }
+        if (value.rfind("pbkdf2_sha256$", 0) != 0) {
+            LOG_WARN("ignoring unknown [admin] option or invalid account hash: ", key);
             continue;
         }
         auto it = std::find_if(admin.accounts.begin(), admin.accounts.end(),
@@ -146,6 +151,8 @@ inline ConfigHistoryConfig config_history_from(const Config& cfg) {
         cfg.get_int("config_history", "gc_batch_size", 20), 1, 20));
     history.gc_interval_sec = std::max(
         10, cfg.get_int("config_history", "gc_interval_sec", 300));
+    history.machine_ttl_sec = std::max(
+        60, cfg.get_int("config_history", "machine_ttl_sec", 3600));
 
     history.max_snapshot_bytes = std::max(
         history.max_snapshot_bytes, history.max_file_bytes);

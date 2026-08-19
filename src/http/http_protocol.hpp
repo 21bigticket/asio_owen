@@ -15,6 +15,7 @@ static constexpr size_t kMaxBodySize = 10 * 1024 * 1024;
 
 struct HeaderParseState {
     std::optional<size_t> content_length;
+    bool invalid_header_name = false;
     bool duplicate_content_length = false;
     bool invalid_content_length = false;
     bool is_chunked = false;
@@ -114,6 +115,9 @@ inline HeaderTokens split_connection_tokens(std::string_view value, std::vector<
 }
 
 inline void update_header_state(std::string_view k, std::string_view v, HeaderParseState& state) {
+    if (trim_view(k).size() != k.size()) {
+        state.invalid_header_name = true;
+    }
     k = trim_view(k);
     v = trim_view(v);
     if (header_iequals(k, "content-length")) {
@@ -165,12 +169,12 @@ inline void parse_header_pair_into(
     std::string_view value,
     std::vector<std::pair<std::string, std::string>>* out,
     HeaderParseState& state) {
+    update_header_state(key, value, state);
     auto k = trim_copy(key);
     auto v = trim_copy(value);
     if (out) {
         out->emplace_back(k, v);
     }
-    update_header_state(k, v, state);
 }
 
 inline void parse_header_line_into(

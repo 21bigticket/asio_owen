@@ -98,7 +98,7 @@ inline std::string build_proxy_request(
     }
     // Pass 2: detect Transfer-Encoding.
     for (auto& [k, v] : ctx.headers) {
-        if (header_iequals(k, "transfer-encoding")) {
+        if (header_iequals(trim_view(k), "transfer-encoding")) {
             forwarding_transfer_encoding = true;
             break;
         }
@@ -108,20 +108,22 @@ inline std::string build_proxy_request(
         forward_req += "Content-Length: " + std::to_string(ctx.body.size()) + "\r\n";
     }
     for (auto& [k, v] : ctx.headers) {
-        if (header_iequals(k, "transfer-encoding") && request_header_state.is_chunked) {
+        const auto name = trim_view(k);
+        if (header_iequals(name, "transfer-encoding") &&
+            request_header_state.is_chunked) {
             continue;
         }
-        if (header_iequals(k, "transfer-encoding")) {
-            forward_req += k + ": " + v + "\r\n";
+        if (header_iequals(name, "transfer-encoding")) {
+            forward_req += std::string(name) + ": " + v + "\r\n";
             continue;
         }
-        if (forwarding_transfer_encoding && header_iequals(k, "content-length")) {
+        if (forwarding_transfer_encoding && header_iequals(name, "content-length")) {
             continue;
         }
-        if (contains_header_name(filtered, k)) {
+        if (contains_header_name(filtered, name)) {
             continue;
         }
-        forward_req += k + ": " + v + "\r\n";
+        forward_req += std::string(name) + ": " + v + "\r\n";
     }
 
     if (send_keep_alive_header) {
