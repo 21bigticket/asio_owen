@@ -13,7 +13,9 @@ void MysqlPoolStats::inc_acquire_retry_exhausted() { ++acquire_retry_exhausted_t
 void MysqlPoolStats::add_idle_recycled(uint64_t n) { idle_recycled_total_ += n; }
 void MysqlPoolStats::inc_ping_fail() { ++ping_fail_total_; }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 MysqlPoolStatsSnapshot MysqlPoolStats::snapshot(
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     size_t total,
     size_t idle,
     size_t creating,

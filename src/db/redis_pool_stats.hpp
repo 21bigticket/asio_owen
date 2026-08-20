@@ -41,6 +41,9 @@ public:
     void inc_ping_fail();
 
     RedisPoolStatsSnapshot base_snapshot(size_t created_total) const;
+    // Positional counters mirror MysqlPoolStats and are intentionally kept
+    // in the public snapshot order.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     RedisPoolStatsSnapshot snapshot(
         size_t created_total,
         size_t total_conn = 0,

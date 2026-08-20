@@ -2,7 +2,7 @@
 
 **日期**：2026-08-20  
 **评估对象**：当前工作区及最近一次 Ubuntu/GCC 11 部署构建  
-**当前评分**：约 **8.4 / 10**  
+**当前评分**：约 **8.5 / 10**
 **目标评分**：**9.0 / 10**  
 **评分口径**：架构、内存安全、并发正确性、异常安全、性能、工程纪律六维度综合评估
 
@@ -34,6 +34,19 @@
 - 本轮输出中已不再出现此前的 `AppServices` missing-field-initializers、未使用 `checksum` 和未使用 client-session 辅助函数 warning。
 
 这次结果确认了 GCC 11 兼容性、普通构建和部署冒烟链路；它不会替代 ASan、TSan、clang-tidy、fuzz、Redis 应用故障矩阵和受控 A/B 的独立证据。
+
+### 1.2 最新 VM 工具链验证：2026-08-20 16:34（Asia/Shanghai）
+
+在授权 Ubuntu VM 上安装 LLVM/Clang 14 后完成以下验证：
+
+- **ASan**：`build_score_asan` 目标集 CTest `253/253` 通过，唯一跳过项仍为权限条件的 `ConfigLoad.RejectsUnreadableFileInsteadOfSilentlySkipping`；未见 AddressSanitizer 运行时错误。GCC/ASIO 模板产生的 `-Wmismatched-new-delete` 是编译 warning，不是 ASan 运行时故障。
+- **TSan**：先发现两个测试 harness 使用 `condition_variable` 的同步报告，已改为 `promise/future`；随后完整 CTest `333/333` 通过，未见 ThreadSanitizer 报告。
+- **clang-tidy**：真实构建 `asio_owen_app`，不是只做配置。Redis timeval 窄化/乘法问题和 Clang 结构化绑定捕获问题已修正；当前规则仍报告 **47 条** `bugprone-*`/`performance-*` warnings-as-errors，构建退出码 2，主要集中在已有 header API 参数顺序、字符串拼接、窄化转换和不必要拷贝。这项尚未达标。
+- **fuzz**：使用 Clang 14/libFuzzer 构建六个目标；每个固定运行 10 秒、RSS 上限 2 GiB，六个退出码均为 0，无 crash/oom/timeout。artifact 目录为 `/tmp/asio-fuzz-artifacts/`。
+- **压测**：VM 当前部署服务，`wrk` 6 threads/50 connections。`/api/health` 运行 15 秒为 `129,784.39 RPS`、平均延迟 `396.89us`；配置直连为 `13,838.87 RPS`/`4.03ms`，Gateway 为 `11,060.59 RPS`/`4.65ms`，两组均 0 非 2xx。该结果是稳定性和量级证据，不等同于 baseline/candidate 交替 A/B。
+- **本地回归**：GCC 本地 `server`、两个改动测试目标编译成功，`git diff --check` 通过。
+
+据此评分从 8.4 上调到约 8.5：内存安全、并发证据和 fuzz/单机性能证据明显补齐；clang-tidy 全量清零、真实 Redis 故障矩阵、受控 A/B、CI 绿跑和分提交纪律仍是 9.0 的硬缺口。
 
 ## 2. 到 9.0 的硬门槛
 
@@ -122,11 +135,11 @@
 - `test_client_session` 生命周期测试；
 - Admin/config/history/reload 相关测试。
 
-验收：ASan 和 TSan workflow 均为绿色；不能只看 configure 成功或空匹配成功。
+当前 VM 实测：ASan 目标集 `253/253`、TSan 全量 `333/333` 均通过；仍需把同样结果固化到实际 `master` CI run。
 
 ### 5.2 clang-tidy
 
-clang-tidy 必须在实际应用库目标上执行，而不是只配置不编译。当前门禁重点是 `bugprone-*` 和 `performance-*`，出现新诊断应阻断构建。
+clang-tidy 已在实际应用库目标上执行；当前 LLVM 14 构建仍因 47 条 warnings-as-errors 失败。必须逐项修复或经过代码所有者审查后精确豁免，不能通过降低门禁范围来制造绿色结果。
 
 ### 5.3 Fuzz
 
@@ -134,7 +147,7 @@ clang-tidy 必须在实际应用库目标上执行，而不是只配置不编译
 
 `fuzz_admin_json`、`fuzz_path_normalize`、`fuzz_http_framing`、`fuzz_ini`、`fuzz_history`、`fuzz_jwt`。
 
-记录运行时长、执行次数、crash/oom/timeout 结果和 corpus 位置。没有原始运行证据时，只能记为“目标已定义”，不能记为“fuzz 已验证”。
+VM 实测六目标各运行 10 秒，退出码均为 0，无 crash/oom/timeout；artifact 目录为 `/tmp/asio-fuzz-artifacts/`。后续仍应把日志和固定 corpus 归档到 CI 工件。
 
 ### 5.4 Redis 故障矩阵
 
@@ -152,7 +165,7 @@ clang-tidy 必须在实际应用库目标上执行，而不是只配置不编译
 - 固定 `BASELINE_PID`、`CANDIDATE_PID` 或等价进程参数；
 - 记录 RPS、p50/p95/p99、CPU、RSS、FD、5xx/连接错误。
 
-验收建议：candidate 相对 baseline 无统计显著回退；若有变化，必须解释是实现变化还是环境噪声。性能分不以“脚本存在”计满分，以归档的原始结果计分。
+验收建议：candidate 相对 baseline 无统计显著回退；若有变化，必须解释是实现变化还是环境噪声。性能分不以“脚本存在”计满分，以归档的原始结果计分。本轮已完成单机 health 以及 direct/gateway 配置对比，但没有第二个候选进程的轮级交替 A/B，因此性能项只能部分计分。
 
 ## 7. P2：架构收敛
 

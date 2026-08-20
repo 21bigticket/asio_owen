@@ -33,7 +33,9 @@ RedisPoolStatsSnapshot RedisPoolStats::base_snapshot(size_t created_total) const
     };
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 RedisPoolStatsSnapshot RedisPoolStats::snapshot(
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     size_t created_total,
     size_t total_conn,
     size_t idle_conn,

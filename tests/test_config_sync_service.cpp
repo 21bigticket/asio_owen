@@ -9,8 +9,8 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <functional>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -274,9 +274,8 @@ TEST(ConfigSyncService, RedisCompletionProcessingUsesFileWorker) {
     auto base = make_temp_base("file_worker");
     asio::io_context ioc;
     asio::thread_pool workers(1);
-    std::mutex mu;
-    std::condition_variable cv;
-    bool completed = false;
+    std::promise<void> completion_promise;
+    auto completion_future = completion_promise.get_future();
     std::thread::id completion_thread;
     const auto caller_thread = std::this_thread::get_id();
     auto service = std::make_shared<ConfigSyncService>(
@@ -288,18 +287,11 @@ TEST(ConfigSyncService, RedisCompletionProcessingUsesFileWorker) {
         base, sync_config(), app_config(), &workers);
 
     service->sync_once_for_test([&](bool) {
-        {
-            std::lock_guard lock(mu);
-            completion_thread = std::this_thread::get_id();
-            completed = true;
-        }
-        cv.notify_one();
+        completion_thread = std::this_thread::get_id();
+        completion_promise.set_value();
     });
-    {
-        std::unique_lock lock(mu);
-        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
-            [&] { return completed; }));
-    }
+    ASSERT_EQ(completion_future.wait_for(std::chrono::seconds(1)),
+        std::future_status::ready);
     workers.join();
 
     EXPECT_NE(completion_thread, caller_thread);

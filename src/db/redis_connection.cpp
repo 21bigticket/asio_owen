@@ -27,7 +27,10 @@ redisContext* create_redis_connection(
     std::atomic<size_t>& created_total) {
     int connect_ms = cfg.connect_timeout_ms;
     if (connect_ms < 100) connect_ms = 100;
-    timeval tv = {connect_ms / 1000, (connect_ms % 1000) * 1000};
+    timeval tv = {
+        static_cast<time_t>(connect_ms / 1000),
+        static_cast<suseconds_t>(connect_ms % 1000) * 1000
+    };
     redisContext* ctx = redisConnectWithTimeout(cfg.host.c_str(), cfg.port, tv);
     if (!ctx || ctx->err) {
         std::string err = ctx ? ctx->errstr : "allocation failed";
@@ -39,7 +42,10 @@ redisContext* create_redis_connection(
     if (cfg.cmd_timeout_ms > 0) {
         int cmd_ms = cfg.cmd_timeout_ms;
         if (cmd_ms < 100) cmd_ms = 100;
-        timeval cmd_tv = {cmd_ms / 1000, (cmd_ms % 1000) * 1000};
+        timeval cmd_tv = {
+            static_cast<time_t>(cmd_ms / 1000),
+            static_cast<suseconds_t>(cmd_ms % 1000) * 1000
+        };
         redisSetTimeout(ctx, cmd_tv);
     }
 

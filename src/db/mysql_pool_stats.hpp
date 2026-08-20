@@ -35,6 +35,8 @@ public:
     void add_idle_recycled(uint64_t n);
     void inc_ping_fail();
 
+    // Positional counters are intentionally ordered to match the snapshot.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     MysqlPoolStatsSnapshot snapshot(
         size_t total,
         size_t idle,

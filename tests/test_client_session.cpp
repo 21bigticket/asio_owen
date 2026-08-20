@@ -7,8 +7,8 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 
@@ -569,19 +569,17 @@ TEST_F(ClientSessionTest, ReloadBetweenSecurityCheckAndRouteRefreshesCorsPolicy)
     rules.load_from_config(old_cfg);
     server().set_security_rules(&rules);
 
-    std::mutex hook_mu;
-    std::condition_variable hook_cv;
-    bool first_check_entered = false;
-    bool release_first_check = false;
-    int hook_calls = 0;
+    std::promise<void> hook_entered_promise;
+    auto hook_entered_future = hook_entered_promise.get_future();
+    std::promise<void> release_promise;
+    auto release_future = release_promise.get_future().share();
+    std::atomic<int> hook_calls{0};
     server().set_after_initial_security_check_for_test([&] {
-        std::unique_lock lock(hook_mu);
-        if (++hook_calls != 1) {
+        if (hook_calls.fetch_add(1, std::memory_order_acq_rel) != 0) {
             return;
         }
-        first_check_entered = true;
-        hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_first_check; });
+        hook_entered_promise.set_value();
+        release_future.wait();
     });
     start_server();
 
@@ -600,20 +598,12 @@ TEST_F(ClientSessionTest, ReloadBetweenSecurityCheckAndRouteRefreshesCorsPolicy)
         }
     });
 
-    bool reached_hook = false;
-    {
-        std::unique_lock lock(hook_mu);
-        reached_hook = hook_cv.wait_for(lock, std::chrono::seconds(1), [&] {
-            return first_check_entered;
-        });
-    }
+    const bool reached_hook =
+        hook_entered_future.wait_for(std::chrono::seconds(1)) ==
+        std::future_status::ready;
 
     if (!reached_hook) {
-        {
-            std::lock_guard lock(hook_mu);
-            release_first_check = true;
-        }
-        hook_cv.notify_all();
+        release_promise.set_value();
         client.join();
         server().set_security_rules(nullptr);
         FAIL() << "request did not reach post-security-check hook";
@@ -629,11 +619,7 @@ TEST_F(ClientSessionTest, ReloadBetweenSecurityCheckAndRouteRefreshesCorsPolicy)
     rules.publish_reload(std::move(prepared_security));
     server().upstreams().publish_reload(std::move(prepared_upstreams));
 
-    {
-        std::lock_guard lock(hook_mu);
-        release_first_check = true;
-    }
-    hook_cv.notify_all();
+    release_promise.set_value();
     client.join();
     server().set_security_rules(nullptr);
 

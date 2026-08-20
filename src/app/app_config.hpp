@@ -91,14 +91,15 @@ inline AdminConfig admin_config_from(const Config& cfg) {
             LOG_WARN("ignoring unknown [admin] option or invalid account hash: ", key);
             continue;
         }
+        const auto account_name = key;
         auto it = std::find_if(admin.accounts.begin(), admin.accounts.end(),
-            [&](const AdminAccountConfig& account) {
-                return account.username == key;
+            [account_name](const AdminAccountConfig& account) {
+                return account.username == account_name;
             });
         if (it != admin.accounts.end()) {
             it->password_hash = value;
         } else {
-            admin.accounts.push_back({key, value});
+            admin.accounts.push_back({account_name, value});
         }
     }
     return admin;
