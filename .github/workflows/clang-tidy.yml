@@ -1,0 +1,18 @@
+name: clang-tidy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  clang-tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy libmysqlclient-dev libhiredis-dev libssl-dev
+      - name: Configure
+        run: cmake -B build-tidy -S . -DBUILD_TESTING=OFF -DASIO_OWEN_ENABLE_CLANG_TIDY=ON
+      - name: Build with clang-tidy
+        run: cmake --build build-tidy --target asio_owen_app -j2

@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  core:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -17,9 +17,37 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhiredis-dev libmysqlclient-dev pkg-config
       - name: Configure
         run: cmake -B build-${{ matrix.sanitizer }} -S . -DASIO_OWEN_SANITIZER=${{ matrix.sanitizer }}
-      - name: Build sanitizer test targets
-        run: cmake --build build-${{ matrix.sanitizer }} --target test_combo_query_limiter test_combo_routes test_rate_limiter test_config_load test_path_normalize test_ip_blacklist test_cors -j 2
-      - name: Run service-free tests
+      - name: Build core sanitizer test targets
+        run: >-
+          cmake --build build-${{ matrix.sanitizer }} --target
+          test_combo_query_limiter test_combo_routes test_rate_limiter
+          test_ready_routes test_shutdown_coordinator test_route_runtime
+          test_config_load test_path_normalize test_ip_blacklist test_cors
+          test_http_pool test_http_protocol test_proxy_forwarder test_proxy_framing
+          test_client_session test_security_chain -j 2
+      - name: Run core service-free tests
         run: >-
           ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
-          -R '^(ComboQueryLimiter|ComboQueryDeadline|ComboRoute|RateLimiter|ConfigLoad|PathNormalize|IpBlacklist|NormalizeIp|MatchCidr|SecurityRuleValues|CorsPolicy|ApplyHeaders|Preflight|LoadCorsPolicy)'
+          -R '^(ComboQueryLimiter|ComboQueryDeadline|ComboRoute|RateLimiter|ConfigLoad|PathNormalize|IpBlacklist|NormalizeIp|MatchCidr|SecurityRuleValues|CorsPolicy|ApplyHeaders|Preflight|LoadCorsPolicy|HttpPool|HttpProtocol|ProxyForwarder|ProxyFraming|ClientSession.*|SecurityChainTest|ReadyRoutes?|ShutdownCoordinator|RouteRuntime)'
+
+  config:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhiredis-dev libmysqlclient-dev pkg-config
+      - name: Configure
+        run: cmake -B build-${{ matrix.sanitizer }} -S . -DASIO_OWEN_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build config sanitizer test targets
+        run: >-
+          cmake --build build-${{ matrix.sanitizer }} --target
+          test_admin_config_routes test_config_sync_service test_config_history
+          test_reload_service test_ready_routes test_shutdown_coordinator test_route_runtime -j 2
+      - name: Run config service-free tests
+        run: >-
+          ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
+          -R '^(AdminConfigRoutes|ConfigSyncService|ConfigHistory|ConfigHistoryService|ReloadService|ReadyRoutes?|ShutdownCoordinator|RouteRuntime)'
