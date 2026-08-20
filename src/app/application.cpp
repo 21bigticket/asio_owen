@@ -1,6 +1,7 @@
 #include "application.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -152,15 +153,34 @@ void Application::stop_after_handler_exception() noexcept {
 
 void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
                              const std::filesystem::path& config_base) {
-    mysql_ = std::make_unique<MysqlPool>(ioc_, app_cfg.mysql);
-    redis_ = std::make_unique<RedisPool>(ioc_, app_cfg.redis);
-    admin_auth_workers_ = std::make_unique<asio::thread_pool>(2);
-    config_file_workers_ = std::make_unique<asio::thread_pool>(1);
+    draining_state_->store(false, std::memory_order_release);
+    admin_credentials_ = std::make_shared<AdminCredentialStore>(config_base);
+    admin_metrics_ = std::make_shared<AdminRuntimeMetrics>();
+    config_metrics_ = std::make_shared<ConfigSyncRuntimeMetrics>();
+    admin_login_throttle_ = std::make_shared<AdminLoginThrottle>();
+    admin_auth_limiter_ = std::make_shared<AdminAuthWorkLimiter>();
+    route_runtime_ = std::make_shared<RouteRuntime>();
+    route_runtime_->shutdown = shutdown_coordinator_;
+    route_runtime_->mysql = std::make_shared<MysqlPool>(ioc_, app_cfg.mysql);
+    route_runtime_->redis = std::make_shared<RedisPool>(ioc_, app_cfg.redis);
+    route_runtime_->admin_auth_workers = std::make_shared<asio::thread_pool>(2);
+    route_runtime_->config_file_workers = std::make_shared<asio::thread_pool>(1);
+    route_runtime_->admin_credentials = admin_credentials_;
+    route_runtime_->admin_metrics = admin_metrics_;
+    route_runtime_->admin_login_throttle = admin_login_throttle_;
+    route_runtime_->admin_auth_limiter = admin_auth_limiter_;
+    route_runtime_->config_metrics = config_metrics_;
+    mysql_ = nullptr;
+    redis_ = nullptr;
+    admin_auth_workers_ = nullptr;
+    config_file_workers_ = nullptr;
+    auto& redis = *route_runtime_->redis;
     combo_query_limiter_ = std::make_shared<ComboQueryLimiter>(
         app_cfg.combo_max_in_flight_queries);
     server_ = std::make_unique<HttpServer>(
         ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms,
-        app_cfg.client_header_read_timeout_ms, app_cfg.client_body_read_timeout_ms);
+        app_cfg.client_header_read_timeout_ms, app_cfg.client_body_read_timeout_ms,
+        shutdown_coordinator_, route_runtime_);
 
     security_rules_ = std::make_unique<SecurityRules>();
     security_rules_->load_from_config(cfg);
@@ -170,21 +190,28 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     snapshot_service_->start(app_cfg.snapshot_interval_sec);
 
     config_history_service_ = std::make_shared<ConfigHistoryService>(
-        ioc_, *redis_, app_cfg.config_sync.history, app_cfg.redis.cmd_timeout_ms);
+        ioc_, redis, app_cfg.config_sync.history, app_cfg.redis.cmd_timeout_ms);
 
     register_routes(*server_, AppServices{
-        .mysql = mysql_.get(),
-        .redis = redis_.get(),
+        .runtime = route_runtime_,
+        .mysql = route_runtime_->mysql.get(),
+        .redis = route_runtime_->redis.get(),
         .combo_query_limiter = combo_query_limiter_,
-        .combo_backend = make_pool_combo_backend(mysql_.get(), redis_.get()),
+        .combo_backend = make_pool_combo_backend(route_runtime_->mysql.get(), route_runtime_->redis.get()),
         .combo_deadline_ms = app_cfg.combo_deadline_ms,
         .config_base = config_base,
         .config_sync = app_cfg.config_sync,
         .config_history_service = config_history_service_,
-        .redis_command = [redis = redis_.get()](std::vector<std::string> args) {
+        .redis_command = [redis = route_runtime_->redis.get()](std::vector<std::string> args) {
             return redis->cmd_argv(std::move(args));
         },
-        .admin_auth_workers = admin_auth_workers_.get()
+        .admin_auth_workers = route_runtime_->admin_auth_workers.get(),
+        .draining_state = draining_state_,
+        .admin_credentials = route_runtime_->admin_credentials,
+        .admin_metrics = admin_metrics_,
+        .admin_login_throttle = route_runtime_->admin_login_throttle,
+        .admin_auth_limiter = route_runtime_->admin_auth_limiter,
+        .upstreams = &server_->upstreams()
     });
 
     register_upstreams(cfg, app_cfg.http_pool);
@@ -193,8 +220,8 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     pool_stats_service_->start(app_cfg.http_pool_stats_interval_sec);
 
     config_sync_service_ = std::make_shared<ConfigSyncService>(
-        ioc_, *redis_, config_base, app_cfg.config_sync, app_cfg,
-        config_file_workers_.get());
+        ioc_, redis, config_base, app_cfg.config_sync, app_cfg,
+        route_runtime_->config_file_workers.get(), config_metrics_);
     config_sync_service_->start();
     config_history_service_->start();
 
@@ -209,16 +236,65 @@ void Application::register_upstreams(const Config& cfg, const HttpPool::Config& 
 
 void Application::request_stop() {
     if (stop_requested_.exchange(true)) return;
+    const bool began_draining = route_runtime_
+        ? route_runtime_->begin_draining()
+        : shutdown_coordinator_->begin_draining();
+    if (!began_draining) return;
+    draining_state_->store(true, std::memory_order_release);
+    const auto now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (admin_metrics_) admin_metrics_->drain_started_ns.store(now_ns, std::memory_order_relaxed);
     LOG_INFO("Graceful shutdown requested...");
     if (server_) server_->stop();
-
-    drain_timer_ = std::make_unique<asio::steady_timer>(ioc_);
-    drain_timer_->expires_after(std::chrono::seconds(5));
-    drain_timer_->async_wait([this](std::error_code ec) {
-        if (ec) return;
-        LOG_INFO("Drain timeout, stopping io_context...");
+    try {
+        asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
+            const bool drained = co_await shutdown_coordinator_->wait_for_drain(
+                std::chrono::seconds(5));
+            if (!drained) {
+                if (admin_metrics_) {
+                    admin_metrics_->drain_timeout_count.fetch_add(1, std::memory_order_relaxed);
+                    admin_metrics_->forced_stop_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                LOG_INFO("Drain timeout, active sessions=",
+                    shutdown_coordinator_->active_sessions());
+            }
+            if (admin_metrics_) {
+                const auto started = admin_metrics_->drain_started_ns.load(
+                    std::memory_order_relaxed);
+                const auto completed = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                if (started != 0 && completed >= started) {
+                    admin_metrics_->drain_duration_ns.store(
+                        completed - started, std::memory_order_relaxed);
+                }
+            }
+            if (route_runtime_) route_runtime_->mark_stopped();
+            else shutdown_coordinator_->mark_stopped();
+            if (admin_metrics_) admin_metrics_->drain_completed_ns.store(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()),
+                std::memory_order_relaxed);
+            ioc_.stop();
+            co_return;
+        }, asio::detached);
+    } catch (...) {
+        if (admin_metrics_) {
+            admin_metrics_->forced_stop_count.fetch_add(1, std::memory_order_relaxed);
+            const auto completed = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            admin_metrics_->drain_completed_ns.store(completed, std::memory_order_relaxed);
+            const auto started = admin_metrics_->drain_started_ns.load(std::memory_order_relaxed);
+            if (started != 0 && completed >= started) {
+                admin_metrics_->drain_duration_ns.store(
+                    completed - started, std::memory_order_relaxed);
+            }
+        }
+        if (route_runtime_) route_runtime_->mark_stopped();
+        else shutdown_coordinator_->mark_stopped();
         ioc_.stop();
-    });
+    }
 }
 
 void Application::cleanup() {
@@ -228,8 +304,8 @@ void Application::cleanup() {
     if (pool_stats_service_) pool_stats_service_->stop();
     if (snapshot_service_) snapshot_service_->stop();
     if (server_) server_->stop();
-    if (admin_auth_workers_) admin_auth_workers_->join();
-    if (config_file_workers_) config_file_workers_->join();
+    if (route_runtime_ && route_runtime_->admin_auth_workers) route_runtime_->admin_auth_workers->join();
+    if (route_runtime_ && route_runtime_->config_file_workers) route_runtime_->config_file_workers->join();
 
     signal_exit_.reset();
     config_history_service_.reset();
@@ -238,14 +314,19 @@ void Application::cleanup() {
     pool_stats_service_.reset();
     snapshot_service_.reset();
     server_.reset();
+    admin_credentials_.reset();
+    admin_metrics_.reset();
+    config_metrics_.reset();
+    admin_login_throttle_.reset();
+    admin_auth_limiter_.reset();
+    if (route_runtime_ && route_runtime_->mysql) route_runtime_->mysql->shutdown();
+    if (route_runtime_ && route_runtime_->redis) route_runtime_->redis->shutdown();
+    if (route_runtime_) route_runtime_->mark_stopped();
+    route_runtime_.reset();
     admin_auth_workers_.reset();
     config_file_workers_.reset();
-
-    if (mysql_) mysql_->shutdown();
-    if (redis_) redis_->shutdown();
     redis_.reset();
     mysql_.reset();
     combo_query_limiter_.reset();
-    drain_timer_.reset();
     security_rules_.reset();
 }

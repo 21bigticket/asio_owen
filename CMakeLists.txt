@@ -4,6 +4,10 @@ if(POLICY CMP0135)
 endif()
 project(asio_owen LANGUAGES C CXX)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
 set(ASIO_OWEN_SANITIZER "" CACHE STRING "Optional sanitizer: address or thread")
 if(ASIO_OWEN_SANITIZER STREQUAL "address")
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
@@ -13,6 +17,19 @@ elseif(ASIO_OWEN_SANITIZER STREQUAL "thread")
     add_link_options(-fsanitize=thread)
 elseif(NOT ASIO_OWEN_SANITIZER STREQUAL "")
     message(FATAL_ERROR "ASIO_OWEN_SANITIZER must be address or thread")
+endif()
+
+option(ASIO_OWEN_BUILD_FUZZERS "Build libFuzzer parser targets" OFF)
+option(ASIO_OWEN_ENABLE_CLANG_TIDY "Run clang-tidy during C++ compilation" OFF)
+option(ASIO_OWEN_BUILD_INTEGRATION_TESTS "Register Docker/service integration tests" OFF)
+if(ASIO_OWEN_ENABLE_CLANG_TIDY)
+    find_program(ASIO_OWEN_CLANG_TIDY_EXECUTABLE NAMES clang-tidy REQUIRED)
+    set(CMAKE_CXX_CLANG_TIDY
+        "${ASIO_OWEN_CLANG_TIDY_EXECUTABLE};--config-file=${PROJECT_SOURCE_DIR}/.clang-tidy"
+        CACHE STRING "clang-tidy command" FORCE)
+endif()
+if(ASIO_OWEN_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ASIO_OWEN_BUILD_FUZZERS requires Clang/libFuzzer")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -249,14 +266,27 @@ add_library(asio_owen_core STATIC
 )
 target_link_libraries(asio_owen_core PUBLIC asio_owen_deps)
 
+add_library(asio_owen_app STATIC
+    src/app/routes.cpp
+    src/app/public_routes.cpp
+    src/app/admin/config_admin.cpp
+    src/app/admin/config_history.cpp
+    src/app/config_sync_service.cpp
+    src/app/admin/admin_routes.cpp
+    src/app/admin/admin_config_routes.cpp
+    src/app/admin/admin_history_routes.cpp
+    src/app/admin/admin_history_operation.cpp
+)
+target_link_libraries(asio_owen_app PUBLIC asio_owen_core)
+add_dependencies(asio_owen_app asio_owen_generated_assets)
+
 # 可执行文件
 add_executable(server
         src/main.cpp
         src/app/application.cpp
-        src/app/routes.cpp
         picohttpparser.c
 )
-target_link_libraries(server PRIVATE asio_owen_core)
+target_link_libraries(server PRIVATE asio_owen_app)
 target_compile_options(server PRIVATE $<$<CONFIG:Release>:-g>)
 add_dependencies(server asio_owen_generated_assets)
 
@@ -283,4 +313,9 @@ if(BUILD_TESTING)
         message(STATUS "googletest: fetched from remote")
     endif()
     add_subdirectory(tests)
+    if(ASIO_OWEN_BUILD_INTEGRATION_TESTS)
+        add_test(NAME redis_fault_matrix
+            COMMAND bash ${PROJECT_SOURCE_DIR}/tests/redis_fault_matrix.sh)
+        set_tests_properties(redis_fault_matrix PROPERTIES LABELS integration)
+    endif()
 endif()

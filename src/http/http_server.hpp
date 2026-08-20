@@ -38,11 +38,14 @@ public:
     HttpServer(asio::io_context& ioc, unsigned short port,
                int downstream_write_timeout_ms = 30000,
                int client_header_read_timeout_ms = 10000,
-               int client_body_read_timeout_ms = 30000)
+               int client_body_read_timeout_ms = 30000,
+               std::shared_ptr<ShutdownCoordinator> shutdown =
+                   std::make_shared<ShutdownCoordinator>(),
+               std::shared_ptr<RouteRuntime> runtime = nullptr)
         : ioc_(ioc), acceptor_(asio::make_strand(ioc), {asio::ip::tcp::v4(), port}),
           state_(std::make_shared<HttpServerState>(
               ioc, downstream_write_timeout_ms, client_header_read_timeout_ms,
-              client_body_read_timeout_ms)) {}
+              client_body_read_timeout_ms, std::move(shutdown), std::move(runtime))) {}
 
     void route(const std::string& path, Handler handler) {
         state_->routes[path] = std::move(handler);
@@ -79,6 +82,7 @@ public:
             std::error_code ec;
             acceptor_.cancel(ec);
             acceptor_.close(ec);
+            state_->stop_sessions();
         });
     }
 
@@ -93,8 +97,9 @@ public:
                 backoff_ms = 0;  // reset on success
                 if (!state_->running) break;
                 auto session = std::make_shared<ClientSession>(state_);
+                auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
                 auto session_executor = asio::make_strand(ioc_);
-                co_spawn(session_executor, session->run(std::move(socket)),
+                co_spawn(session_executor, session->run(std::move(session_socket)),
                     [session](std::exception_ptr ep) {
                         if (!ep) return;
                         try {

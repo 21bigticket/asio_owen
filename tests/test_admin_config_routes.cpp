@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #include "app/admin/config_admin.hpp"
+#include "app/admin/config_history.hpp"
+#include "app/admin/admin_credential_store.hpp"
 #include "app/routes.hpp"
 
 namespace {
@@ -228,15 +230,31 @@ std::string expired_admin_token() {
         .sign(jwt::algorithm::rs256{kPublicKey, kPrivateKey});
 }
 
+// Safe fake command: a coroutine lambda's frame reads captures through the
+// closure object, so a closure that dies before the lazy awaitable resumes
+// dangles. This plain lambda hands the (owned) pointer and args to a free
+// coroutine, which copies both into its own frame.
+asio::awaitable<Reply> run_fake_redis_command(
+    FakeRedis* redis, std::vector<std::string> args) {
+    co_return redis->handle(std::move(args));
+}
+
+std::shared_ptr<AdminLoginThrottle> test_login_throttle =
+    std::make_shared<AdminLoginThrottle>();
+std::shared_ptr<AdminAuthWorkLimiter> test_auth_limiter =
+    std::make_shared<AdminAuthWorkLimiter>();
+
 AppServices services_for(const std::filesystem::path& base, FakeRedis& redis,
                          ConfigSyncConfig cfg) {
     return AppServices{
         .config_base = base,
         .config_sync = cfg,
-        .redis_command = [&redis](
-                              std::vector<std::string> args) -> asio::awaitable<Reply> {
-            co_return redis.handle(std::move(args));
-        }
+        .redis_command = [&redis](std::vector<std::string> args) {
+            return run_fake_redis_command(&redis, std::move(args));
+        },
+        .admin_credentials = std::make_shared<AdminCredentialStore>(base),
+        .admin_login_throttle = test_login_throttle,
+        .admin_auth_limiter = test_auth_limiter
     };
 }
 
@@ -1451,8 +1469,16 @@ TEST(AdminConfigRoutes, AdminPageReturnsLoginPage) {
     EXPECT_EQ(ctx.status_code, 200);
     ASSERT_FALSE(ctx.response_headers.empty());
     EXPECT_EQ(get_header_value(ctx.response_headers, "Cache-Control"), "no-store");
-    EXPECT_FALSE(get_header_value(
-        ctx.response_headers, "Content-Security-Policy").empty());
+    const auto csp = get_header_value(ctx.response_headers, "Content-Security-Policy");
+    EXPECT_NE(csp.find("script-src 'self' 'nonce-"), std::string::npos);
+    EXPECT_NE(csp.find("style-src 'self' 'nonce-"), std::string::npos);
+    EXPECT_EQ(csp.find("unsafe-inline"), std::string::npos);
+    const auto nonce_start = csp.find("'nonce-");
+    ASSERT_NE(nonce_start, std::string::npos);
+    const auto nonce_end = csp.find('\'', nonce_start + 7);
+    ASSERT_NE(nonce_end, std::string::npos);
+    const auto nonce = csp.substr(nonce_start + 7, nonce_end - nonce_start - 7);
+    EXPECT_NE(ctx.response_body.find("nonce=\"" + nonce + "\""), std::string::npos);
     EXPECT_NE(ctx.response_body.find("asio_owen Config Center"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/api/admin/login"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("adminToken"), std::string::npos);
@@ -1467,6 +1493,14 @@ TEST(AdminConfigRoutes, AdminSettingsPageReturnsEmbeddedSinglePageApp) {
     EXPECT_EQ(ctx.status_code, 200);
     ASSERT_FALSE(ctx.response_headers.empty());
     EXPECT_EQ(get_header_value(ctx.response_headers, "Cache-Control"), "no-store");
+    const auto csp = get_header_value(ctx.response_headers, "Content-Security-Policy");
+    EXPECT_EQ(csp.find("unsafe-inline"), std::string::npos);
+    const auto nonce_start = csp.find("'nonce-");
+    ASSERT_NE(nonce_start, std::string::npos);
+    const auto nonce_end = csp.find('\'', nonce_start + 7);
+    ASSERT_NE(nonce_end, std::string::npos);
+    const auto nonce = csp.substr(nonce_start + 7, nonce_end - nonce_start - 7);
+    EXPECT_NE(ctx.response_body.find("nonce=\"" + nonce + "\""), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/api/admin/config"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("function render"), std::string::npos);
     EXPECT_NE(ctx.response_body.find("/admin/login"), std::string::npos);

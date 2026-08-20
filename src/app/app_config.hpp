@@ -245,13 +245,12 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.snapshot_interval_sec = cfg.get_int("rate_limit", "snapshot_interval_sec", 30);
     app.reload_interval_sec = cfg.get_int("security", "config_reload_interval_sec", 30);
     app.http_pool_stats_interval_sec = cfg.get_int("http_pool", "stats_interval_sec", 30);
-    app.config_sync = ConfigSyncConfig{
-        .enabled = cfg.get_bool("config_sync", "enabled", false),
-        .sync_interval_sec = cfg.get_int("config_sync", "sync_interval_sec", 5),
-        .machine_name = cfg.get("config_sync", "machine_name", ""),
-        .first_pull = cfg.get("config_sync", "first_pull", "async"),
-        .first_pull_timeout_ms = cfg.get_int("config_sync", "first_pull_timeout_ms", 3000)
-    };
+    app.config_sync.enabled = cfg.get_bool("config_sync", "enabled", false);
+    app.config_sync.sync_interval_sec = cfg.get_int("config_sync", "sync_interval_sec", 5);
+    app.config_sync.machine_name = cfg.get("config_sync", "machine_name", "");
+    app.config_sync.first_pull = cfg.get("config_sync", "first_pull", "async");
+    app.config_sync.first_pull_timeout_ms = cfg.get_int(
+        "config_sync", "first_pull_timeout_ms", 3000);
     app.config_sync.admin = admin_config_from(cfg);
     app.config_sync.history = config_history_from(cfg);
     return app;

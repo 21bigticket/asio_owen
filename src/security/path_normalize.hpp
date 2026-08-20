@@ -69,7 +69,7 @@ inline NormalizedPath normalize_path(std::string_view path_only, bool case_sensi
     }
     std::string& decoded = decoded_result.path;
     if (decoded.empty()) {
-        return {"/"};
+        return {"/", true, ""};
     }
 
     // 2. collapse // to /, split into segments
@@ -109,5 +109,5 @@ inline NormalizedPath normalize_path(std::string_view path_only, bool case_sensi
         }
     }
 
-    return {std::move(normalized)};
+    return {std::move(normalized), true, ""};
 }

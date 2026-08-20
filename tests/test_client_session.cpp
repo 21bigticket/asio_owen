@@ -281,6 +281,39 @@ TEST_F(ClientSessionTest, GetLocalRouteReturns200) {
     EXPECT_NE(resp.find("pong"), std::string::npos) << resp;
 }
 
+TEST(ClientSessionLifecycleTest, DrainingRuntimeRejectsNewSessionBeforeReading) {
+    asio::io_context ioc;
+    auto state = std::make_shared<HttpServerState>(ioc);
+    state->runtime = std::make_shared<RouteRuntime>();
+    ASSERT_TRUE(state->runtime->begin_draining());
+
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    bool completed = false;
+    auto session = std::make_shared<ClientSession>(state);
+    co_spawn(ioc, session->run(socket),
+        [&completed](std::exception_ptr error) {
+            EXPECT_FALSE(error);
+            completed = true;
+        });
+    ioc.run();
+
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(state->runtime->active_handlers(), 0u);
+}
+
+TEST(ClientSessionLifecycleTest, StopSessionsClosesRegisteredSockets) {
+    asio::io_context ioc;
+    auto state = std::make_shared<HttpServerState>(ioc);
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    socket->open(tcp::v4());
+    state->register_session(socket);
+
+    state->stop_sessions();
+    ioc.run();
+
+    EXPECT_FALSE(socket->is_open());
+}
+
 TEST_F(ClientSessionTest, QueryStringStillMatchesExactLocalRoute) {
     start_server();
     auto resp = read_response_with_timeout(port(),

@@ -18,12 +18,12 @@ gtest_discover_tests(test_reload_service)
 
 # Redis-backed config center mirror service
 add_executable(test_config_sync_service test_config_sync_service.cpp)
-target_link_libraries(test_config_sync_service PRIVATE gtest_main asio_owen_core)
+target_link_libraries(test_config_sync_service PRIVATE gtest_main asio_owen_app)
 gtest_discover_tests(test_config_sync_service)
 
 # Immutable config history model, integrity guard and bounded GC
 add_executable(test_config_history test_config_history.cpp)
-target_link_libraries(test_config_history PRIVATE gtest_main asio_owen_core)
+target_link_libraries(test_config_history PRIVATE gtest_main asio_owen_app)
 gtest_discover_tests(test_config_history)
 
 # JSON key 转换
@@ -113,14 +113,30 @@ target_link_libraries(test_combo_query_limiter PRIVATE gtest_main asio_owen_core
 gtest_discover_tests(test_combo_query_limiter)
 
 # /api/combo response status and cache-fallback flow without external services
-add_executable(test_combo_routes test_combo_routes.cpp ${PROJECT_SOURCE_DIR}/src/app/routes.cpp)
-target_link_libraries(test_combo_routes PRIVATE gtest_main asio_owen_core)
+add_executable(test_combo_routes test_combo_routes.cpp)
+target_link_libraries(test_combo_routes PRIVATE gtest_main asio_owen_app)
 add_dependencies(test_combo_routes asio_owen_generated_assets)
 gtest_discover_tests(test_combo_routes)
 
+# Readiness state and bounded shutdown signal
+add_executable(test_ready_routes test_ready_routes.cpp)
+target_link_libraries(test_ready_routes PRIVATE gtest_main asio_owen_app)
+add_dependencies(test_ready_routes asio_owen_generated_assets)
+gtest_discover_tests(test_ready_routes)
+
+# Explicit shutdown phase and in-flight session drain accounting
+add_executable(test_shutdown_coordinator test_shutdown_coordinator.cpp)
+target_link_libraries(test_shutdown_coordinator PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_shutdown_coordinator)
+
+# Unified route resource ownership and handler lease lifecycle
+add_executable(test_route_runtime test_route_runtime.cpp)
+target_link_libraries(test_route_runtime PRIVATE gtest_main asio_owen_app)
+gtest_discover_tests(test_route_runtime)
+
 # Config center Admin API and embedded /admin page
-add_executable(test_admin_config_routes test_admin_config_routes.cpp ${PROJECT_SOURCE_DIR}/src/app/routes.cpp)
-target_link_libraries(test_admin_config_routes PRIVATE gtest_main asio_owen_core)
+add_executable(test_admin_config_routes test_admin_config_routes.cpp)
+target_link_libraries(test_admin_config_routes PRIVATE gtest_main asio_owen_app)
 add_dependencies(test_admin_config_routes asio_owen_generated_assets)
 gtest_discover_tests(test_admin_config_routes)
 
@@ -144,3 +160,32 @@ gtest_discover_tests(test_redis_pool_shutdown)
 add_executable(test_cors test_cors.cpp)
 target_link_libraries(test_cors PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_cors)
+
+if(ASIO_OWEN_BUILD_FUZZERS)
+    foreach(fuzzer_target IN ITEMS fuzz_admin_json fuzz_path_normalize fuzz_http_framing fuzz_ini fuzz_history fuzz_jwt)
+        add_executable(${fuzzer_target} ${fuzzer_target}.cpp)
+        if(fuzzer_target STREQUAL "fuzz_admin_json" OR
+           fuzzer_target STREQUAL "fuzz_ini" OR
+           fuzzer_target STREQUAL "fuzz_history")
+            target_link_libraries(${fuzzer_target} PRIVATE asio_owen_app)
+        else()
+            target_link_libraries(${fuzzer_target} PRIVATE asio_owen_core)
+        endif()
+        add_dependencies(${fuzzer_target} asio_owen_generated_assets)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+            target_sources(${fuzzer_target} PRIVATE fuzz_standalone_main.cpp)
+            target_compile_options(${fuzzer_target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+            target_link_options(${fuzzer_target} PRIVATE -fsanitize=address)
+        else()
+            target_compile_options(${fuzzer_target} PRIVATE -fsanitize=fuzzer,address -fno-omit-frame-pointer)
+            target_link_options(${fuzzer_target} PRIVATE -fsanitize=fuzzer,address)
+        endif()
+    endforeach()
+endif()
+
+if(ASIO_OWEN_BUILD_INTEGRATION_TESTS)
+    add_test(
+        NAME RedisFaultMatrix
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/redis_fault_matrix.sh)
+    set_tests_properties(RedisFaultMatrix PROPERTIES TIMEOUT 120)
+endif()

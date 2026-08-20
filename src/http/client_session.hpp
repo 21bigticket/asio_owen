@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,8 @@
 #include "response.hpp"
 #include "response_builder.hpp"
 #include "upstream_manager.hpp"
+#include "../app/shutdown_coordinator.hpp"
+#include "../app/route_runtime.hpp"
 
 using namespace std::chrono_literals;
 
@@ -33,11 +36,15 @@ struct HttpServerState {
         asio::io_context& ioc,
         int downstream_write_timeout_ms = 30000,
         int client_header_read_timeout_ms = 10000,
-        int client_body_read_timeout_ms = 30000)
+        int client_body_read_timeout_ms = 30000,
+        std::shared_ptr<ShutdownCoordinator> shutdown =
+            std::make_shared<ShutdownCoordinator>(),
+        std::shared_ptr<RouteRuntime> runtime = nullptr)
         : upstreams(ioc),
           downstream_write_timeout_ms(downstream_write_timeout_ms),
           client_header_read_timeout_ms(client_header_read_timeout_ms),
-          client_body_read_timeout_ms(client_body_read_timeout_ms) {}
+          client_body_read_timeout_ms(client_body_read_timeout_ms),
+          shutdown(std::move(shutdown)), runtime(std::move(runtime)) {}
 
     std::unordered_map<std::string, Handler> routes;
     std::vector<std::pair<std::string, Handler>> prefix_routes;
@@ -47,9 +54,74 @@ struct HttpServerState {
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
     int client_body_read_timeout_ms = 30000;
+    std::shared_ptr<ShutdownCoordinator> shutdown;
+    std::shared_ptr<RouteRuntime> runtime;
+
+    void register_session(const std::shared_ptr<asio::ip::tcp::socket>& socket) {
+        register_session(socket, socket->get_executor());
+    }
+
+    void register_session(const std::shared_ptr<asio::ip::tcp::socket>& socket,
+                          asio::any_io_executor executor) {
+        std::lock_guard lock(session_mutex);
+        sessions.emplace(socket.get(), SessionRegistration{socket, std::move(executor)});
+    }
+
+    void unregister_session(asio::ip::tcp::socket* socket) noexcept {
+        std::lock_guard lock(session_mutex);
+        sessions.erase(socket);
+    }
+
+    void stop_sessions() {
+        // Take a strong snapshot under the lock, then post without holding it.
+        // The snapshot keeps sockets alive until their executor callbacks run.
+        std::vector<SessionRegistration> active;
+        {
+            std::lock_guard lock(session_mutex);
+            active.reserve(sessions.size());
+            for (const auto& [_, registration] : sessions) active.push_back(registration);
+        }
+        for (auto& registration : active) {
+            auto socket = std::move(registration.socket);
+            asio::post(registration.executor, [socket = std::move(socket)] {
+                asio::error_code ec;
+                socket->cancel(ec);
+                socket->close(ec);
+            });
+        }
+    }
+
 #ifdef ASIO_OWEN_TESTING
     std::function<void()> after_initial_security_check_for_test;
 #endif
+
+private:
+    struct SessionRegistration {
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+        asio::any_io_executor executor;
+    };
+
+    std::mutex session_mutex;
+    std::unordered_map<asio::ip::tcp::socket*, SessionRegistration> sessions;
+};
+
+class SessionSocketGuard {
+public:
+    SessionSocketGuard(std::shared_ptr<HttpServerState> state,
+                       std::shared_ptr<asio::ip::tcp::socket> socket,
+                       asio::any_io_executor executor)
+        : state_(std::move(state)), socket_(std::move(socket)) {
+        state_->register_session(socket_, std::move(executor));
+    }
+    SessionSocketGuard(const SessionSocketGuard&) = delete;
+    SessionSocketGuard& operator=(const SessionSocketGuard&) = delete;
+    ~SessionSocketGuard() {
+        if (state_ && socket_) state_->unregister_session(socket_.get());
+    }
+
+private:
+    std::shared_ptr<HttpServerState> state_;
+    std::shared_ptr<asio::ip::tcp::socket> socket_;
 };
 
 class ClientSession {
@@ -67,14 +139,21 @@ public:
         return m == "GET" || m == "HEAD" || m == "OPTIONS" || m == "TRACE";
     }
 
-    asio::awaitable<void> run(asio::ip::tcp::socket socket) {
+    asio::awaitable<void> run(std::shared_ptr<asio::ip::tcp::socket> socket_holder) {
+        auto& socket = *socket_holder;
+        auto executor = co_await asio::this_coro::executor;
+        auto session_lease = state_->shutdown ?
+            state_->shutdown->enter_session() : ShutdownCoordinator::SessionLease{};
+        auto handler_lease = state_->runtime ?
+            state_->runtime->enter_handler() : RouteRuntime::HandlerLease{};
+        SessionSocketGuard socket_guard(state_, std::move(socket_holder), executor);
+        if (state_->runtime && !handler_lease) co_return;
         int final_error_status = 0;
         std::string final_error_reason;
         std::string final_error_body;
         try {
             char buf[kClientReadBufferSize];
             std::string client_preread;
-            auto executor = co_await asio::this_coro::executor;
             OperationDeadline client_deadline(executor);
             auto client_header_timeout = std::chrono::milliseconds(state_->client_header_read_timeout_ms);
             auto client_body_timeout = std::chrono::milliseconds(state_->client_body_read_timeout_ms);
@@ -540,6 +619,8 @@ public:
                     break;
                 }
                 if (client_conn_tokens.close) break;
+                if (state_->runtime && state_->runtime->draining()) break;
+                if (!state_->runtime && state_->shutdown && state_->shutdown->draining()) break;
             }
         } catch (const std::system_error& e) {
             LOG_WARN("Connection system_error: ", e.what());

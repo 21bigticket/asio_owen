@@ -21,6 +21,7 @@
 
 #include "app/app_config.hpp"
 #include "app/config_sync_service.hpp"
+#include "app/admin/config_history.hpp"
 
 namespace {
 

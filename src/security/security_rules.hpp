@@ -221,16 +221,16 @@ private:
     {
         // Root path returns 404 directly, skip auth chain
         if (raw_path.empty() || raw_path == "/") {
-            return {404, "not found"};
+            return {404, "not found", 0, std::nullopt, "", false};
         }
 
-        if (!snapshot) return {500, "security rules unavailable"};
+        if (!snapshot) return {500, "security rules unavailable", 0, std::nullopt, "", false};
 
         // 1. Extract real IP from the immutable snapshot.
         auto client_ip = get_client_ip(socket, xff_header, snapshot->trusted_proxies);
         auto normalized_ip_result = normalize_ip(client_ip);
         if (!normalized_ip_result.parse_ok) {
-            return {400, "invalid client ip"};
+            return {400, "invalid client ip", 0, std::nullopt, "", false};
         }
         auto& normalized_ip = normalized_ip_result.str;
         CheckResult result;
@@ -240,7 +240,7 @@ private:
         // 2. Path normalization (case_sensitive controls whether paths are lowercased)
         auto norm = normalize_path(raw_path, snapshot->case_sensitive_paths);
         if (!norm.valid) {
-            return {400, "invalid path"};
+            return {400, "invalid path", 0, std::nullopt, "", false};
         }
         auto& path = norm.path;
 
@@ -269,7 +269,7 @@ private:
         // without Authorization), but only AFTER the IP blacklist + rate limit
         // above, so OPTIONS cannot be used to slip past those controls.
         if (method == "OPTIONS") {
-            return {0, ""};
+            return {0, "", 0, std::nullopt, "", false};
         }
 
         // 6. Auth whitelist
