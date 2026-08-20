@@ -611,7 +611,7 @@ private:
     }
 
     Reply make_error(std::string msg) const {
-        return Reply{false, std::move(msg), "", 0};
+        return Reply{false, std::move(msg), "", 0, {}, "error"};
     }
 
     void record_command_result(const Reply& r) {

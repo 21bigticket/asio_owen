@@ -61,11 +61,21 @@ public:
     std::optional<RouteResult> route(const std::string& path) {
         std::shared_lock lock(mtx_);
         if (path.empty() || path[0] != '/') return std::nullopt;
-        auto end = path.find('/', 1);
-        auto svc = (end == std::string::npos) ? path.substr(1) : path.substr(1, end - 1);
+        const auto query = path.find('?');
+        const auto path_end = query == std::string::npos ? path.size() : query;
+        auto slash = path.find('/', 1);
+        if (slash == std::string::npos || slash > path_end) slash = path_end;
+        auto svc = path.substr(1, slash - 1);
         auto it = upstreams_.find(svc);
         if (it == upstreams_.end()) return std::nullopt;
-        std::string upstream_path = (end == std::string::npos) ? "/" : path.substr(end);
+        std::string upstream_path;
+        if (slash < path_end) {
+            upstream_path = path.substr(slash);
+        } else if (query != std::string::npos) {
+            upstream_path = "/" + path.substr(query);
+        } else {
+            upstream_path = "/";
+        }
         auto pool = pools_.at(svc);
         return RouteResult{it->second, pool, std::move(upstream_path),
             json_keys_snake_to_camel_};

@@ -176,26 +176,18 @@ inline asio::awaitable<ProxyResponse> read_proxy_response(
         auto first_line_end = header_part.find("\r\n");
         auto status_line = first_line_end == std::string::npos ?
             header_part : header_part.substr(0, first_line_end);
-        auto sp1 = status_line.find(' ');
-        auto sp2 = status_line.find(' ', sp1 + 1);
-        if (sp1 == std::string::npos || sp2 == std::string::npos) {
-            LOG_INFO("Proxy response invalid status line: ", sanitize_body_preview(status_line));
+        auto parsed_status = parse_http_status_line(status_line);
+        if (!parsed_status) {
+            LOG_INFO("Proxy response invalid HTTP version: ",
+                sanitize_body_preview(status_line));
             resp.error = "upstream_response_invalid_status_line";
             conn.connection_close = true;
             co_return resp;
         }
-        auto status_code = parse_decimal_size(status_line.substr(sp1 + 1, sp2 - sp1 - 1));
-        if (!status_code || *status_code > 999) {
-            LOG_INFO("Proxy response invalid status code: status_line=",
-                sanitize_body_preview(status_line));
-            resp.error = "upstream_response_invalid_status_code";
-            conn.connection_close = true;
-            co_return resp;
-        }
-        resp.status_code = static_cast<int>(*status_code);
-        resp.status_text = status_line.substr(sp2 + 1);
+        const bool upstream_http10 = status_line.rfind("HTTP/1.0 ", 0) == 0;
+        resp.status_code = parsed_status->first;
+        resp.status_text = std::move(parsed_status->second);
 
-        int upstream_minor_version = status_line.rfind("HTTP/1.0", 0) == 0 ? 0 : 1;
         header_state = HeaderParseState{};
         auto hdr = first_line_end == std::string::npos ?
             std::string{} : header_part.substr(first_line_end + 2);
@@ -240,7 +232,7 @@ inline asio::awaitable<ProxyResponse> read_proxy_response(
         }
 
         conn.connection_close = header_state.connection_close ||
-            (upstream_minor_version == 0 && !header_state.connection_keep_alive);
+            (upstream_http10 && !header_state.connection_keep_alive);
         break;
     }
 

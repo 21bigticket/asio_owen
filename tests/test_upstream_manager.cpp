@@ -90,6 +90,17 @@ TEST(UpstreamManager, RoutesBareServiceToRootPath) {
     EXPECT_EQ(route->upstream_path, "/");
 }
 
+TEST(UpstreamManager, RoutesBareServiceQueryToRootPath) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    load_upstream(manager, "zebra-config", "127.0.0.1", 30001);
+
+    auto route = manager.route("/zebra-config?key=value");
+
+    ASSERT_TRUE(route.has_value());
+    EXPECT_EQ(route->upstream_path, "/?key=value");
+}
+
 TEST(UpstreamManager, IgnoresUnknownService) {
     asio::io_context ioc;
     UpstreamManager manager(ioc);

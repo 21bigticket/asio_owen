@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 static constexpr size_t kHttpIoBufferSize = 4096;
 static constexpr size_t kClientReadBufferSize = 8192;
@@ -57,6 +58,27 @@ inline std::optional<size_t> parse_decimal_size(std::string_view s) {
         value = value * 10 + d;
     }
     return value;
+}
+
+inline std::optional<std::pair<int, std::string>> parse_http_status_line(
+    std::string_view line) {
+    const bool http10 = line.rfind("HTTP/1.0 ", 0) == 0;
+    const bool http11 = line.rfind("HTTP/1.1 ", 0) == 0;
+    if (!http10 && !http11) return std::nullopt;
+    const auto first_space = line.find(' ');
+    const auto second_space = line.find(' ', first_space + 1);
+    if (first_space == std::string_view::npos ||
+        second_space == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto code_text = line.substr(first_space + 1,
+        second_space - first_space - 1);
+    auto code = parse_decimal_size(code_text);
+    if (code_text.size() != 3 || !code || *code < 100 || *code > 599) {
+        return std::nullopt;
+    }
+    return std::make_pair(static_cast<int>(*code),
+        std::string(line.substr(second_space + 1)));
 }
 
 inline std::optional<size_t> parse_hex_size_line(std::string_view line) {

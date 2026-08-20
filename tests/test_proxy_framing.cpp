@@ -242,6 +242,28 @@ TEST(ProxyFraming, InformationalResponseIsConsumedBeforeFinalResponse) {
     EXPECT_EQ(response.find("100 Continue"), std::string::npos) << response;
 }
 
+TEST(ProxyFraming, NonHttpStatusLineReturns502) {
+    auto response = proxy_request_for(
+        "ICY 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "ok");
+
+    EXPECT_TRUE(response.rfind("HTTP/1.1 502", 0) == 0) << response;
+}
+
+TEST(ProxyFraming, OutOfRangeStatusCodeReturns502) {
+    auto response = proxy_request_for(
+        "HTTP/1.1 700 Invalid\r\n"
+        "Content-Length: 2\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "ok");
+
+    EXPECT_TRUE(response.rfind("HTTP/1.1 502", 0) == 0) << response;
+}
+
 TEST(ProxyFraming, ChunkedControlLineTooLargeReturns502) {
     std::string upstream_response =
         "HTTP/1.1 200 OK\r\n"

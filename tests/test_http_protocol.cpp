@@ -68,6 +68,17 @@ TEST(HttpProtocol, ParseDecimalSizeAcceptsAndRejects) {
     EXPECT_FALSE(parse_decimal_size("12.5"));
 }
 
+TEST(HttpProtocol, ParseHttpStatusLineValidatesVersionCodeAndReason) {
+    auto parsed = parse_http_status_line("HTTP/1.1 204 No Content");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->first, 204);
+    EXPECT_EQ(parsed->second, "No Content");
+    EXPECT_TRUE(parse_http_status_line("HTTP/1.0 500 Error").has_value());
+    EXPECT_FALSE(parse_http_status_line("HTTP/2 200 OK").has_value());
+    EXPECT_FALSE(parse_http_status_line("HTTP/1.1 99 Too Small").has_value());
+    EXPECT_FALSE(parse_http_status_line("HTTP/1.1 600 Too Large").has_value());
+}
+
 TEST(HttpProtocol, UpdateHeaderStateConnectionClose) {
     HeaderParseState state;
     update_header_state("Connection", "close", state);
