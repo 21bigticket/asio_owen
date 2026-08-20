@@ -246,16 +246,16 @@ std::shared_ptr<AdminAuthWorkLimiter> test_auth_limiter =
 
 AppServices services_for(const std::filesystem::path& base, FakeRedis& redis,
                          ConfigSyncConfig cfg) {
-    return AppServices{
-        .config_base = base,
-        .config_sync = cfg,
-        .redis_command = [&redis](std::vector<std::string> args) {
-            return run_fake_redis_command(&redis, std::move(args));
-        },
-        .admin_credentials = std::make_shared<AdminCredentialStore>(base),
-        .admin_login_throttle = test_login_throttle,
-        .admin_auth_limiter = test_auth_limiter
+    AppServices services{};
+    services.config_base = base;
+    services.config_sync = std::move(cfg);
+    services.redis_command = [&redis](std::vector<std::string> args) {
+        return run_fake_redis_command(&redis, std::move(args));
     };
+    services.admin_credentials = std::make_shared<AdminCredentialStore>(base);
+    services.admin_login_throttle = test_login_throttle;
+    services.admin_auth_limiter = test_auth_limiter;
+    return services;
 }
 
 AppServices services_for(const std::filesystem::path& base, FakeRedis& redis) {

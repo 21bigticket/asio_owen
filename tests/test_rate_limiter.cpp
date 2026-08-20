@@ -373,7 +373,6 @@ TEST(RateLimiter, SnapshotExpiredIsIgnored) {
         hdr.total_buckets = 0;
         ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
         // empty body with matching checksum
-        uint32_t checksum = 2166136261u;
         // Recompute properly: body is empty so FNV-1a hash of 0 bytes = initial value.
         // The implementation calls calculate_checksum on body.data(), body.size()=0.
         // FNV-1a of empty input = 2166136261 (the initial offset basis, no multiplications).

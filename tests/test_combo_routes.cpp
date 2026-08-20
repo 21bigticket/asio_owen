@@ -38,6 +38,16 @@ void run_combo(asio::io_context& ioc, HttpContext& ctx, AppServices services) {
     ioc.run();
 }
 
+AppServices combo_services(std::shared_ptr<ComboQueryLimiter> limiter,
+                           std::shared_ptr<ComboBackend> backend,
+                           int deadline_ms = 500) {
+    AppServices services{};
+    services.combo_query_limiter = std::move(limiter);
+    services.combo_backend = std::move(backend);
+    services.combo_deadline_ms = deadline_ms;
+    return services;
+}
+
 }  // namespace
 
 TEST(ComboRoute, Returns503WhenFallbackPermitIsExhausted) {
@@ -47,7 +57,7 @@ TEST(ComboRoute, Returns503WhenFallbackPermitIsExhausted) {
     ASSERT_TRUE(held.has_value());
     auto backend = std::make_shared<FakeComboBackend>();
     HttpContext ctx;
-    run_combo(ioc, ctx, {.combo_query_limiter = limiter, .combo_backend = backend});
+    run_combo(ioc, ctx, combo_services(limiter, backend));
 
     EXPECT_EQ(ctx.status_code, 503);
     EXPECT_NE(ctx.response_body.find("too many in-flight"), std::string::npos);
@@ -59,11 +69,7 @@ TEST(ComboRoute, Returns504AndReleasesPermitAfterLateQueryCompletion) {
     auto backend = std::make_shared<FakeComboBackend>();
     backend->query_delay = std::chrono::milliseconds(30);
     HttpContext ctx;
-    run_combo(ioc, ctx, {
-        .combo_query_limiter = limiter,
-        .combo_backend = backend,
-        .combo_deadline_ms = 1
-    });
+    run_combo(ioc, ctx, combo_services(limiter, backend, 1));
 
     EXPECT_EQ(ctx.status_code, 504);
     EXPECT_TRUE(limiter->try_acquire().has_value());
@@ -74,7 +80,7 @@ TEST(ComboRoute, ReturnsMysqlValueWhenCacheWriteIsUnavailableInUnitTest) {
     auto limiter = std::make_shared<ComboQueryLimiter>(1);
     auto backend = std::make_shared<FakeComboBackend>();
     HttpContext ctx;
-    run_combo(ioc, ctx, {.combo_query_limiter = limiter, .combo_backend = backend});
+    run_combo(ioc, ctx, combo_services(limiter, backend));
 
     EXPECT_EQ(ctx.status_code, 200);
     EXPECT_NE(ctx.response_body.find("from_mysql"), std::string::npos);

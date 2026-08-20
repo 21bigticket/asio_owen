@@ -23,9 +23,6 @@ namespace {
 
 using tcp = asio::ip::tcp;
 
-constexpr int kServerStartTimeoutMs = 500;
-constexpr int kClientReadTimeoutMs = 2000;
-
 Config make_upstream_config(const std::string& name, const std::string& host, int port) {
     auto path = std::filesystem::temp_directory_path() /
         ("asio_owen_client_session_" +
@@ -101,33 +98,6 @@ Config make_security_config(const std::filesystem::path& base, bool cors_enabled
     Config cfg;
     EXPECT_TRUE(cfg.load(base));
     return cfg;
-}
-
-// Send raw bytes to the server and read everything until EOF/short read.
-// Used for tests that don't depend on Content-Length framing for the response.
-struct ClientExchange {
-    std::string request;
-    bool shutdown_write_after_send = false;
-};
-
-std::string exchange_with_server(unsigned short port, const ClientExchange& ex) {
-    asio::io_context ioc;
-    tcp::socket client(ioc);
-    client.connect({asio::ip::make_address("127.0.0.1"), port});
-
-    asio::write(client, asio::buffer(ex.request));
-    if (ex.shutdown_write_after_send) {
-        asio::error_code ec;
-        client.shutdown(tcp::socket::shutdown_send, ec);
-    }
-
-    std::string response;
-    asio::error_code ec;
-    asio::read(client, asio::dynamic_buffer(response), ec);
-
-    asio::error_code ignore;
-    client.close(ignore);
-    return response;
 }
 
 // Read until either the response body is fully received (Content-Length) or a
