@@ -26,11 +26,11 @@ public:
           completion_(std::move(completion)),
           kind_(kind) {}
 
-    void start() noexcept {
+    void start() {
         auto self = shared_from_this();
         dispatch_admin_work(services_,
             [self]() { self->start_blocking(); },
-            [self](std::exception_ptr ep) { self->fail(ep); });
+            [self](const std::exception_ptr& ep) { self->fail(ep); });
     }
 
 private:
@@ -66,7 +66,7 @@ private:
     void read_config_version(int attempt) {
         auto self = shared_from_this();
         run_command({"GET", std::string(config_admin::kVersionKey)},
-            [self, attempt](RedisPool::Reply reply) {
+            [self, attempt](const RedisPool::Reply& reply) {
                 if (!reply.ok) {
                     self->ctx_.status_code = 500;
                     self->ctx_.response_body = resp_err(DB_ERROR, reply.error);
@@ -85,7 +85,7 @@ private:
     void read_config_files(int64_t version, int attempt) {
         auto self = shared_from_this();
         run_command({"HGETALL", config_history::snapshot_key(version)},
-            [self, version, attempt](RedisPool::Reply reply) {
+            [self, version, attempt](const RedisPool::Reply& reply) {
                 if (!reply.ok) {
                     self->ctx_.status_code = 500;
                     self->ctx_.response_body = resp_err(DB_ERROR, reply.error);
@@ -114,7 +114,7 @@ private:
     void read_config_mirror(int64_t version, int attempt) {
         auto self = shared_from_this();
         run_command({"HGETALL", std::string(config_admin::kFilesKey)},
-            [self, version, attempt](RedisPool::Reply reply) {
+            [self, version, attempt](const RedisPool::Reply& reply) {
                 if (!reply.ok) {
                     self->ctx_.status_code = 500;
                     self->ctx_.response_body = resp_err(DB_ERROR, reply.error);
@@ -148,7 +148,7 @@ private:
         run_command({"HGET", std::string(config_history::kMetaKey),
                      std::to_string(version)},
             [self, version, attempt, files = std::move(files), degraded](
-                RedisPool::Reply reply) mutable {
+                const RedisPool::Reply& reply) mutable {
                 auto expected = reply.ok && reply.type == "string" ?
                     config_history::json_string_field(
                         reply.str, "content_sha256") : std::nullopt;
@@ -172,7 +172,7 @@ private:
         auto self = shared_from_this();
         run_command({"GET", std::string(config_admin::kVersionKey)},
             [self, version, attempt, files = std::move(files), degraded](
-                RedisPool::Reply reply) {
+                const RedisPool::Reply& reply) {
                 auto version_after = config_admin::redis_version(reply);
                 if (!version_after) {
                     self->invalid_version();
@@ -307,12 +307,12 @@ private:
         }
 
         auto self = shared_from_this();
-        run_command(std::move(args), [self](RedisPool::Reply reply) {
-            self->handle_save_reply(std::move(reply));
+        run_command(std::move(args), [self](const RedisPool::Reply& reply) {
+            self->handle_save_reply(reply);
         });
     }
 
-    void handle_save_reply(RedisPool::Reply reply) {
+    void handle_save_reply(const RedisPool::Reply& reply) {
         if (!reply.ok) {
             ctx_.status_code = 500;
             ctx_.response_body = resp_err(DB_ERROR, reply.error);
@@ -374,7 +374,7 @@ private:
     void read_conflict_version() {
         auto self = shared_from_this();
         run_command({"GET", std::string(config_admin::kVersionKey)},
-            [self](RedisPool::Reply reply) {
+            [self](const RedisPool::Reply& reply) {
                 auto current_version = config_admin::redis_version(reply);
                 std::string data = current_version ?
                     "{\"current_version\":" + std::to_string(*current_version) + "}" :
@@ -394,7 +394,7 @@ private:
         }
         auto self = shared_from_this();
         run_command({"HGETALL", std::string(config_admin::kMachinesKey)},
-            [self](RedisPool::Reply reply) {
+            [self](const RedisPool::Reply& reply) {
                 if (!reply.ok) {
                     self->ctx_.status_code = 500;
                     self->ctx_.response_body = resp_err(DB_ERROR, reply.error);
@@ -420,7 +420,7 @@ private:
         auto self = shared_from_this();
         dispatch_redis_command(
             services_, executor_, std::move(args), std::move(callback),
-            [self](std::exception_ptr ep) { self->fail(ep); });
+            [self](const std::exception_ptr& ep) { self->fail(ep); });
     }
 
     void invalid_version() {
@@ -430,7 +430,7 @@ private:
         complete();
     }
 
-    void fail(std::exception_ptr ep) noexcept {
+    void fail(const std::exception_ptr& ep) noexcept {
         std::string message = "unknown admin request exception";
         if (ep) {
             try {

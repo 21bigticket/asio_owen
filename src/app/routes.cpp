@@ -2,7 +2,7 @@
 
 #include "public_routes.hpp"
 
-void register_routes(HttpServer& server, AppServices services) {
+void register_routes(HttpServer& server, const AppServices& services) {
     server.route("/api/health", api_health);
     server.route("/api/ready", [services](HttpContext& ctx) {
         return api_ready(ctx, services);

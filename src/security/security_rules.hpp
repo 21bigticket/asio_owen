@@ -179,7 +179,7 @@ public:
     CheckResult check(
         asio::ip::tcp::socket& socket,
         const std::string& method,
-        const std::string& raw_path,
+        const std::string& raw_path, // NOLINT(bugprone-easily-swappable-parameters)
         const std::string& xff_header,
         const std::string& auth_header) const
     {
@@ -211,6 +211,8 @@ public:
     }
 
 private:
+    // Path and forwarding/auth headers are distinct request fields.
+    // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     CheckResult check_snapshot(
         asio::ip::tcp::socket& socket,
         const std::string& method,
@@ -317,6 +319,7 @@ private:
 
         return result;
     }
+    // NOLINTEND(bugprone-easily-swappable-parameters)
 
 public:
     // Get rate limiter reference (for snapshot timer)

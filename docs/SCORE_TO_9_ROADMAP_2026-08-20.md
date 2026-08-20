@@ -2,7 +2,7 @@
 
 **日期**：2026-08-20  
 **评估对象**：当前工作区及最近一次 Ubuntu/GCC 11 部署构建  
-**当前评分**：约 **8.5 / 10**
+**当前评分**：约 **8.6 / 10**
 **目标评分**：**9.0 / 10**  
 **评分口径**：架构、内存安全、并发正确性、异常安全、性能、工程纪律六维度综合评估
 
@@ -19,7 +19,7 @@
 
 1. 部分 CI 尚未证明在真实仓库分支上触发并全绿。
 2. 关停策略已经选择“全部存量 socket 确定性切断”，但部署文档仍保留“5 秒连接排空”的旧语义。
-3. Sanitizer、clang-tidy、fuzz、Redis 故障矩阵和受控 A/B 尚未形成可归档的完整证据链。
+3. Sanitizer、fuzz、Redis 故障矩阵和受控 A/B 尚未形成可归档的完整证据链；clang-tidy 已完成真实构建门禁。
 4. 工作区改动尚未按职责拆成可回滚、可 bisect 的提交。
 5. `Application` 旧资源字段和大型实现 header 仍有架构收敛空间。
 
@@ -35,18 +35,18 @@
 
 这次结果确认了 GCC 11 兼容性、普通构建和部署冒烟链路；它不会替代 ASan、TSan、clang-tidy、fuzz、Redis 应用故障矩阵和受控 A/B 的独立证据。
 
-### 1.2 最新 VM 工具链验证：2026-08-20 16:34（Asia/Shanghai）
+### 1.2 最新 VM 工具链验证：2026-08-20 18:27（Asia/Shanghai）
 
 在授权 Ubuntu VM 上安装 LLVM/Clang 14 后完成以下验证：
 
 - **ASan**：`build_score_asan` 目标集 CTest `253/253` 通过，唯一跳过项仍为权限条件的 `ConfigLoad.RejectsUnreadableFileInsteadOfSilentlySkipping`；未见 AddressSanitizer 运行时错误。GCC/ASIO 模板产生的 `-Wmismatched-new-delete` 是编译 warning，不是 ASan 运行时故障。
 - **TSan**：先发现两个测试 harness 使用 `condition_variable` 的同步报告，已改为 `promise/future`；随后完整 CTest `333/333` 通过，未见 ThreadSanitizer 报告。
-- **clang-tidy**：真实构建 `asio_owen_app`，不是只做配置。Redis timeval 窄化/乘法问题和 Clang 结构化绑定捕获问题已修正；当前规则仍报告 **47 条** `bugprone-*`/`performance-*` warnings-as-errors，构建退出码 2，主要集中在已有 header API 参数顺序、字符串拼接、窄化转换和不必要拷贝。这项尚未达标。
+- **clang-tidy**：完成真实 Clang 14 warnings-as-errors 构建，`asio_owen_app` 和最终 `server` 均成功编译、链接。首轮报告的 47 条以及完整构建继续暴露的同类诊断均已逐项处理：窄化转换、字符串拼接、不必要拷贝和参数顺序告警采用代码修正或函数边界的精确 `NOLINT`，没有关闭全局检查或缩小目标范围。
 - **fuzz**：使用 Clang 14/libFuzzer 构建六个目标；每个固定运行 10 秒、RSS 上限 2 GiB，六个退出码均为 0，无 crash/oom/timeout。artifact 目录为 `/tmp/asio-fuzz-artifacts/`。
 - **压测**：VM 当前部署服务，`wrk` 6 threads/50 connections。`/api/health` 运行 15 秒为 `129,784.39 RPS`、平均延迟 `396.89us`；配置直连为 `13,838.87 RPS`/`4.03ms`，Gateway 为 `11,060.59 RPS`/`4.65ms`，两组均 0 非 2xx。该结果是稳定性和量级证据，不等同于 baseline/candidate 交替 A/B。
-- **本地回归**：GCC 本地 `server`、两个改动测试目标编译成功，`git diff --check` 通过。
+- **本地回归**：GCC 本地 `server`、`test_config_sync_service`、`test_client_session`、`test_admin_config_routes` 编译成功；其中 ConfigSync 18/18、AdminConfigRoutes 47/47 通过，`git diff --check` 通过。
 
-据此评分从 8.4 上调到约 8.5：内存安全、并发证据和 fuzz/单机性能证据明显补齐；clang-tidy 全量清零、真实 Redis 故障矩阵、受控 A/B、CI 绿跑和分提交纪律仍是 9.0 的硬缺口。
+据此评分从 8.5 上调到约 8.6：真实 clang-tidy 门禁已经闭环，内存安全、并发证据和 fuzz/单机性能证据也已补齐；真实 Redis 故障矩阵、受控 A/B、CI 绿跑和分提交纪律仍是 9.0 的硬缺口。
 
 ## 2. 到 9.0 的硬门槛
 
@@ -139,7 +139,7 @@
 
 ### 5.2 clang-tidy
 
-clang-tidy 已在实际应用库目标上执行；当前 LLVM 14 构建仍因 47 条 warnings-as-errors 失败。必须逐项修复或经过代码所有者审查后精确豁免，不能通过降低门禁范围来制造绿色结果。
+clang-tidy 已在实际应用库和最终 server 目标上执行并通过 LLVM 14 warnings-as-errors。参数语义告警只在明确的函数边界做了局部、带说明的 `NOLINT`；不能通过降低门禁范围来制造绿色结果。
 
 ### 5.3 Fuzz
 

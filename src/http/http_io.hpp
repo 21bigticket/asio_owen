@@ -56,8 +56,11 @@ inline IoStatus classify_write_error(const asio::error_code& ec, bool timed_out)
 // run both the socket operations and this object on the same strand.
 class OperationDeadline {
 public:
+    // any_io_executor is intentionally passed by value so the deadline owns
+    // its executor handle; the move is not an accidental copy optimization.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param,performance-move-const-arg)
     explicit OperationDeadline(asio::any_io_executor executor)
-        : timer_(std::move(executor)), state_(std::make_shared<State>()) {}
+        : timer_(executor), state_(std::make_shared<State>()) {}
 
     uint64_t arm(asio::ip::tcp::socket& socket, std::chrono::milliseconds timeout) {
         auto state = state_;

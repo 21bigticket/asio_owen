@@ -64,17 +64,18 @@ int Application::run(int argc, char* argv[]) {
     try {
         initialize(cfg, app_cfg, config_base);
 
-        co_spawn(server_->executor(), server_->start(), [this](std::exception_ptr ep) {
-            if (!ep) return;
-            try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                LOG_ERROR("HTTP accept loop failed: ", e.what());
-            } catch (...) {
-                LOG_ERROR("HTTP accept loop failed with an unknown exception");
-            }
-            request_stop();
-        });
+        co_spawn(server_->executor(), server_->start(),
+            [this](const std::exception_ptr& ep) {
+                if (!ep) return;
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("HTTP accept loop failed: ", e.what());
+                } catch (...) {
+                    LOG_ERROR("HTTP accept loop failed with an unknown exception");
+                }
+                request_stop();
+            });
 
         signal_exit_ = std::make_unique<SignalExit>(ioc_);
         signal_exit_->on_exit([this]() {

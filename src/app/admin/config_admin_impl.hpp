@@ -646,6 +646,8 @@ inline std::string pbkdf2_sha256_hash_string(
         base64url_encode(hash->data(), hash->size());
 }
 
+// The output buffers are distinct semantic fields despite sharing a type.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 inline bool split_password_hash(
     std::string_view encoded,
     int& iterations,
@@ -680,7 +682,10 @@ inline bool split_password_hash(
     expected = std::move(*parsed_hash);
     return true;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
+// Username and password are intentionally adjacent authentication inputs.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 inline bool verify_admin_password(
     const AdminConfig& admin,
     const std::string& username,
@@ -710,6 +715,7 @@ inline bool verify_admin_password(
         CRYPTO_memcmp(actual->data(), expected.data(), expected.size()) == 0;
     return valid_account_hash && matched;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 inline std::optional<std::string> load_pem_or_file(
     const std::string& value,

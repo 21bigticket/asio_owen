@@ -41,7 +41,10 @@ public:
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq + 1);
             trim(key); trim(val);
-            data_[section + "." + key] = val;
+            std::string qualified_key = section;
+            qualified_key += ".";
+            qualified_key += key;
+            data_[std::move(qualified_key)] = val;
             raw_entries_.emplace_back(section, key, val);
         }
         return true;
@@ -82,7 +85,11 @@ public:
         return true;
     }
 
-    std::string get(const std::string& section, const std::string& key, 
+    // Section and key are intentionally positional parts of one config key.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    std::string get(
+                    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+                    const std::string& section, const std::string& key,
                     const std::string& def = "") const {
         auto it = data_.find(section + "." + key);
         return it != data_.end() ? it->second : def;

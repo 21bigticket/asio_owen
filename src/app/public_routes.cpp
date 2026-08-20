@@ -46,7 +46,7 @@ asio::awaitable<std::optional<MysqlPool::Result>> execute_combo_with_deadline(
     std::chrono::milliseconds deadline) {
     co_return co_await await_combo_query_with_deadline(
         std::move(query), std::move(permit), deadline,
-        [](std::exception_ptr ep) {
+        [](const std::exception_ptr& ep) {
             MysqlPool::Result result;
             if (ep) {
                 try {
@@ -140,7 +140,7 @@ asio::awaitable<void> handle_api_combo(HttpContext& ctx, AppServices services) {
             auto redis = services.redis;
             asio::co_spawn(ex,
                 redis->cmd_argv({"SET", "cache:user:1", data, "EX", "300"}),
-                [](std::exception_ptr ep, RedisPool::Reply reply) {
+                [](const std::exception_ptr& ep, const RedisPool::Reply& reply) {
             if (ep) {
                 try {
                     std::rethrow_exception(ep);

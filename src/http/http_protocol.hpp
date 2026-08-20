@@ -11,8 +11,8 @@
 
 static constexpr size_t kHttpIoBufferSize = 4096;
 static constexpr size_t kClientReadBufferSize = 8192;
-static constexpr size_t kMaxHeaderSize = 64 * 1024;
-static constexpr size_t kMaxBodySize = 10 * 1024 * 1024;
+static constexpr size_t kMaxHeaderSize = static_cast<size_t>(64) * 1024;
+static constexpr size_t kMaxBodySize = static_cast<size_t>(10) * 1024 * 1024;
 
 struct HeaderParseState {
     std::optional<size_t> content_length;
@@ -269,6 +269,8 @@ inline std::string describe_headers(
     return out;
 }
 
+// Header name and value are intentionally ordered as a pair.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline std::string sanitize_header_value(std::string_view key, std::string_view value) {
     if (header_iequals(key, "authorization") || header_iequals(key, "cookie") ||
         header_iequals(key, "set-cookie")) {

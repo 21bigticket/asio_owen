@@ -35,6 +35,8 @@ using namespace std::chrono_literals;
 
 class HttpServer {
 public:
+    // Port and timeout values are intentionally positional constructor fields.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     HttpServer(asio::io_context& ioc, unsigned short port,
                int downstream_write_timeout_ms = 30000,
                int client_header_read_timeout_ms = 10000,
@@ -100,7 +102,7 @@ public:
                 auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
                 auto session_executor = asio::make_strand(ioc_);
                 co_spawn(session_executor, session->run(std::move(session_socket)),
-                    [session](std::exception_ptr ep) {
+                    [session](const std::exception_ptr& ep) {
                         if (!ep) return;
                         try {
                             std::rethrow_exception(ep);

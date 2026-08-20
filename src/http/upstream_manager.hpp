@@ -109,8 +109,12 @@ public:
             }
             auto colon = val.find(':');
             if (colon == std::string::npos) {
-                throw std::invalid_argument(
-                    "upstream \"" + name + "\": missing ':' in value \"" + val + "\"");
+                std::string message = "upstream \"";
+                message += name;
+                message += "\": missing ':' in value \"";
+                message += val;
+                message += '"';
+                throw std::invalid_argument(message);
             }
 
             auto host = val.substr(0, colon);
@@ -131,17 +135,27 @@ public:
             try {
                 port = std::stoi(port_str, &parsed);
             } catch (...) {
-                throw std::invalid_argument(
-                    "upstream \"" + name + "\": invalid port \"" + port_str + "\"");
+                std::string message = "upstream \"";
+                message += name;
+                message += "\": invalid port \"";
+                message += port_str;
+                message += '"';
+                throw std::invalid_argument(message);
             }
             if (parsed != port_str.size()) {
-                throw std::invalid_argument(
-                    "upstream \"" + name + "\": invalid port \"" + port_str +
-                    "\" (trailing characters)");
+                std::string message = "upstream \"";
+                message += name;
+                message += "\": invalid port \"";
+                message += port_str;
+                message += "\" (trailing characters)";
+                throw std::invalid_argument(message);
             }
             if (port < 1 || port > 65535) {
-                throw std::invalid_argument(
-                    "upstream \"" + name + "\": port out of range [1,65535]: " + port_str);
+                std::string message = "upstream \"";
+                message += name;
+                message += "\": port out of range [1,65535]: ";
+                message += port_str;
+                throw std::invalid_argument(message);
             }
             auto current = current_upstreams.find(name);
             if (current != current_upstreams.end() &&

@@ -71,7 +71,7 @@ public:
                   auto done = std::make_shared<CommandCompletion>(std::move(completion));
                   try {
                       co_spawn(ioc, redis.cmd_argv(std::move(args)),
-                          [done](std::exception_ptr ep, Reply reply) mutable {
+                          [done](const std::exception_ptr& ep, Reply reply) mutable {
                               if (ep) {
                                   reply = exception_reply(ep);
                               }
@@ -163,7 +163,7 @@ public:
                 auto done = std::make_shared<CommandCompletion>(std::move(completion));
                 try {
                     co_spawn(pull_ioc, temp_pool.cmd_argv(std::move(args)),
-                        [done](std::exception_ptr ep, Reply reply) mutable {
+                        [done](const std::exception_ptr& ep, Reply reply) mutable {
                             if (ep) {
                                 reply = exception_reply(ep);
                             }
@@ -224,6 +224,8 @@ public:
         return true;
     }
 
+    // Filename and contents are distinct fields even though both are strings.
+    // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     static ValidationResult validate_managed_file(
         const std::string& name, const std::string& content) {
         if (is_never_sync_file(name)) {
@@ -249,6 +251,7 @@ public:
         }
         return {};
     }
+    // NOLINTEND(bugprone-easily-swappable-parameters)
 
     static bool has_reserved_admin_rule(const std::string& content) {
         std::string section;
@@ -289,6 +292,8 @@ public:
                path == "/api/admin" || path.rfind("/api/admin/", 0) == 0;
     }
 
+    // The content document and section name have intentionally different roles.
+    // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     static bool contains_section(const std::string& content, const std::string& target) {
         std::string lowered_target = target;
         to_lower_in_place(lowered_target);
@@ -305,6 +310,7 @@ public:
         }
         return false;
     }
+    // NOLINTEND(bugprone-easily-swappable-parameters)
 
     static std::string content_hash(const std::string& content) {
         uint64_t hash = 1469598103934665603ull;
@@ -481,7 +487,7 @@ private:
     void sync_once(Completion completion) {
         auto self = shared_from_this();
         run_command({"GET", std::string(kVersionKey)},
-            [self, completion = std::move(completion)](Reply reply) mutable {
+            [self, completion = std::move(completion)](const Reply& reply) mutable {
                 auto version = read_version_reply(reply);
                 if (version.status == VersionRead::Status::Error) {
                     self->warn_limited(
@@ -547,7 +553,7 @@ private:
         auto self = shared_from_this();
         run_command({"HGETALL", config_history::snapshot_key(remote_version)},
             [self, remote_version, completion = std::move(completion)](
-                Reply files_reply) mutable {
+                const Reply& files_reply) mutable {
                 if (!files_reply.ok) {
                     self->warn_limited(
                         "ConfigSync history HGETALL failed: " + files_reply.error);
@@ -587,7 +593,7 @@ private:
         auto self = shared_from_this();
         run_command({"HGETALL", std::string(kFilesKey)},
             [self, remote_version, require_meta_hash,
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 if (!reply.ok) {
                     self->record_history_failure(remote_version,
                         "history_snapshot_missing_mirror_read_failed",
@@ -624,7 +630,7 @@ private:
                      std::to_string(remote_version)},
             [self, remote_version, files = std::move(files),
              fallback_detail = std::move(fallback_detail),
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 if (!reply.ok || reply.type != "string") {
                     self->record_history_failure(remote_version,
                         "history_snapshot_meta_missing", std::move(completion));
@@ -668,7 +674,7 @@ private:
         run_command({"GET", std::string(kVersionKey)},
             [self, remote_version, remote_files = std::move(remote_files),
              forced_partial_detail = std::move(forced_partial_detail),
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 auto version_after = read_version_reply(reply);
                 if (version_after.status != VersionRead::Status::Value) {
                     LOG_ERROR("ConfigSync second version read failed while syncing version ",
@@ -792,7 +798,7 @@ private:
         auto self = shared_from_this();
         run_command(std::move(args),
             [self, seeded_state = std::move(seeded_state), local_file_count,
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 if (!reply.ok) {
                     LOG_ERROR("ConfigSync seed EVAL failed: ", reply.error);
                     completion(false);
@@ -958,7 +964,9 @@ private:
             for (const auto& [name, reason] : *failures) {
                 if (!first) value += ",";
                 first = false;
-                value += name + ":" + reason;
+                value += name;
+                value += ":";
+                value += reason;
             }
         }
         return value;
@@ -968,7 +976,7 @@ private:
         run_command({
                 "HSET", std::string(kMachinesKey), machine_name(), std::move(value)
             },
-            [completion = std::move(completion)](Reply reply) mutable {
+            [completion = std::move(completion)](const Reply& reply) mutable {
                 if (!reply.ok) {
                     LOG_WARN("ConfigSync heartbeat failed: ", reply.error);
                 }
@@ -1056,7 +1064,7 @@ private:
         }
     }
 
-    static Reply exception_reply(std::exception_ptr ep) {
+    static Reply exception_reply(const std::exception_ptr& ep) {
         Reply reply;
         reply.ok = false;
         reply.type = "error";
@@ -1126,6 +1134,8 @@ private:
         return config_base_ / "config.d";
     }
 
+    // Name and content are fixed, distinct fields of the managed file record.
+    // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     bool write_managed_file_if_changed(
         const std::string& name, const std::string& content) const {
         std::error_code ec;
@@ -1146,6 +1156,7 @@ private:
         }
         return std::rename(tmp.string().c_str(), path.string().c_str()) == 0;
     }
+    // NOLINTEND(bugprone-easily-swappable-parameters)
 
     static std::optional<std::map<std::string, std::string>> parse_hgetall(
         const Reply& reply) {

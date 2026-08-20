@@ -21,7 +21,7 @@ public:
     struct Config {
         size_t max_size = 256;                  // pool-level: hard cap on total connections
         size_t max_concurrent = 0;              // pool-level: 0 means unlimited
-        size_t max_body_size = 10 * 1024 * 1024;  // consumed by proxy layer, not pool
+        size_t max_body_size = static_cast<size_t>(10) * 1024 * 1024;
         int connect_timeout_ms = 1000;          // pool-level: DNS resolve + TCP connect
         int read_timeout_ms = 30000;            // pool-level: upstream read timeout
         int request_timeout_ms = 60000;         // pool-level: upstream write timeout
@@ -76,7 +76,7 @@ public:
         std::atomic<int> fail_idle_acquire_stage_for_test{0};
 #endif
 
-        State(asio::io_context& io, Config c) : ioc(io), cfg(std::move(c)) {}
+        State(asio::io_context& io, Config c) : ioc(io), cfg(c) {}
 
         ~State() {
             for (auto& shard : shards) {
@@ -104,7 +104,7 @@ public:
     };
 
     HttpPool(asio::io_context& ioc, Config cfg)
-        : state_(std::make_shared<State>(ioc, std::move(cfg))) {}
+        : state_(std::make_shared<State>(ioc, cfg)) {}
 
     ~HttpPool() { shutdown(); }
 

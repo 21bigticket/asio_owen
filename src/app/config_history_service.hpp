@@ -50,7 +50,7 @@ public:
                       std::move(completion));
                   try {
                       co_spawn(ioc, redis.cmd_argv(std::move(args)),
-                          [done](std::exception_ptr ep, Reply reply) mutable {
+                          [done](const std::exception_ptr& ep, Reply reply) mutable {
                               if (ep) reply = exception_reply(ep);
                               (*done)(std::move(reply));
                           });
@@ -152,12 +152,12 @@ private:
         auto self = shared_from_this();
         run_health_check(
             [self, completions = std::move(completions)]() mutable {
-                self->finish_health_check(std::move(completions));
+                self->finish_health_check(completions);
             });
     }
 
     void finish_health_check(
-        std::vector<std::function<void()>> completions) {
+        const std::vector<std::function<void()>>& completions) {
         for (auto& completion : completions) {
             try {
                 if (completion) completion();
@@ -279,7 +279,8 @@ private:
         }
         auto self = shared_from_this();
         run_command({"HGETALL", "asio_owen:config:files"},
-            [self, current, completion = std::move(completion)](Reply reply) mutable {
+            [self, current, completion = std::move(completion)](
+                const Reply& reply) mutable {
                 auto files = parse_hgetall(reply);
                 if (!files || files->empty()) {
                     self->mark_inconsistent(
@@ -296,13 +297,13 @@ private:
                     return;
                 }
                 self->publish_legacy_snapshot(
-                    current, std::move(*files), info, std::move(completion));
+                    current, *files, info, std::move(completion));
             });
     }
 
     void publish_legacy_snapshot(
         int64_t current,
-        std::map<std::string, std::string> files,
+        const std::map<std::string, std::string>& files,
         const config_history::SnapshotInfo& info,
         std::function<void()> completion) {
         const int64_t timestamp = static_cast<int64_t>(std::time(nullptr));
@@ -336,7 +337,7 @@ private:
         auto self = shared_from_this();
         run_command(std::move(args),
             [self, current, file_count,
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 auto code = reply.ok ? redis_integer(reply) : std::nullopt;
                 if (!code) {
                     ++self->gc_failures_;
@@ -390,7 +391,7 @@ private:
                      std::to_string(cutoff),
                      std::to_string(cfg_.gc_batch_size)},
             [self, current, cutoff, completion = std::move(completion)](
-                Reply reply) mutable {
+                const Reply& reply) mutable {
                 if (!reply.ok || reply.type != "array") {
                     ++self->gc_failures_;
                     LOG_WARN("ConfigHistory GC candidate query failed: ",
@@ -432,7 +433,7 @@ private:
                      std::to_string(cfg_.retention_versions),
                      std::to_string(cutoff)},
             [self, current, cutoff, candidates = std::move(candidates), index,
-             completion = std::move(completion)](Reply reply) mutable {
+             completion = std::move(completion)](const Reply& reply) mutable {
                 auto code = reply.ok ? redis_integer(reply) : std::nullopt;
                 if (!code) {
                     ++self->gc_failures_;
@@ -477,7 +478,7 @@ private:
         return std::nullopt;
     }
 
-    static Reply exception_reply(std::exception_ptr ep) {
+    static Reply exception_reply(const std::exception_ptr& ep) {
         Reply reply;
         reply.ok = false;
         reply.type = "error";

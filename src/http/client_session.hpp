@@ -34,6 +34,8 @@ using namespace std::chrono_literals;
 struct HttpServerState {
     explicit HttpServerState(
         asio::io_context& ioc,
+        // Timeout values intentionally follow the public constructor order.
+        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
         int downstream_write_timeout_ms = 30000,
         int client_header_read_timeout_ms = 10000,
         int client_body_read_timeout_ms = 30000,

@@ -75,4 +75,4 @@ asio::awaitable<void> handle_api_admin_history_migration(HttpContext& ctx, AppSe
 asio::awaitable<void> handle_api_admin_orphan_resolution(HttpContext& ctx, AppServices services);
 asio::awaitable<void> handle_admin_page(HttpContext& ctx);
 asio::awaitable<void> handle_admin_settings_page(HttpContext& ctx);
-void register_routes(HttpServer& server, AppServices services);
+void register_routes(HttpServer& server, const AppServices& services);

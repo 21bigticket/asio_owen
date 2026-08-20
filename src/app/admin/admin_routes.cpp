@@ -40,7 +40,7 @@ void dispatch_admin_work(
     auto invoke_failure = [failure = std::move(failure)](
                                std::exception_ptr ep) mutable noexcept {
         try {
-            failure(ep);
+            failure(std::move(ep));
         } catch (...) {
         }
     };
@@ -83,7 +83,7 @@ bool redis_command_available(const AppServices& services) {
 
 namespace {
 
-RedisPool::Reply redis_exception_reply(std::exception_ptr ep) {
+RedisPool::Reply redis_exception_reply(const std::exception_ptr& ep) {
     RedisPool::Reply reply;
     reply.ok = false;
     reply.type = "error";
@@ -102,6 +102,8 @@ RedisPool::Reply redis_exception_reply(std::exception_ptr ep) {
 
 void dispatch_redis_command(
     const AppServices& services,
+    // The executor is passed by value to match the public helper contract.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
     asio::any_io_executor executor,
     std::vector<std::string> args,
     std::function<void(RedisPool::Reply)> callback,
@@ -113,7 +115,7 @@ void dispatch_redis_command(
         auto command = run_redis_command(services, std::move(args));
         asio::co_spawn(executor, std::move(command),
             [workers, callback = std::move(callback), failure_handler](
-                std::exception_ptr ep, RedisPool::Reply reply) mutable {
+                const std::exception_ptr& ep, RedisPool::Reply reply) mutable {
                 if (ep) reply = redis_exception_reply(ep);
                 auto invoke = [callback = std::move(callback),
                                failure_handler,

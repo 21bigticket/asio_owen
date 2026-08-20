@@ -131,6 +131,8 @@ inline std::string metadata_json(
     return out.str();
 }
 
+// JSON is the source document and field is its lookup key; both are string views.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 inline std::optional<std::string> json_string_field(
     std::string_view json, std::string_view field) {
     const std::string needle = "\"" + std::string(field) + "\"";
@@ -170,6 +172,7 @@ inline std::optional<std::string> json_string_field(
     }
     return std::nullopt;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 inline std::optional<int64_t> parse_int64(std::string_view value) {
     if (value.empty()) return std::nullopt;
@@ -257,6 +260,8 @@ inline std::vector<std::string> split_text_lines(const std::string& text) {
     return lines;
 }
 
+// The three strings have fixed roles in the generated diff.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 inline std::string coarse_text_diff(
     const std::string& name,
     const std::string& from,
@@ -293,6 +298,7 @@ inline std::string coarse_text_diff(
     }
     return out.str();
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 inline bool looks_sensitive(const std::string& content) {
     std::string lowered = content;

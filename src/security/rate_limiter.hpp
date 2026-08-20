@@ -44,7 +44,8 @@ inline Decision allow(TokenBucket& b, double rate, double burst) {
     auto elapsed = now - b.last_refill_ms;
     b.last_refill_ms = now;
     // refill tokens, capped at burst
-    b.tokens = std::min(burst, b.tokens + elapsed * rate / 1000.0);
+    b.tokens = std::min(burst,
+        b.tokens + static_cast<double>(elapsed) * rate / 1000.0);
     if (b.tokens >= 1.0) {
         b.tokens -= 1.0;
         return {true, 0};
@@ -60,6 +61,8 @@ struct GlobalBucket {
     std::atomic<int64_t> last_refill_ms{0};
 };
 
+// Rate and burst are intentionally ordered to match the configured bucket.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline Decision check_global(GlobalBucket& global, double rate, double burst) {
     if (rate <= 0.0) return {true, 0};  // unlimited
     int64_t now = now_ms();
@@ -69,7 +72,8 @@ inline Decision check_global(GlobalBucket& global, double rate, double burst) {
     // CAS refill: only one thread advances time and refills tokens
     if (elapsed > 0 &&
         global.last_refill_ms.compare_exchange_strong(last, now)) {
-        int64_t add_milli = static_cast<int64_t>(elapsed * rate);
+        int64_t add_milli = static_cast<int64_t>(
+            static_cast<double>(elapsed) * rate);
         int64_t old_t = global.tokens_milli.load(std::memory_order_relaxed);
         int64_t burst_milli = static_cast<int64_t>(burst * 1000);
         do {
@@ -186,7 +190,10 @@ public:
     }
 
     // Multi-dimension check: any dimension fails -> 429, Retry-After = max
+    // IP, path, and service are distinct dimensions kept in this order.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     Decision check_all(
+        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
         const std::string& ip,
         const std::string& path,
         const std::string& service)
@@ -213,6 +220,7 @@ public:
         return {false, max_retry};
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     Decision check_all(const std::string& ip, const std::string& path,
                        const std::string& service, const Config& cfg) {
         auto ip_d = check(ip, cfg.ip_rps, cfg.ip_burst);
@@ -404,7 +412,7 @@ private:
         ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
 
         // write body
-        ofs.write(body.data(), body.size());
+        ofs.write(body.data(), static_cast<std::streamsize>(body.size()));
         if (!ofs) {
             LOG_WARN("rate_limit: snapshot write failed: ", path);
             return false;
@@ -450,7 +458,7 @@ private:
         }
 
         // check expiry (older than 2 minutes is stale)
-        if (hdr.written_at_ms + 120 * 1000 < now_ms()) {
+        if (hdr.written_at_ms + static_cast<int64_t>(120) * 1000 < now_ms()) {
             LOG_WARN("rate_limit: snapshot expired (age > 2min), starting empty");
             return;
         }

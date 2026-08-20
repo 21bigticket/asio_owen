@@ -303,9 +303,9 @@ private:
         } else if (algorithm_ == "RS256") {
             // Manual RS256 path — see verify_rs256() comment for the macOS
             // OpenSSL 3.x issue that forces us to bypass jwt-cpp here.
-            auto header_b64 = decoded.get_header_base64();
-            auto payload_b64 = decoded.get_payload_base64();
-            auto sig = decoded.get_signature();
+            const auto& header_b64 = decoded.get_header_base64();
+            const auto& payload_b64 = decoded.get_payload_base64();
+            const auto& sig = decoded.get_signature();
             auto msg = header_b64 + "." + payload_b64;
             if (!verify_rs256(msg, sig, pkey_.get())) {
                 throw std::runtime_error("failed to verify signature");

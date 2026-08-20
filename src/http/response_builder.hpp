@@ -28,6 +28,8 @@ inline bool http_response_has_no_body(std::string_view method, int status) {
         (status >= 100 && status < 200);
 }
 
+// Header name and value are intentionally ordered as a pair.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline bool is_safe_header(const std::string& name, const std::string& value) {
     for (char c : name) {
         if (c == '\r' || c == '\n' || c == '\0' || c == ':') {
@@ -113,14 +115,20 @@ inline std::string build_downstream_response(
             for (auto& [k, v] : ctx.response_headers) {
                 if (contains_header_name(filtered, k)) continue;
                 if (!is_safe_header(k, v)) continue;
-                resp += k + ": " + v + "\r\n";
+                resp += k;
+                resp += ": ";
+                resp += v;
+                resp += "\r\n";
                 if (header_iequals(k, "content-type")) has_content_type = true;
             }
         } else {
             for (auto& [k, v] : ctx.response_headers) {
                 if (header_iequals(k, "content-length") || is_hop_by_hop_header(k)) continue;
                 if (!is_safe_header(k, v)) continue;
-                resp += k + ": " + v + "\r\n";
+                resp += k;
+                resp += ": ";
+                resp += v;
+                resp += "\r\n";
                 if (header_iequals(k, "content-type")) has_content_type = true;
             }
         }

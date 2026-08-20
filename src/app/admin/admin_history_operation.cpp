@@ -38,11 +38,11 @@ public:
           completion_(std::move(completion)),
           kind_(kind) {}
 
-    void start() noexcept {
+    void start() {
         auto self = shared_from_this();
         dispatch_admin_work(services_,
             [self]() { self->start_blocking(); },
-            [self](std::exception_ptr ep) { self->fail(ep); });
+            [self](const std::exception_ptr& ep) { self->fail(ep); });
     }
 
 private:
@@ -208,12 +208,12 @@ private:
             complete();
             return;
         }
-        submit_rollback(std::move(files), std::move(*record), info);
+        submit_rollback(std::move(files), *record, info);
     }
 
     void submit_rollback(
         std::vector<config_admin::ManagedFile> files,
-        config_history::SnapshotRecord source,
+        const config_history::SnapshotRecord& source,
         const config_history::SnapshotInfo& info) {
         const int64_t new_version = rollback_request_.base_version + 1;
         const std::string user = ctx_.admin_principal ?
@@ -262,12 +262,12 @@ private:
                 rollback_request_.target_version, ", user=", user);
         }
         auto self = shared_from_this();
-        run_command(std::move(args), [self, sensitive](RedisPool::Reply reply) {
-            self->handle_rollback_reply(std::move(reply), sensitive);
+        run_command(std::move(args), [self, sensitive](const RedisPool::Reply& reply) {
+            self->handle_rollback_reply(reply, sensitive);
         });
     }
 
-    void handle_rollback_reply(RedisPool::Reply reply, bool sensitive) {
+    void handle_rollback_reply(const RedisPool::Reply& reply, bool sensitive) {
         if (!reply.ok) {
             redis_failed(reply.error);
             return;
@@ -353,7 +353,7 @@ private:
                         return;
                     }
                     self->submit_repair(
-                        std::move(record->files), record->meta_json,
+                        record->files, record->meta_json,
                         config_history::mirror_rebuild_script(), "mirror-rebuild");
                 });
             return;
@@ -368,6 +368,7 @@ private:
         std::string_view action,
         const std::map<std::string, std::string>& files) const {
         std::vector<config_admin::ManagedFile> audit_files;
+        audit_files.reserve(files.size());
         for (const auto& [name, content] : files) {
             audit_files.push_back({name, content});
         }
@@ -378,7 +379,7 @@ private:
     }
 
     void submit_restore_version(
-        std::map<std::string, std::string> files, const std::string& meta) {
+        const std::map<std::string, std::string>& files, const std::string& meta) {
         const auto& cfg = services_.config_sync.history;
         std::vector<std::string> args{
             "EVAL", config_history::restore_version_script(), "8",
@@ -406,14 +407,14 @@ private:
             orphan_request_.target_version, ", reason=",
             sanitize_body_preview(orphan_request_.reason));
         auto self = shared_from_this();
-        run_command(std::move(args), [self](RedisPool::Reply result) {
+        run_command(std::move(args), [self](const RedisPool::Reply& result) {
             self->handle_orphan_resolution_reply(
-                std::move(result), "restore-version");
+                result, "restore-version");
         });
     }
 
     void submit_delete_orphan(
-        std::map<std::string, std::string> files, const std::string& meta,
+        const std::map<std::string, std::string>& files, const std::string& meta,
         bool indexed, bool snapshot_exists) {
         std::vector<std::string> args{
             "EVAL", config_history::delete_orphan_script(), "6",
@@ -437,14 +438,14 @@ private:
             orphan_request_.target_version, ", reason=",
             sanitize_body_preview(orphan_request_.reason));
         auto self = shared_from_this();
-        run_command(std::move(args), [self](RedisPool::Reply result) {
+        run_command(std::move(args), [self](const RedisPool::Reply& result) {
             self->handle_orphan_resolution_reply(
-                std::move(result), "delete-orphan");
+                result, "delete-orphan");
         });
     }
 
     void handle_orphan_resolution_reply(
-        RedisPool::Reply reply, const std::string& action) {
+        const RedisPool::Reply& reply, const std::string& action) {
         auto code = reply.ok ? config_admin::redis_integer(reply) : std::nullopt;
         if (!code || *code <= 0) {
             ctx_.status_code = (!reply.ok || !code || *code == -2 ||
@@ -463,7 +464,7 @@ private:
     void read_repair_mirror() {
         auto self = shared_from_this();
         run_command({"HGETALL", std::string(config_admin::kFilesKey)},
-            [self](RedisPool::Reply reply) {
+            [self](const RedisPool::Reply& reply) {
                 auto files = config_admin::parse_hgetall(reply);
                 if (!files || files->empty()) {
                     self->inconsistent("current mirror is missing or malformed");
@@ -485,7 +486,7 @@ private:
                         self->repair_request_.version,
                         static_cast<int64_t>(std::time(nullptr)), user,
                         "migration", self->repair_request_.reason, info);
-                    self->submit_repair(std::move(*files), std::move(meta),
+                    self->submit_repair(*files, std::move(meta),
                         config_history::migration_script(), "migration");
                     return;
                 }
@@ -499,7 +500,7 @@ private:
         run_command({"HGET", std::string(config_history::kMetaKey),
                      std::to_string(repair_request_.version)},
             [self, files = std::move(files), mirror_hash = std::move(mirror_hash)](
-                RedisPool::Reply reply) mutable {
+                const RedisPool::Reply& reply) mutable {
                 if (!reply.ok || reply.type != "string") {
                     self->inconsistent("current history metadata is missing");
                     return;
@@ -511,13 +512,13 @@ private:
                         "current mirror hash does not match history metadata");
                     return;
                 }
-                self->submit_repair(std::move(files), reply.str,
+                self->submit_repair(files, reply.str,
                     config_history::snapshot_repair_script(), "snapshot-repair");
             });
     }
 
     void submit_repair(
-        std::map<std::string, std::string> files,
+        const std::map<std::string, std::string>& files,
         std::string meta,
         std::string script,
         std::string action) {
@@ -561,12 +562,12 @@ private:
             ", reason=", sanitize_body_preview(repair_request_.reason));
         auto self = shared_from_this();
         run_command(std::move(args),
-            [self, action = std::move(action)](RedisPool::Reply reply) {
-                self->handle_repair_reply(std::move(reply), action);
+            [self, action = std::move(action)](const RedisPool::Reply& reply) {
+                self->handle_repair_reply(reply, action);
             });
     }
 
-    void handle_repair_reply(RedisPool::Reply reply, const std::string& action) {
+    void handle_repair_reply(const RedisPool::Reply& reply, const std::string& action) {
         if (!reply.ok) {
             redis_failed(reply.error);
             return;
