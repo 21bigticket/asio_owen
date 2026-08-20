@@ -1,0 +1,14 @@
+name: Redis fault matrix
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  redis-fault-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run wrong-type, nil, CAS and restart cases
+        run: bash tests/redis_fault_matrix.sh
