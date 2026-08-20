@@ -41,6 +41,18 @@ prepare_admin_credentials() {
         echo "ERROR: ADMIN_SECRET_DIR must be an absolute path without newlines"
         return 1
     fi
+    local normalized_secret_dir
+    local normalized_build_dir
+    local normalized_candidate_dir
+    normalized_secret_dir=$(realpath -m -- "$ADMIN_SECRET_DIR")
+    normalized_build_dir=$(realpath -m -- "$BUILD_DIR")
+    normalized_candidate_dir=$(realpath -m -- "$CANDIDATE_BUILD_DIR")
+    case "${normalized_secret_dir}/" in
+        "${normalized_build_dir}/"*|"${normalized_candidate_dir}/"*)
+            echo "ERROR: ADMIN_SECRET_DIR must be outside BUILD_DIR and its candidate directory"
+            return 1
+            ;;
+    esac
 
     umask 077
     mkdir -p "$ADMIN_SECRET_DIR"
