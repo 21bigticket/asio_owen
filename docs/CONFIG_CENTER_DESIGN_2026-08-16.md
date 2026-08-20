@@ -40,7 +40,7 @@
 | D1 | 同步机制 | 轮询更新本地；**维持本地文件读取逻辑** | 复用全部现有热加载机制；Redis 故障有本地兜底 |
 | D2 | 同步范围 | **除 `[redis]` 连接信息外全部**（含 `[server]`/`[mysql]`） | 集中管理一切；启动期配置落盘后重启生效（页面明确标注） |
 | D3 | 页面形态 | 内嵌单页 HTML，多 tab，表单 + 源码双模式 | 无前端工程、无额外部署，符合项目零外部依赖风格 |
-| D4 | 覆盖规则 | Redis 覆盖本地；`99-local.ini` 保留为单机逃生舱 | Redis 是唯一事实源；逃生舱用于单机临时 override（加载序最后天然覆盖） |
+| D4 | 覆盖规则 | Redis 覆盖本地；`99-local.ini` 保留为 never-sync 本地层 | Redis 是托管配置事实源；本地层承载固定 Admin 凭证引用，也可用于单机临时 override（加载序最后天然覆盖） |
 | D5 | Redis 写入原子性 | 种子与保存均走 Lua 脚本，且脚本**前置校验 + staging key + RENAME**（v1.2 强化） | 脚本"原子执行"≠"出错回滚"：后置命令报错时先前的写不回滚，必须把报错面消灭在写核心状态之前 |
 | D6 | 部分失败语义 | 任一托管文件校验失败 → **不推进已同步版本**，同版本重试 | "跳过坏文件但报同步成功"会让坏文件永远不再被尝试 |
 | D7 | admin 保护唯一执行点（v1.2 新增） | 授权只由 **admin handler 代码级**执行；托管配置**禁止**声明 `/admin`、`/api/admin` 相关的 auth_whitelist/path_blacklist 规则 | 配置层 guard 与 insecure 逃生口在安全链路里互斥（403 先于 handler）；且托管 path_blacklist 空值规则可在 handler 前把 admin API 全员封死（自 DoS） |
@@ -153,8 +153,8 @@ first_pull_timeout_ms = 3000  ; 仅 blocking 模式：池构建+首命令+同步
 # 无账号或无私钥 → 登录与全部 admin 端点 503 fail-closed（§7.1）
 [admin]
 ops = pbkdf2_sha256$100000$<salt>$<hash>
-jwt_private_key = jwt_keys/admin-private-key.pem   ; 仅签发用，chmod 600；相对 config_base 解析
-jwt_public_key  = jwt_keys/admin-public-key.pem    ; 验证用（gen_admin_keys.sh 生成）；相对 config_base 解析
+jwt_private_key = jwt_keys/admin-private-key.pem   ; 仅签发用，chmod 600；支持相对 config_base 或绝对路径
+jwt_public_key  = jwt_keys/admin-public-key.pem    ; 验证用（gen_admin_keys.sh 生成）；支持相对或绝对路径
 token_ttl_min = 120
 insecure_no_auth = false      ; 实验室逃生口（v1.5 起与业务 jwt_disabled 彻底脱钩，
                               ; admin 有自己的信任域；替代并移除 [config_sync].allow_insecure_admin）
@@ -328,7 +328,7 @@ RENAME 后、SET version 前死亡，files 已建好但 version 仍不存在 →
 |---|---|
 | `11-redis.ini` | `[redis]` 连接信息（配置源自身） |
 | `12-config-sync.ini` | 同步服务自身参数 + `[admin]` 节（账号/密钥/insecure_no_auth 逃生口，v1.5）——配置中心的自我保护全部落在此文件 |
-| `99-local.ini` | 单机逃生舱：加载序最后，可临时覆盖 Redis 值做单机调整；admin 相关白/黑名单规则的合法落点（§6.3） |
+| `99-local.ini` | never-sync 本地层：Ubuntu 部署注入固定 Admin 账号及密钥绝对路径；也可临时覆盖 Redis 值做单机调整，并作为 admin 相关白/黑名单规则的合法落点（§6.3） |
 
 （v1.1 的 `13-admin-guard.ini` 已移除：它与 allow_insecure_admin 在安全链路里互斥——jwt_disabled 时无 claims，role 路径在 handler 之前就 403，逃生口永远走不到；且按 §6.3 它本身可被托管配置架空。admin 授权唯一执行点收敛为代码级，见 §7.1。）
 
@@ -395,7 +395,7 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 
 > v1.2-v1.4 实现信任业务公钥验证的 principal（`ctx.principal`）+ `role:admin`——但现有 JWT 是**业务 token**（pixiu 体系签发，网关只持公钥），业务系统的角色词汇表与网关管理角色无关：任何业务 token 只要 claims 撞上 `role:admin`/`roles:["admin"]` 即可改写网关全部配置。v1.5 起业务凭证对 admin 面一律无效。
 
-1. **独立密钥对与 issuer**：`jwt_keys/admin-private-key.pem`（仅签发）+ `jwt_keys/admin-public-key.pem`（验证），issuer 常量 `asio-owen-admin`（与业务 `pixiu-gateway` 不同——业务 token 即使角色撞名，issuer/签名也不匹配 → 401）。admin key 路径相对 `config_base`（server 所在目录）解析；验证直接复用 `JWTAuth`（RS256 裸 EVP + claims 提取，jwt_auth.hpp:142/167/322-353）；**签发**镜像 `verify_rs256` 的裸 EVP 模式实现 `sign_rs256`（EVP_PKEY 启动加载一次 + EVP_DigestSign）——不用 jwt-cpp 的 PEM 签名路径（其 PEM 处理在 macOS Homebrew OpenSSL 3.x 有已知问题，A25）
+1. **独立密钥对与 issuer**：`jwt_keys/admin-private-key.pem`（仅签发）+ `jwt_keys/admin-public-key.pem`（验证），issuer 常量 `asio-owen-admin`（与业务 `pixiu-gateway` 不同——业务 token 即使角色撞名，issuer/签名也不匹配 → 401）。admin key 支持相对 `config_base`（server 所在目录）或绝对路径；Ubuntu 的 `rebuild_deploy.sh` 使用构建目录外 `/etc/asio-owen/admin` 的固定绝对路径，重建不轮换密钥。验证直接复用 `JWTAuth`（RS256 裸 EVP + claims 提取，jwt_auth.hpp:142/167/322-353）；**签发**镜像 `verify_rs256` 的裸 EVP 模式实现 `sign_rs256`（EVP_PKEY 启动加载一次 + EVP_DigestSign）——不用 jwt-cpp 的 PEM 签名路径（其 PEM 处理在 macOS Homebrew OpenSSL 3.x 有已知问题，A25）
 2. **登录端点 `POST /api/admin/login`**：账号在 never-sync 本地文件 `[admin]` 节（§5.2），PBKDF2-SHA256 口令哈希（`PKCS5_PBKDF2_HMAC`，OpenSSL::Crypto 已链接；格式内嵌迭代数，默认 100k）+ `CRYPTO_memcmp` 恒时比较 + 未知用户/密码错统一 401；口令校验和签名进入 2 线程专用 worker，最多 16 个在途任务，超限返回 429；失败按客户端 IP 锁定，轮换用户名不能绕过；每次登录尝试重读本地 admin 配置（登录低频，无热加载需求），admin API 鉴权也每请求重读同一份本地配置，保证账号/密钥/逃生口语义一致
 3. **签发 token**：`iss=asio-owen-admin, sub/name=<username>, roles=["admin"], exp=now+token_ttl_min, iat, av=<账号口令哈希版本>`；页面登录框获取后存 localStorage（原"token 粘贴框"保留为调试入口）。每次鉴权比较本地账号计算出的 `av`，因此改密或删除账号会立即撤销该账号旧 token；轮换密钥对仍可全局撤销全部 token
 4. **authorize_admin 新判定序**：本地 admin 配置不可读取 → **503 fail-closed**；`insecure_no_auth=true` → 放行（实验室逃生口，与业务 `jwt_disabled` 脱钩）；非 insecure 且未配置（无账号或无密钥）→ **503 fail-closed**；Bearer 缺失/验证失败 → **401**；无 admin 角色 → 403（自签 token 必有 role，纯防御）。`ctx.principal`（业务链路管道）保留但**不再用于 admin 授权**
@@ -500,7 +500,7 @@ Rollout 顺序：使用 `enabled=true, first_pull=blocking` 先部署一个具�
 | A24 | 安全链路顺序：IP 黑名单 → **限流** → OPTIONS → **白名单** → JWT → 路径黑名单——白名单路径仍被限流，登录端点天然有 IP/全局限流兜底 | `src/security/security_rules.hpp:246-302` |
 | A25 | jwt-cpp 已链接进主程序（可签名），但其 PEM 处理在 macOS Homebrew OpenSSL 3.x 有已知问题（RS256 验证因此绕开 jwt-cpp 用裸 EVP）——admin token 签发须镜像同模式；`JWTAuth` 类可直接复用做 admin token 验证 | `CMakeLists.txt:97-117, 216-225`；`src/security/jwt_auth.hpp:239-265, 322-353` |
 | A26 | 现有 JWT 为业务 token：公钥自 pixiu/dubbo-go-pixiu 拷入、issuer `pixiu-gateway`、登录端点在业务侧（zebra-passport）——网关公钥-only 是部署现状，非文档化设计；admin 凭证与业务凭证必须分家（D8 依据） | `jwt_keys/README.md:7-8`、`config.d/30-security.ini:10`、`config.d/33-auth_whitelist.ini:16` |
-| A27 | OpenSSL::SSL/Crypto 已 PUBLIC 链接进 core；admin 密钥路径相对 `config_base` 解析，私钥由部署系统直接放入运行目录且不会在 build 阶段复制；业务 JWT 密钥路径仍沿用安全链路既有 CWD 语义 | `CMakeLists.txt`；`src/app/admin/config_admin.hpp:554-563`；`src/security/security_rules.hpp:440-455` |
+| A27 | OpenSSL::SSL/Crypto 已 PUBLIC 链接进 core；admin 密钥支持相对 `config_base` 或绝对路径。Ubuntu 部署把固定私钥保存在 `/etc/asio-owen/admin`，candidate 只注入绝对路径，不在 build 或备份目录复制私钥；业务 JWT 密钥路径仍沿用安全链路既有 CWD 语义 | `CMakeLists.txt`；`src/app/admin/config_admin.hpp`；`src/security/security_rules.hpp`；`rebuild_deploy.sh` |
 | A28 | 仓库无 tools/ 目录，运维脚本惯例在根目录（bench.sh 等）——admin 密钥生成/口令哈希脚本放根目录 | 仓库根 |
 
 ---

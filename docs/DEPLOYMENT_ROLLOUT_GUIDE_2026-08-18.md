@@ -42,7 +42,7 @@
 
 - `config.d/11-redis.ini`
 - `config.d/12-config-sync.ini`
-- `config.d/99-local.ini`（可选，仅用于单实例临时覆盖）
+- `config.d/99-local.ini`（Ubuntu 部署脚本用于注入固定 Admin 账号和密钥路径；也可承载单实例临时覆盖）
 
 推荐同步配置：
 
@@ -67,12 +67,26 @@ auto_migrate_legacy = true
 
 ### 2.3 Admin 凭证
 
-- 仓库默认不启用管理员账号；上线前使用 `hash_admin_password.py <username>` 交互式生成强口令哈希，并仅写入本地覆盖配置（口令不会出现在进程参数中）。
-- admin 私钥必须在运行目录挂载或生成，构建过程不会复制私钥目录。
-- Ubuntu 的 `rebuild_deploy.sh` 默认在 `/etc/asio-owen/admin` 首次生成并持久化 Admin 密钥，同时交互创建固定 `admin` 账号；后续部署复用同一凭证，并在 candidate 的 `99-local.ini` 中注入账号及密钥绝对路径，不复制私钥。可通过 `ADMIN_SECRET_DIR` 和 `ADMIN_USERNAME` 修改固定目录与账号名。
+- 仓库默认不启用管理员账号。Ubuntu 上直接运行 `rebuild_deploy.sh`：首次部署交互设置密码，后续部署不再询问；口令不会出现在进程参数或部署日志中。
+- 脚本默认在 `/etc/asio-owen/admin` 首次生成并持久化 Admin 密钥和账号哈希，私钥权限为 `600`；后续部署复用同一凭证，并在 candidate 的 `99-local.ini` 中注入账号及密钥绝对路径，不复制私钥。
+- 可通过 `ADMIN_SECRET_DIR` 和 `ADMIN_USERNAME` 修改固定目录与账号名；固定目录必须位于构建目录之外。非脚本部署可使用 `gen_admin_keys.sh` 和 `hash_admin_password.py <username>` 完成同等配置。
 - 所有 Pod 必须挂载同一套 admin 公私钥和相同账号配置。
 - 私钥权限保持 `600`，不得写入镜像、日志或 Git。
 - 若各 Pod 使用不同密钥，登录 Pod 签发的 token 到其他 Pod 会验证失败，表现为随机 `401`。
+
+单机首次部署直接执行：
+
+```bash
+./rebuild_deploy.sh
+```
+
+脚本会提示输入并确认密码。需要自定义固定账号或持久目录时，只能在首次创建凭证前指定，并在后续部署保持相同参数：
+
+```bash
+ADMIN_USERNAME=ops ADMIN_SECRET_DIR=/etc/asio-owen/admin ./rebuild_deploy.sh
+```
+
+`ADMIN_SECRET_DIR` 必须安全备份但不能进入代码仓库。目录丢失后再次执行会生成新密钥并要求设置密码，所有旧 Admin token 随即失效。多节点部署时，只允许一个节点首次生成；其他节点应先安全分发或挂载同一目录，再运行部署脚本，禁止各节点独立生成。
 
 ### 2.4 Pod 文件系统
 
@@ -99,10 +113,11 @@ ctest --test-dir build-gcc11 --output-on-failure
 ### 3.1 部署单 Pod
 
 1. 为首个 Pod 准备完整且已审核的托管 `config.d/*.ini`。
-2. 确认本地 Redis、config sync、admin 配置和密钥均可用。
-3. 仅启动一个 Pod，副本数保持为 `1`。
-4. 由该 Pod 在 Redis version 不存在时执行原子播种。
-5. 首个 Pod 未完成验收前，不得扩容，也不得让空配置 Pod 先启动。
+2. 运行 `rebuild_deploy.sh`，确认固定 Admin 凭证已创建或复用，candidate 已生成 `99-local.ini`。
+3. 确认本地 Redis、config sync、admin 配置和密钥均可用。
+4. 仅启动一个 Pod，副本数保持为 `1`。
+5. 由该 Pod 在 Redis version 不存在时执行原子播种。
+6. 首个 Pod 未完成验收前，不得扩容，也不得让空配置 Pod 先启动。
 
 这里“Redis 无配置”特指 `asio_owen:config:version`、files 和 history 均不存在的全新环境。首个 Pod 会把随包本地托管配置一次性写成 v1 的 version/files/snapshot/meta/index；单 Pod 验收与扩容使用同一份本地专属配置，验收后不再修改开关。
 
@@ -112,7 +127,8 @@ ctest --test-dir build-gcc11 --output-on-failure
 
 至少确认以下项目：
 
-- `/api/health` 返回成功。
+- `/api/health` 返回成功，确认进程 liveness。
+- `/api/ready` 返回 HTTP 200 且 `data.ready=true`，确认 blocking 首拉、配置同步状态和 history 一致性均可用。
 - Redis 中 `asio_owen:config:version` 存在且为正整数。
 - Redis 中 `asio_owen:config:files` 是预期的完整文件集合，而不是意外空集合。
 - `/api/admin/config` 返回的 version 和文件内容正确。
@@ -126,7 +142,7 @@ ctest --test-dir build-gcc11 --output-on-failure
 
 1. 保持 Redis 配置不变，开始扩容。
 2. 新 Pod 使用 `first_pull=blocking`，启动时从 Redis 拉取完整配置。
-3. 新 Pod 的 `/api/health` 成功后按计划继续扩容。
+3. 新 Pod 的 `/api/health` 成功且 `/api/ready` 返回 200 后按计划继续扩容。
 4. 达到目标副本数后，逐个验证关键接口和 admin token 跨 Pod 可用性。
 5. 扩容完成后核对各 Pod 最终均收敛为 `status=ok`，version 等于首次验收版本。
 
@@ -157,7 +173,7 @@ strategy:
 发布步骤：
 
 1. 确认 Redis version 仍等于冻结版本，且发布窗口内没有配置写入。
-2. 按既有策略滚动部署代码，以 `/api/health` 作为进程健康检查。
+2. 按既有策略滚动部署代码，以 `/api/health` 作为 liveness、`/api/ready` 作为 readiness 检查。
 3. 滚动完成后验证关键业务接口，并核对所有存活 Pod 最终均为 `ok@冻结版本`。
 4. 完成业务验收后解除配置冻结。
 
@@ -208,9 +224,9 @@ strategy:
 
 ### 6.6 本地配置漂移
 
-远端 version 等于本地 `synced_version` 时，同步器仍会重新扫描 Redis 托管文件并校验 hash。若文件缺失、内容漂移或上次状态不是 `ok`，同步器会重新应用当前远端快照；只有文件集合与 hash 都匹配时才直接上报 `ok`。仍应避免人工修改 Redis 托管文件，以免触发不必要的自动覆盖。
+远端 version 等于本地 `synced_version` 时，同步器仍会扫描本地托管文件并与 `last_ok` hash 校验。若文件缺失、内容漂移或上次状态不是 `ok`，同步器才重新读取并应用当前远端快照；只有文件集合与 hash 都匹配时才直接上报 `ok`。仍应避免人工修改 Redis 托管文件，以免触发不必要的自动覆盖。
 
-`99-local.ini` 会在托管文件之后加载，可用于单 Pod 紧急覆盖，但会有意造成实例差异。问题处理完毕后应及时删除覆盖并重新验收。
+`99-local.ini` 会在托管文件之后加载。`rebuild_deploy.sh` 生成的文件包含固定 Admin 账号和密钥路径，必须保留；若人工加入其他单 Pod 紧急覆盖，问题处理完毕后只删除对应覆盖项并重新验收，不要删除整个文件。
 
 ## 7. 发布检查清单
 
@@ -220,7 +236,8 @@ strategy:
 - [ ] 仅部署一个 Pod
 - [ ] 首个 Pod 本地托管配置完整
 - [ ] Redis 环境和 DB 隔离正确
-- [ ] 已在本地覆盖配置中启用强口令 admin 账号
+- [ ] `/etc/asio-owen/admin`（或 `ADMIN_SECRET_DIR`）位于构建目录之外且权限正确
+- [ ] candidate 的 `99-local.ini` 已注入强口令 Admin 账号和固定密钥绝对路径
 - [ ] 所有副本将使用同一套 admin 密钥
 - [ ] `config.d/` 和 `.config-sync-state` 每 Pod 独立可写
 - [ ] Redis version/files 正确
@@ -232,6 +249,7 @@ strategy:
 ### 后续滚动发布
 
 - [ ] 新配置兼容当前运行代码
+- [ ] 固定 Admin 凭证目录仍存在，部署日志显示复用而非重新生成
 - [ ] 配置已在现有 Pod 上验收
 - [ ] 已记录并冻结 Redis version
 - [ ] 发布期间禁止修改配置

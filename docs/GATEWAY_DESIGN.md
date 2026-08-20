@@ -8,8 +8,12 @@
 ## 目标
 
 网关接收客户端 HTTP/1.x 请求，将 `/{service}/...` 路由到配置的上游 HTTP 服务。
-本地路由 `/api/health`、`/api/redis`、`/api/mysql`、`/api/combo` 精确匹配优先，
+本地路由 `/api/health`、`/api/ready`、`/api/redis`、`/api/mysql`、`/api/combo` 精确匹配优先，
 代理路由作为 fallback。
+
+`/api/health` 只表示进程仍在运行；`/api/ready` 表示实例可以接收流量，
+会检查配置中心状态、历史一致性和 graceful shutdown draining 状态。未就绪时返回
+HTTP 503，且不会因为 Redis/MySQL 的瞬时业务请求失败而直接把 liveness 判为失败。
 
 设计优先级：
 
@@ -17,7 +21,15 @@
 2. 防请求走私：非法或歧义 framing 直接拒绝。
 3. 资源有界：上游连接池有总量和并发上限，空闲连接会回收。
 4. 超时完整：客户端读、客户端写、上游 resolve/connect/write/read 都有超时。
-5. shutdown 可控：关闭 acceptor 和连接池 socket，in-flight 请求通过 RAII 收尾。
+5. shutdown 可控：关闭 acceptor 和连接池 socket，存量客户端连接显式取消，资源通过 RAII 收尾。
+
+### Shutdown 连接语义
+
+进入 draining 后不再接受新连接或 keep-alive 请求。`HttpServer::stop()` 会关闭
+acceptor，并将所有已注册的客户端 socket 的取消/关闭操作投递回连接 executor；因此
+空闲 keep-alive 连接会立即退出，不会把停机拖到读超时。当前实现采用确定性优先的
+“全部存量连接切断”策略，在途请求也可能在响应完成前被取消，不承诺 5 秒宽限完成。
+需要保证慢请求收尾时，应在部署层先排空流量或使用更长的上游/客户端超时窗口。
 
 ## 模块结构
 
