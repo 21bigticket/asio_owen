@@ -23,6 +23,14 @@ HTTP 503，且不会因为 Redis/MySQL 的瞬时业务请求失败而直接把 l
 4. 超时完整：客户端读、客户端写、上游 resolve/connect/write/read 都有超时。
 5. shutdown 可控：关闭 acceptor 和连接池 socket，存量客户端连接显式取消，资源通过 RAII 收尾。
 
+进程资源边界由三层配置共同约束：`server.io_threads` 控制事件循环线程数，
+`server.max_client_connections` 限制存量下游会话，
+`http_pool.max_total_connections` 限制全部 service 及热更新旧代际合计持有的上游连接。
+`io_threads=0` 使用宿主可见 CPU 数自动计算，但最多取 16，避免容器继承过大的宿主核数。
+启动时会读取 `RLIMIT_NOFILE`，校验客户端、上游、MySQL、Redis 的最大连接数与
+`server.fd_reserve` 之和。`fd_reserve` 用于 listener、事件后端、日志、配置/管理文件、
+DNS 及库内部临时描述符；预算超过进程软限制时拒绝启动，热更新提高上游总量时也会拒绝发布。
+
 ### Shutdown 连接语义
 
 进入 draining 后不再接受新连接或 keep-alive 请求。`HttpServer::stop()` 会关闭
@@ -175,8 +183,9 @@ State
 
 配置：
 
-- `max_size`：idle + active 上游 socket 全局硬上限。
-- `max_concurrent`：active 请求全局上限；`0` 表示不额外限制。
+- `max_size`：单个 service 池的 idle + active 上游 socket 硬上限。
+- `max_concurrent`：单个 service 池的 active 请求上限；`0` 表示不额外限制。
+- `max_total_connections`：全部 service 池共享的进程级上游连接硬上限；热更新的新旧代际共同使用同一预算。
 - `max_body_size`：请求/响应 body 上限，由代理层使用。
 - `connect_timeout_ms`：resolve + TCP connect 超时。
 - `request_timeout_ms`：写上游请求超时。
@@ -244,6 +253,7 @@ GET/HEAD/OPTIONS/TRACE 白名单，且写上游或读上游失败时，才会重
 [http_pool]
 max_size = 5120
 max_concurrent = 0
+max_total_connections = 20000
 max_body_size = 10485760
 connect_timeout_ms = 1000
 read_timeout_ms = 5000
@@ -253,10 +263,14 @@ send_keep_alive_header = true
 stats_interval_sec = 30
 ```
 
-`[http_pool]` 配置被所有上游连接池共享，目前不支持按 service 覆盖。配置热更新采用
+`max_size` 和 `max_concurrent` 是每个 service 池各自的上限；
+`max_total_connections` 是所有 service 共享的进程上限。`[http_pool]` 配置被所有
+上游连接池共享，目前不支持按 service 覆盖。配置热更新采用
 prepare/publish 两阶段：先完整构造新的安全快照、upstream 映射和所需连接池，全部成功后
-再发布。`[upstream]` host/port 或任一 `[http_pool]` 参数变化时会替换对应池；旧池由在途
-请求的 `shared_ptr` 保活，请求结束后再析构。
+再发布。`[upstream]` host/port 或除 `max_total_connections` 外的 `[http_pool]`
+参数变化时会替换对应池；旧池由在途请求的 `shared_ptr` 保活，请求结束后再析构。
+`max_total_connections` 属于跨池共享预算，热更新时通过原子 `set_limit()` 原地生效，
+不会重建现有池。
 
 ## 已知限制
 

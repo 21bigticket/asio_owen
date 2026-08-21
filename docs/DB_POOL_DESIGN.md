@@ -40,7 +40,7 @@ max_size = 64
 max_idle_sec = 60
 connect_timeout_ms = 1000
 read_timeout_ms = 500
-query_timeout_ms = 0
+query_timeout_ms = 30000
 acquire_timeout_ms = 3000
 keepalive_sec = 30
 worker_threads = 32
@@ -48,8 +48,8 @@ max_creating = 0
 ```
 
 当前代码中 `query_timeout_ms <= 0` 会在 `validate_config()` 中归一化为
-`30000`，并在创建连接时设置到 `MYSQL_OPT_READ_TIMEOUT`。因此配置文件里的
-`query_timeout_ms = 0` 实际表示使用 30s 安全兜底，不是无限制慢查询。
+`30000`，并在创建连接时设置到 `MYSQL_OPT_READ_TIMEOUT`。仓库默认配置已显式
+写为 `30000`，便于部署系统直接计算 shutdown grace period，不再依赖隐藏兜底。
 
 `read_timeout_ms` 目前只传给 `mysql_ping_with_timeout()`；ping 前会临时设置
 `MYSQL_OPT_READ_TIMEOUT`，按 MySQL C API 秒级粒度向上取整，ping 后恢复原
@@ -193,6 +193,11 @@ worker 模式 acquire 逻辑：
 2. 无 idle 时受 `max_size` 和 `max_creating_limit_` 限制建连。
 3. 池满时等待 `acquire_timeout_ms`。
 4. maintain 线程回收超时 idle、补充到 `min_size`、少量 PING 探活。
+
+worker 模式的连接归还是无异常边界：`ConnectionGuard` 析构、正常命令归还、
+预创建/补池以及 PING 后归还都通过同一个 `push_idle_locked()`。若 idle 队列扩容
+失败，连接会在锁外释放并回滚 `total_` 槽位；异常不会从析构函数或维护线程逸出。
+维护循环本身也捕获每轮异常，单次维护失败不会终止进程。
 5. 坏连接兜底：命令执行返回 `reply == nullptr`（连接层失败）时 drop 该连接；
    **只读幂等命令**（GET/MGET/EXISTS 等白名单，见 `is_readonly_idempotent`）会
    换一条新连接**自动重试一次**，对调用方透明；非幂等命令（SET/EXPIRE/INCR 等）
@@ -237,7 +242,7 @@ Redis direct 只能清理当前线程的 TLS 连接；其他线程的 TLS 连接
 
 | 限制 | 说明 |
 |------|------|
-| MySQL `query_timeout_ms=0` | 当前实现会变为 30s 安全超时，不是无限制。 |
+| MySQL 查询超时 | 默认显式配置为 30s；非正值仍归一化为 30s 安全兜底。 |
 | `/api/combo` soft deadline | MySQL fallback 超过 `[server] combo_deadline_ms`（默认 500ms）时 HTTP 请求返回 504，但同步 `mysql_query` 不会被取消。查询仍在 SQL worker 上完成并正常归还连接。为避免超时请求积压，cache miss 的 MySQL fallback 在启动前占用固定 permit，最多同时 `combo_max_in_flight_queries`（默认 8）个；permit 只在 worker completion 时释放，因此超时后仍在执行的查询也受此上限约束。满额时新的 cache miss 返回 503。两项参数在启动时读取，修改后需重启。 |
 | MySQL ping 超时 | `read_timeout_ms` 会在 ping 前临时设置 `MYSQL_OPT_READ_TIMEOUT`，ping 后恢复。 |
 | Redis direct | 故障 Redis 会阻塞调用线程直到命令超时。生产稳定性优先时用 worker。 |

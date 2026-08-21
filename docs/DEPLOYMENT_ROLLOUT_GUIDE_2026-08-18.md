@@ -177,7 +177,11 @@ strategy:
 3. 滚动完成后验证关键业务接口，并核对所有存活 Pod 最终均为 `ok@冻结版本`。
 4. 完成业务验收后解除配置冻结。
 
-`terminationGracePeriodSeconds` 应覆盖服务的 5 秒连接排空时间，并预留 Redis 命令结束时间，建议至少设置为 15 秒，再根据线上超时配置调整。
+当前服务采用确定性 hard-stop：收到终止信号后停止接入并立即取消存量客户端
+socket；应用内的 5 秒 deadline 只限制 session drain 等待，不限制阻塞 worker 的
+`join()`。`terminationGracePeriodSeconds` 必须大于 MySQL `query_timeout_ms`、Redis
+命令超时和其他 worker 最坏收尾时间之和并留出调度余量。按当前 MySQL 30 秒默认值，
+建议从 45 秒起配，并在修改相关超时后同步调整；它不应再被描述为“5 秒连接排空”。
 
 ## 5. 回滚流程
 
