@@ -14,23 +14,38 @@ namespace admin_route_detail {
 
 class AdminRequestOperation : public std::enable_shared_from_this<AdminRequestOperation> {
 public:
-    enum class Kind { Config, Machines };
+    using StartAction = std::function<void(AdminRequestOperation&)>;
 
     AdminRequestOperation(HttpContext& ctx, AppServices services,
                           asio::any_io_executor executor,
-                          std::function<void()> completion, Kind kind)
+                          std::function<void()> completion, StartAction start_action)
         : ctx_(ctx),
           services_(std::move(services)),
           executor_(std::move(executor)),
           executor_guard_(executor_),
           completion_(std::move(completion)),
-          kind_(kind) {}
+          start_action_(std::move(start_action)) {}
 
     void start() {
         auto self = shared_from_this();
         dispatch_admin_work(services_,
             [self]() { self->start_blocking(); },
             [self](const std::exception_ptr& ep) { self->fail(ep); });
+    }
+
+    void start_config() {
+        if (ctx_.method == "GET") {
+            read_config_version(0);
+        } else if (ctx_.method == "POST") {
+            save_config();
+        } else {
+            method_not_allowed(ctx_, "GET, POST");
+            complete();
+        }
+    }
+
+    void start_machines_request() {
+        start_machines();
     }
 
 private:
@@ -46,16 +61,7 @@ private:
                 complete();
                 return;
             }
-            if (kind_ == Kind::Machines) {
-                start_machines();
-            } else if (ctx_.method == "GET") {
-                read_config_version(0);
-            } else if (ctx_.method == "POST") {
-                save_config();
-            } else {
-                method_not_allowed(ctx_, "GET, POST");
-                complete();
-            }
+            start_action_(*this);
         } catch (...) {
             fail(std::current_exception());
         }
@@ -458,22 +464,24 @@ private:
     asio::any_io_executor executor_;
     AdminExecutorGuard executor_guard_;
     std::function<void()> completion_;
-    Kind kind_;
+    StartAction start_action_;
     std::atomic<bool> completed_{false};
 };
 
 asio::awaitable<void> start_admin_request(
-    HttpContext& ctx, AppServices services, AdminRequestOperation::Kind kind) {
+    HttpContext& ctx, AppServices services,
+    AdminRequestOperation::StartAction start_action) {
     asio::use_awaitable_t<> token;
     return asio::async_initiate<asio::use_awaitable_t<>, void()>(
-        [&ctx, services = std::move(services), kind](auto handler) mutable {
+        [&ctx, services = std::move(services),
+         start_action = std::move(start_action)](auto handler) mutable {
             asio::any_io_executor executor = asio::get_associated_executor(handler);
             using HandlerType = std::decay_t<decltype(handler)>;
             auto handler_ptr = std::make_shared<HandlerType>(std::move(handler));
             auto completion = [handler_ptr]() mutable { (*handler_ptr)(); };
             auto operation = std::make_shared<AdminRequestOperation>(
                 ctx, std::move(services), std::move(executor),
-                std::move(completion), kind);
+                std::move(completion), std::move(start_action));
             operation->start();
         },
         token);
@@ -483,10 +491,12 @@ asio::awaitable<void> start_admin_request(
 
 asio::awaitable<void> handle_api_admin_config(HttpContext& ctx, AppServices services) {
     return admin_route_detail::start_admin_request(
-        ctx, std::move(services), admin_route_detail::AdminRequestOperation::Kind::Config);
+        ctx, std::move(services),
+        [](auto& operation) { operation.start_config(); });
 }
 
 asio::awaitable<void> handle_api_admin_machines(HttpContext& ctx, AppServices services) {
     return admin_route_detail::start_admin_request(
-        ctx, std::move(services), admin_route_detail::AdminRequestOperation::Kind::Machines);
+        ctx, std::move(services),
+        [](auto& operation) { operation.start_machines_request(); });
 }

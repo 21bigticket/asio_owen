@@ -1,5 +1,3 @@
-#include "config_sync_service.hpp"
-
 #include "config_sync_service_impl.hpp"
 
 ConfigSyncService::ConfigSyncService(
@@ -25,7 +23,6 @@ void ConfigSyncService::stop() { impl_->stop(); }
 void ConfigSyncService::sync_once_for_test(Completion completion) {
     impl_->sync_once_for_test(std::move(completion));
 }
-
 bool ConfigSyncService::blocking_first_pull(
     const std::filesystem::path& config_base,
     const ConfigSyncConfig& sync_cfg, RedisPool::Config redis_cfg,
@@ -33,7 +30,6 @@ bool ConfigSyncService::blocking_first_pull(
     return ConfigSyncServiceImpl::blocking_first_pull(
         config_base, sync_cfg, std::move(redis_cfg), running_app_cfg);
 }
-
 ConfigSyncConfig ConfigSyncService::normalize_config(ConfigSyncConfig cfg) {
     return ConfigSyncServiceImpl::normalize_config(std::move(cfg));
 }

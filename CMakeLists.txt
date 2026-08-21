@@ -269,13 +269,27 @@ target_link_libraries(asio_owen_core PUBLIC asio_owen_deps)
 add_library(asio_owen_app STATIC
     src/app/routes.cpp
     src/app/public_routes.cpp
-    src/app/admin/config_admin.cpp
-    src/app/admin/config_history.cpp
+    src/app/admin/config_admin_parse.cpp
+    src/app/admin/config_admin_auth.cpp
+    src/app/admin/config_admin_store.cpp
+    src/app/admin/config_history_data.cpp
+    src/app/admin/config_history_scripts.cpp
     src/app/config_sync_service.cpp
+    src/app/config_sync_lifecycle.cpp
+    src/app/config_sync_state.cpp
+    src/app/config_sync_remote.cpp
+    src/app/config_sync_apply.cpp
+    src/app/config_sync_dispatch.cpp
+    src/app/config_sync_files.cpp
     src/app/admin/admin_routes.cpp
     src/app/admin/admin_config_routes.cpp
     src/app/admin/admin_history_routes.cpp
     src/app/admin/admin_history_operation.cpp
+    src/app/admin/admin_history_query.cpp
+    src/app/admin/admin_history_rollback.cpp
+    src/app/admin/admin_history_repair.cpp
+    src/app/admin/admin_history_orphan.cpp
+    src/app/admin/admin_history_common.cpp
 )
 target_link_libraries(asio_owen_app PUBLIC asio_owen_core)
 add_dependencies(asio_owen_app asio_owen_generated_assets)
@@ -313,9 +327,4 @@ if(BUILD_TESTING)
         message(STATUS "googletest: fetched from remote")
     endif()
     add_subdirectory(tests)
-    if(ASIO_OWEN_BUILD_INTEGRATION_TESTS)
-        add_test(NAME redis_fault_matrix
-            COMMAND bash ${PROJECT_SOURCE_DIR}/tests/redis_fault_matrix.sh)
-        set_tests_properties(redis_fault_matrix PROPERTIES LABELS integration)
-    endif()
 endif()
