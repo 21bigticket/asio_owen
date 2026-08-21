@@ -254,8 +254,8 @@ TEST_F(ClientSessionTest, GetLocalRouteReturns200) {
 TEST(ClientSessionLifecycleTest, DrainingRuntimeRejectsNewSessionBeforeReading) {
     asio::io_context ioc;
     auto state = std::make_shared<HttpServerState>(ioc);
-    state->runtime = std::make_shared<RouteRuntime>();
-    ASSERT_TRUE(state->runtime->begin_draining());
+    state->lifecycle = std::make_shared<RouteLifecycle>();
+    ASSERT_TRUE(state->lifecycle->begin_draining());
 
     auto socket = std::make_shared<tcp::socket>(ioc);
     bool completed = false;
@@ -268,7 +268,7 @@ TEST(ClientSessionLifecycleTest, DrainingRuntimeRejectsNewSessionBeforeReading) 
     ioc.run();
 
     EXPECT_TRUE(completed);
-    EXPECT_EQ(state->runtime->active_handlers(), 0u);
+    EXPECT_EQ(state->lifecycle->active_handlers(), 0u);
 }
 
 TEST(ClientSessionLifecycleTest, StopSessionsClosesRegisteredSockets) {
@@ -282,6 +282,48 @@ TEST(ClientSessionLifecycleTest, StopSessionsClosesRegisteredSockets) {
     ioc.run();
 
     EXPECT_FALSE(socket->is_open());
+}
+
+TEST(ClientSessionLifecycleTest, ServerRejectsCapacityBeforeSpawningSecondSession) {
+    asio::io_context server_ioc;
+    auto shutdown = std::make_shared<ShutdownCoordinator>();
+    HttpServer server(server_ioc, 0, 30000, 10000, 30000,
+                      shutdown, nullptr, 1);
+    co_spawn(server_ioc, server.start(), asio::detached);
+    std::thread runner([&server_ioc] { server_ioc.run(); });
+
+    asio::io_context client_ioc;
+    tcp::socket first(client_ioc);
+    first.connect({asio::ip::make_address("127.0.0.1"), server.port()});
+    for (int i = 0; i < 100 && shutdown->active_sessions() != 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (shutdown->active_sessions() != 1) {
+        ADD_FAILURE() << "first session did not acquire its capacity lease";
+        asio::error_code close_ec;
+        first.close(close_ec);
+        server.stop();
+        server_ioc.stop();
+        runner.join();
+        return;
+    }
+
+    tcp::socket second(client_ioc);
+    second.connect({asio::ip::make_address("127.0.0.1"), server.port()});
+    std::array<char, 1> byte{};
+    asio::error_code read_ec;
+    second.read_some(asio::buffer(byte), read_ec);
+
+    EXPECT_TRUE(read_ec == asio::error::eof ||
+                read_ec == asio::error::connection_reset);
+    EXPECT_EQ(shutdown->capacity_rejections(), 1u);
+    EXPECT_EQ(shutdown->active_sessions(), 1u);
+
+    asio::error_code close_ec;
+    first.close(close_ec);
+    server.stop();
+    server_ioc.stop();
+    runner.join();
 }
 
 TEST_F(ClientSessionTest, QueryStringStillMatchesExactLocalRoute) {

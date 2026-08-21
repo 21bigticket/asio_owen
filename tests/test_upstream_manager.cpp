@@ -163,6 +163,26 @@ TEST(UpstreamManager, ReloadReplacesPoolWhenPoolConfigChanges) {
     EXPECT_EQ(after->pool->cfg().max_size, 20u);
 }
 
+TEST(UpstreamManager, ReloadingProcessBudgetKeepsExistingPools) {
+    asio::io_context ioc;
+    UpstreamManager manager(ioc);
+    auto upstream = make_upstream_config("zebra-config", "127.0.0.1", 30001);
+    HttpPool::Config initial_pool_cfg;
+    initial_pool_cfg.max_total_connections = 10;
+    manager.reload(upstream, initial_pool_cfg);
+    auto before = manager.route("/zebra-config/path");
+    ASSERT_TRUE(before.has_value());
+
+    auto changed_pool_cfg = initial_pool_cfg;
+    changed_pool_cfg.max_total_connections = 20;
+    manager.reload(upstream, changed_pool_cfg);
+    auto after = manager.route("/zebra-config/path");
+    ASSERT_TRUE(after.has_value());
+
+    EXPECT_EQ(after->pool, before->pool);
+    EXPECT_NE(manager.pool_stats().find("process_total=0/20"), std::string::npos);
+}
+
 TEST(UpstreamManager, PreparedReloadDoesNotPublishEarly) {
     asio::io_context ioc;
     UpstreamManager manager(ioc);

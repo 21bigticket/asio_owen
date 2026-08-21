@@ -145,7 +145,7 @@ private:
         ConnectionGuard(MysqlPool* pool, MYSQL* conn)
             : pool_(pool), conn_(conn) {}
 
-        ~ConnectionGuard() {
+        ~ConnectionGuard() noexcept {
             if (!conn_) return;
             if (bad_) {
                 pool_->drop_bad_connection(conn_);
@@ -276,10 +276,25 @@ private:
     }
 
     // --- release: timestamp then return to idle pool ---
-    void release(MYSQL* conn) {
+    void release(MYSQL* conn) noexcept {
         if (!conn) return;
-        std::lock_guard lock(mtx_);
-        idle_pool_.push_back({conn, std::chrono::steady_clock::now()});
+        bool pooled = false;
+        {
+            std::lock_guard lock(mtx_);
+            try {
+                idle_pool_.push_back({conn, std::chrono::steady_clock::now()});
+                pooled = true;
+            } catch (...) {
+                // ConnectionGuard is a noexcept destructor. If the idle deque
+                // cannot grow, drop this connection and release its reserved
+                // pool slot instead of terminating or leaving total_ stuck.
+                if (total_ > 0) --total_;
+            }
+        }
+        if (!pooled) {
+            ensure_mysql_thread_initialized();
+            mysql_close(conn);
+        }
         cv_.notify_one();
     }
 

@@ -15,7 +15,7 @@
 #include "pool_stats_service.hpp"
 #include "reload_service.hpp"
 #include "snapshot_service.hpp"
-#include "shutdown_coordinator.hpp"
+#include "../common/shutdown_coordinator.hpp"
 #include "route_runtime.hpp"
 #include "../common/signal_exit.hpp"
 #include "../db/mysql_pool.hpp"
@@ -42,10 +42,6 @@ private:
     void cleanup();
 
     asio::io_context ioc_;
-    std::unique_ptr<MysqlPool> mysql_;
-    std::unique_ptr<RedisPool> redis_;
-    std::unique_ptr<asio::thread_pool> admin_auth_workers_;
-    std::unique_ptr<asio::thread_pool> config_file_workers_;
     std::shared_ptr<ComboQueryLimiter> combo_query_limiter_;
     std::unique_ptr<HttpServer> server_;
     std::unique_ptr<SecurityRules> security_rules_;
@@ -66,6 +62,7 @@ private:
     std::shared_ptr<ShutdownCoordinator> shutdown_coordinator_ =
         std::make_shared<ShutdownCoordinator>();
     std::shared_ptr<RouteRuntime> route_runtime_;
+    unsigned int effective_io_threads_ = 1;
     // Set when an unhandled io_context handler exception forced the shutdown,
     // so run() reports a non-zero exit code instead of a clean "0" that
     // supervisors (systemd Restart=on-failure, containers, CLI) would treat

@@ -1,0 +1,25 @@
+services:
+  mysql-integration:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: integration-root
+      MYSQL_DATABASE: zebra_config
+    ports:
+      - "${ASIO_OWEN_INTEGRATION_MYSQL_PORT:-33079}:3306"
+    volumes:
+      - ./tests/integration/mysql-init.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pintegration-root"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  redis-integration:
+    image: redis:7-alpine
+    ports:
+      - "${ASIO_OWEN_INTEGRATION_REDIS_PORT:-6389}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

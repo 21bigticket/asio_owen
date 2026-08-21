@@ -29,6 +29,8 @@ public:
             release();
         }
 
+        explicit operator bool() const noexcept { return owner_ != nullptr; }
+
     private:
         void release() noexcept {
             if (owner_) {
@@ -41,7 +43,28 @@ public:
     };
 
     SessionLease enter_session() {
-        active_sessions_.fetch_add(1, std::memory_order_acq_rel);
+        return try_enter_session(0);
+    }
+
+    SessionLease try_enter_session(size_t max_sessions) {
+        if (phase() != Phase::Running) return {};
+
+        auto current = active_sessions_.load(std::memory_order_acquire);
+        for (;;) {
+            if (max_sessions != 0 && current >= max_sessions) {
+                capacity_rejections_.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            }
+            if (active_sessions_.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+        if (phase() != Phase::Running) {
+            leave_session();
+            return {};
+        }
         return SessionLease(shared_from_this());
     }
 
@@ -59,6 +82,9 @@ public:
     bool draining() const { return phase() != Phase::Running; }
     size_t active_sessions() const {
         return active_sessions_.load(std::memory_order_acquire);
+    }
+    uint64_t capacity_rejections() const {
+        return capacity_rejections_.load(std::memory_order_relaxed);
     }
 
     asio::awaitable<bool> wait_for_drain(
@@ -90,4 +116,5 @@ private:
 
     std::atomic<Phase> phase_{Phase::Running};
     std::atomic<size_t> active_sessions_{0};
+    std::atomic<uint64_t> capacity_rejections_{0};
 };

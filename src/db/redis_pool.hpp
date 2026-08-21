@@ -242,7 +242,7 @@ private:
         ConnectionGuard(RedisPool* pool, redisContext* ctx)
             : pool_(pool), ctx_(ctx) {}
 
-        ~ConnectionGuard() {
+        ~ConnectionGuard() noexcept {
             if (!dropped_ && ctx_) {
                 pool_->release_conn(ctx_);
             }
@@ -306,10 +306,16 @@ private:
         for (size_t i = 0; i < cfg_.min_size; ++i) {
             auto* ctx = create_connection();
             if (ctx) {
-                std::lock_guard lock(mtx_);
-                idle_pool_.push_back({ctx, std::chrono::steady_clock::now()});
-                ++total_;
-                ++created;
+                bool pooled = false;
+                {
+                    std::lock_guard lock(mtx_);
+                    pooled = push_idle_locked(ctx);
+                    if (pooled) {
+                        ++total_;
+                        ++created;
+                    }
+                }
+                if (!pooled) redisFree(ctx);
             }
         }
         LOG_INFO("RedisPool worker pre-created ", created, " connections");
@@ -343,7 +349,7 @@ private:
         return acquire_direct();
     }
 
-    void release_conn(redisContext* ctx) {
+    void release_conn(redisContext* ctx) noexcept {
         if (!ctx) return;
         if (cfg_.mode == Mode::Worker) {
             release_worker(ctx);
@@ -419,11 +425,37 @@ private:
         return nullptr;
     }
 
-    void release_worker(redisContext* ctx) {
+    void release_worker(redisContext* ctx) noexcept {
         if (!ctx) return;
-        std::lock_guard lock(mtx_);
-        idle_pool_.push_back({ctx, std::chrono::steady_clock::now()});
+        bool pooled = false;
+        try {
+            std::lock_guard lock(mtx_);
+            pooled = push_idle_locked(ctx);
+            if (!pooled && total_ > 0) --total_;
+        } catch (...) {
+            // A lock failure is not recoverable for pool accounting, but the
+            // connection must still be freed and no exception may escape a
+            // ConnectionGuard destructor.
+        }
+        if (!pooled) redisFree(ctx);
         cv_.notify_one();
+    }
+
+    bool push_idle_locked(redisContext* ctx) noexcept {
+        try {
+#ifdef ASIO_OWEN_TESTING
+            size_t remaining = fail_idle_pushes_for_test_.load(std::memory_order_relaxed);
+            while (remaining > 0 &&
+                   !fail_idle_pushes_for_test_.compare_exchange_weak(
+                       remaining, remaining - 1, std::memory_order_relaxed)) {
+            }
+            if (remaining > 0) throw std::bad_alloc();
+#endif
+            idle_pool_.push_back({ctx, std::chrono::steady_clock::now()});
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 
     void drop_bad_connection(redisContext* ctx) {
@@ -472,16 +504,34 @@ private:
         return false;
     }
 
-    void maintain_loop() {
-        LOG_INFO("Redis maintain thread started");
-        while (running_) {
-            std::unique_lock lock(mtx_);
-            cv_.wait_for(lock, std::chrono::seconds(30), [&] { return !running_; });
-            if (!running_) break;
-            lock.unlock();
-            do_maintain();
+    void maintain_loop() noexcept {
+        try {
+            LOG_INFO("Redis maintain thread started");
+        } catch (...) {
         }
-        LOG_INFO("Redis maintain thread exited");
+        while (running_) {
+            try {
+                std::unique_lock lock(mtx_);
+                cv_.wait_for(lock, std::chrono::seconds(30), [&] { return !running_; });
+                if (!running_) break;
+                lock.unlock();
+                do_maintain();
+            } catch (const std::exception& e) {
+                try {
+                    LOG_ERROR("Redis maintain failed: ", e.what());
+                } catch (...) {
+                }
+            } catch (...) {
+                try {
+                    LOG_ERROR("Redis maintain failed with an unknown exception");
+                } catch (...) {
+                }
+            }
+        }
+        try {
+            LOG_INFO("Redis maintain thread exited");
+        } catch (...) {
+        }
     }
 
     void do_maintain() {
@@ -490,6 +540,9 @@ private:
         std::vector<redisContext*> to_close;
         {
             std::lock_guard lock(mtx_);
+            // Reserve before removing ownership from idle_pool_. If allocation
+            // fails, maintain_loop catches it with the pool still unchanged.
+            to_close.reserve(idle_pool_.size());
             while (!idle_pool_.empty()) {
                 const auto age = std::chrono::duration_cast<std::chrono::seconds>(
                     now - idle_pool_.front().last_used_at).count();
@@ -508,6 +561,8 @@ private:
 
         if (!running_) return;
 
+        std::vector<redisContext*> new_conns;
+        new_conns.reserve(cfg_.min_size);
         size_t need = 0;
         {
             std::lock_guard lock(mtx_);
@@ -517,31 +572,36 @@ private:
                 total_ += need;
             }
         }
-        std::vector<redisContext*> new_conns;
-        size_t created = 0;
         for (size_t i = 0; i < need; ++i) {
             if (!running_) break;
             auto* ctx = create_connection();
             if (ctx) {
                 new_conns.push_back(ctx);
-                ++created;
             }
         }
+        size_t pooled = 0;
         {
             std::lock_guard lock(mtx_);
-            total_ -= (need - created);
-            for (auto* c : new_conns) {
-                idle_pool_.push_back({c, std::chrono::steady_clock::now()});
+            for (auto*& c : new_conns) {
+                if (push_idle_locked(c)) {
+                    ++pooled;
+                    c = nullptr;
+                }
             }
+            total_ -= (need - pooled);
             cv_.notify_all();
-            if (created > 0)
-                LOG_INFO("maintain: added ", created, " connections");
         }
+        for (auto* c : new_conns) {
+            if (c) redisFree(c);
+        }
+        if (pooled > 0)
+            LOG_INFO("maintain: added ", pooled, " connections");
 
         if (!running_) return;
 
         constexpr size_t max_check = 4;
         std::vector<IdleConn> to_check;
+        to_check.reserve(max_check);
         {
             std::lock_guard lock(mtx_);
             const size_t cnt = std::min(idle_pool_.size(), max_check);
@@ -568,8 +628,15 @@ private:
                 stats_.inc_ping_fail();
                 ++dead_count;
             } else {
-                std::lock_guard lock(mtx_);
-                idle_pool_.push_back({ctx, std::chrono::steady_clock::now()});
+                bool pooled = false;
+                {
+                    std::lock_guard lock(mtx_);
+                    pooled = push_idle_locked(ctx);
+                }
+                if (!pooled) {
+                    redisFree(ctx);
+                    ++dead_count;
+                }
             }
         }
         if (!running_) {
@@ -674,6 +741,24 @@ private:
     size_t max_creating_limit_ = 0;
     mutable std::mutex mtx_;
     std::condition_variable cv_;
+
+#ifdef ASIO_OWEN_TESTING
+public:
+    void fail_idle_pushes_for_test(size_t count) noexcept {
+        fail_idle_pushes_for_test_.store(count, std::memory_order_relaxed);
+    }
+
+    void return_worker_connection_for_test(redisContext* ctx) noexcept {
+        {
+            std::lock_guard lock(mtx_);
+            ++total_;
+        }
+        release_worker(ctx);
+    }
+
+private:
+    std::atomic<size_t> fail_idle_pushes_for_test_{0};
+#endif
 
     inline static std::atomic<uint64_t> next_generation_{1};
     inline static thread_local TlsRedisConn tls_;

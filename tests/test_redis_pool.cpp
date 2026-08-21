@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <hiredis/hiredis.h>
+#include <sys/time.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "db/redis_connection.hpp"
 #include "db/redis_pool_stats.hpp"
 #include "db/redis_reply.hpp"
+#include "db/redis_pool.hpp"
 
 TEST(RedisReply, ParsesStringStatusIntegerNilAndError) {
     redisReply string_reply{};
@@ -144,4 +146,26 @@ TEST(RedisPoolStats, FormatsSnapshotCounters) {
               ", connect_ok_total=0, connect_fail_total=0, acquire_wait_total=0, acquire_timeout_total=0"
               ", acquire_retry_exhausted_total=0, idle_recycled_total=0, ping_fail_total=0"
               ", total_conn=0, idle_conn=0, creating_conn=0, max_creating=0");
+}
+
+TEST(RedisPool, IdleQueueAllocationFailureDropsConnectionAndReleasesSlot) {
+    asio::io_context ioc;
+    RedisPool::Config cfg;
+    cfg.mode = RedisPool::Mode::Worker;
+    cfg.min_size = 0;
+    cfg.max_size = 1;
+    cfg.worker_threads = 1;
+    RedisPool pool(ioc, cfg);
+
+    timeval timeout{0, 1000};
+    redisContext* ctx = redisConnectWithTimeout("127.0.0.1", 1, timeout);
+    ASSERT_NE(ctx, nullptr);
+
+    pool.fail_idle_pushes_for_test(1);
+    pool.return_worker_connection_for_test(ctx);
+
+    const auto snapshot = pool.snapshot();
+    EXPECT_EQ(snapshot.total_conn, 0u);
+    EXPECT_EQ(snapshot.idle_conn, 0u);
+    pool.shutdown();
 }

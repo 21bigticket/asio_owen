@@ -44,9 +44,11 @@ public:
         std::unordered_map<std::string, UpstreamConfig> upstreams_;
         std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
         bool json_keys_snake_to_camel_ = true;
+        size_t max_total_connections_ = 0;
     };
 
-    explicit UpstreamManager(asio::io_context& ioc) : ioc_(ioc) {}
+    explicit UpstreamManager(asio::io_context& ioc)
+        : ioc_(ioc), connection_budget_(std::make_shared<HttpConnectionBudget>()) {}
 
     // Monotonic counter incremented on every publish. Client sessions compare
     // it with the security-rules generation to detect that a hot-reload landed
@@ -91,6 +93,7 @@ public:
         // an invalid value rejects the whole reload (get_bool throws), same
         // fail-closed semantics as a malformed upstream entry below.
         PreparedReload prepared;
+        prepared.max_total_connections_ = pool_cfg.max_total_connections;
         prepared.json_keys_snake_to_camel_ =
             cfg.get_bool("gateway", "json_keys_snake_to_camel", true);
 
@@ -160,10 +163,11 @@ public:
             auto current = current_upstreams.find(name);
             if (current != current_upstreams.end() &&
                 current->second.host == host && current->second.port == port &&
-                current_pools.at(name)->cfg() == pool_cfg) {
+                current_pools.at(name)->cfg().same_pool_settings(pool_cfg)) {
                 prepared.pools_[name] = current_pools.at(name);
             } else {
-                prepared.pools_[name] = std::make_shared<HttpPool>(ioc_, pool_cfg);
+                prepared.pools_[name] = std::make_shared<HttpPool>(
+                    ioc_, pool_cfg, connection_budget_);
             }
             // Assign (not emplace) so that later config files (e.g.
             // 99-local.ini) override earlier ones for the same service name,
@@ -183,6 +187,7 @@ public:
             // Swapped inside the same lock as the maps + generation bump, so a
             // request never sees the new flag mixed with the old route table.
             json_keys_snake_to_camel_ = prepared.json_keys_snake_to_camel_;
+            connection_budget_->set_limit(prepared.max_total_connections_);
             // Increment inside the lock: a reader that observes the new
             // generation must also observe the new maps, and vice versa.
             generation_.fetch_add(1, std::memory_order_release);
@@ -199,13 +204,15 @@ public:
 
     std::string pool_stats() const {
         std::shared_lock lock(mtx_);
-        if (pools_.empty()) return "none";
+        if (pools_.empty()) return "process_total=" +
+            std::to_string(connection_budget_->current()) + "/" +
+            std::to_string(connection_budget_->limit()) + "; none";
 
         std::ostringstream oss;
-        bool first = true;
+        oss << "process_total=" << connection_budget_->current()
+            << "/" << connection_budget_->limit();
         for (const auto& [name, pool] : pools_) {
-            if (!first) oss << "; ";
-            first = false;
+            oss << "; ";
             oss << name << "={" << pool->stats() << "}";
         }
         return oss.str();
@@ -223,6 +230,7 @@ private:
     asio::io_context& ioc_;
     std::unordered_map<std::string, UpstreamConfig> upstreams_;
     std::unordered_map<std::string, std::shared_ptr<HttpPool>> pools_;
+    std::shared_ptr<HttpConnectionBudget> connection_budget_;
     // Written only under the unique_lock in publish_reload, read under the
     // shared_lock in route(), so it always publishes atomically with the maps.
     bool json_keys_snake_to_camel_ = true;

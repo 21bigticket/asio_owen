@@ -77,6 +77,11 @@ add_executable(test_config_load test_config_load.cpp)
 target_link_libraries(test_config_load PRIVATE gtest_main asio_owen_core)
 gtest_discover_tests(test_config_load)
 
+# Process-wide file-descriptor budget calculation and RLIMIT validation
+add_executable(test_process_fd_budget test_process_fd_budget.cpp)
+target_link_libraries(test_process_fd_budget PRIVATE gtest_main asio_owen_core)
+gtest_discover_tests(test_process_fd_budget)
+
 # 安全路径规范化
 add_executable(test_path_normalize test_path_normalize.cpp)
 target_link_libraries(test_path_normalize PRIVATE gtest_main asio_owen_core)
@@ -100,6 +105,7 @@ gtest_discover_tests(test_mysql_pool)
 # Redis 连接池集成测试（需要真实 Redis 实例）
 add_executable(test_redis_pool test_redis_pool.cpp)
 target_link_libraries(test_redis_pool PRIVATE gtest_main asio_owen_core)
+target_compile_definitions(test_redis_pool PRIVATE ASIO_OWEN_TESTING)
 gtest_discover_tests(test_redis_pool)
 
 # Rate limiter (token bucket + 32-shard LRU + snapshot)
@@ -188,4 +194,12 @@ if(ASIO_OWEN_BUILD_INTEGRATION_TESTS)
         NAME RedisFaultMatrix
         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/redis_fault_matrix.sh)
     set_tests_properties(RedisFaultMatrix PROPERTIES TIMEOUT 120)
+
+    add_test(
+        NAME ServiceIntegration
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/service_integration.sh
+            $<TARGET_FILE:server>)
+    set_tests_properties(ServiceIntegration PROPERTIES
+        TIMEOUT 180
+        LABELS integration)
 endif()

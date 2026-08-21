@@ -43,11 +43,13 @@ public:
                int client_body_read_timeout_ms = 30000,
                std::shared_ptr<ShutdownCoordinator> shutdown =
                    std::make_shared<ShutdownCoordinator>(),
-               std::shared_ptr<RouteRuntime> runtime = nullptr)
+               std::shared_ptr<RouteLifecycle> lifecycle = nullptr,
+               size_t max_client_connections = 8192)
         : ioc_(ioc), acceptor_(asio::make_strand(ioc), {asio::ip::tcp::v4(), port}),
           state_(std::make_shared<HttpServerState>(
               ioc, downstream_write_timeout_ms, client_header_read_timeout_ms,
-              client_body_read_timeout_ms, std::move(shutdown), std::move(runtime))) {}
+              client_body_read_timeout_ms, std::move(shutdown), std::move(lifecycle),
+              max_client_connections)) {}
 
     void route(const std::string& path, Handler handler) {
         state_->routes[path] = std::move(handler);
@@ -98,10 +100,20 @@ public:
                 auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
                 backoff_ms = 0;  // reset on success
                 if (!state_->running) break;
+                auto session_lease = state_->shutdown ?
+                    state_->shutdown->try_enter_session(
+                        state_->max_client_connections) :
+                    ShutdownCoordinator::SessionLease{};
+                if (state_->shutdown && !session_lease) {
+                    asio::error_code close_ec;
+                    socket.close(close_ec);
+                    continue;
+                }
                 auto session = std::make_shared<ClientSession>(state_);
                 auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
                 auto session_executor = asio::make_strand(ioc_);
-                co_spawn(session_executor, session->run(std::move(session_socket)),
+                co_spawn(session_executor, session->run(
+                    std::move(session_socket), std::move(session_lease)),
                     [session](const std::exception_ptr& ep) {
                         if (!ep) return;
                         try {

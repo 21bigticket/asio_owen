@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -16,14 +17,18 @@
 
 class ReloadService {
 public:
+    using PoolConfigValidator = std::function<void(const HttpPool::Config&)>;
+
     ReloadService(asio::io_context& ioc,
                   std::filesystem::path config_base,
                   SecurityRules& security_rules,
-                  UpstreamManager& upstreams)
+                  UpstreamManager& upstreams,
+                  PoolConfigValidator pool_config_validator = {})
         : timer_(ioc)
         , config_base_(std::move(config_base))
         , security_rules_(security_rules)
-        , upstreams_(upstreams) {}
+        , upstreams_(upstreams)
+        , pool_config_validator_(std::move(pool_config_validator)) {}
 
     void start(int interval_sec) {
         if (interval_sec <= 0) return;
@@ -76,8 +81,12 @@ private:
                                 // Re-read [http_pool] each reload instead of using
                                 // the value captured at construction, so pool
                                 // tuning changes take effect.
+                                auto pool_cfg = http_pool_config_from(new_cfg);
+                                if (pool_config_validator_) {
+                                    pool_config_validator_(pool_cfg);
+                                }
                                 auto prepared_upstreams = upstreams_.prepare_reload(
-                                    new_cfg, http_pool_config_from(new_cfg));
+                                    new_cfg, pool_cfg);
 
                                 // All allocation and parsing completes before
                                 // either live subsystem is changed. Publish
@@ -183,6 +192,7 @@ private:
     std::filesystem::path config_base_;
     SecurityRules& security_rules_;
     UpstreamManager& upstreams_;
+    PoolConfigValidator pool_config_validator_;
     std::optional<ConfigFingerprint> last_config_fingerprint_;
     // Fingerprint observed for the first time; published only after it is
     // confirmed stable on the next tick (debounce against half-written files).

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -62,6 +63,20 @@ int Application::run(int argc, char* argv[]) {
         }
     };
     try {
+        effective_io_threads_ = std::thread::hardware_concurrency();
+        if (effective_io_threads_ == 0) effective_io_threads_ = 4;
+        if (app_cfg.io_threads != 0) {
+            effective_io_threads_ = static_cast<unsigned int>(app_cfg.io_threads);
+        } else {
+            effective_io_threads_ = std::min(effective_io_threads_, 16u);
+        }
+        const auto fd_budget = process_fd_budget_from(app_cfg, effective_io_threads_);
+        const auto fd_soft_limit = process_soft_fd_limit();
+        validate_process_fd_budget(fd_budget, fd_soft_limit);
+        LOG_INFO("Process FD budget validated, required=", fd_budget.total(),
+                 ", soft_limit=",
+                 fd_soft_limit.value_or(std::numeric_limits<uint64_t>::max()),
+                 ", ", fd_budget.describe());
         initialize(cfg, app_cfg, config_base);
 
         co_spawn(server_->executor(), server_->start(),
@@ -82,9 +97,9 @@ int Application::run(int argc, char* argv[]) {
             request_stop();
         });
 
-        unsigned int thread_count = std::thread::hardware_concurrency();
-        if (thread_count == 0) thread_count = 4;
-        for (unsigned int i = 1; i < thread_count; ++i) {
+        LOG_INFO("Starting io_context workers, threads=", effective_io_threads_,
+                 ", configured=", app_cfg.io_threads);
+        for (unsigned int i = 1; i < effective_io_threads_; ++i) {
             threads.emplace_back([this]() { run_io_context(); });
         }
         run_io_context();
@@ -171,17 +186,13 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     route_runtime_->admin_login_throttle = admin_login_throttle_;
     route_runtime_->admin_auth_limiter = admin_auth_limiter_;
     route_runtime_->config_metrics = config_metrics_;
-    mysql_ = nullptr;
-    redis_ = nullptr;
-    admin_auth_workers_ = nullptr;
-    config_file_workers_ = nullptr;
     auto& redis = *route_runtime_->redis;
     combo_query_limiter_ = std::make_shared<ComboQueryLimiter>(
         app_cfg.combo_max_in_flight_queries);
     server_ = std::make_unique<HttpServer>(
         ioc_, app_cfg.server_port, app_cfg.downstream_write_timeout_ms,
         app_cfg.client_header_read_timeout_ms, app_cfg.client_body_read_timeout_ms,
-        shutdown_coordinator_, route_runtime_);
+        shutdown_coordinator_, route_runtime_, app_cfg.max_client_connections);
 
     security_rules_ = std::make_unique<SecurityRules>();
     security_rules_->load_from_config(cfg);
@@ -212,7 +223,9 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
         .admin_metrics = admin_metrics_,
         .admin_login_throttle = route_runtime_->admin_login_throttle,
         .admin_auth_limiter = route_runtime_->admin_auth_limiter,
-        .upstreams = &server_->upstreams()
+        .upstreams = &server_->upstreams(),
+        .io_threads = effective_io_threads_,
+        .max_client_connections = app_cfg.max_client_connections
     });
 
     register_upstreams(cfg, app_cfg.http_pool);
@@ -227,7 +240,12 @@ void Application::initialize(const Config& cfg, const AppConfig& app_cfg,
     config_history_service_->start();
 
     reload_service_ = std::make_unique<ReloadService>(
-        ioc_, config_base, *security_rules_, server_->upstreams());
+        ioc_, config_base, *security_rules_, server_->upstreams(),
+        [base_budget = process_fd_budget_from(app_cfg, effective_io_threads_)](
+            const HttpPool::Config& pool_cfg) mutable {
+            base_budget.upstream_connections = pool_cfg.max_total_connections;
+            validate_process_fd_budget(base_budget);
+        });
     reload_service_->start(app_cfg.reload_interval_sec);
 }
 
@@ -245,7 +263,7 @@ void Application::request_stop() {
     const auto now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     if (admin_metrics_) admin_metrics_->drain_started_ns.store(now_ns, std::memory_order_relaxed);
-    LOG_INFO("Graceful shutdown requested...");
+    LOG_INFO("Shutdown requested; active client sockets will be cancelled");
     if (server_) server_->stop();
     try {
         asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
@@ -324,10 +342,6 @@ void Application::cleanup() {
     if (route_runtime_ && route_runtime_->redis) route_runtime_->redis->shutdown();
     if (route_runtime_) route_runtime_->mark_stopped();
     route_runtime_.reset();
-    admin_auth_workers_.reset();
-    config_file_workers_.reset();
-    redis_.reset();
-    mysql_.reset();
     combo_query_limiter_.reset();
     security_rules_.reset();
 }

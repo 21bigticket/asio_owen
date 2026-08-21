@@ -25,9 +25,9 @@
 #include "proxy_forwarder.hpp"
 #include "response.hpp"
 #include "response_builder.hpp"
+#include "route_lifecycle.hpp"
 #include "upstream_manager.hpp"
-#include "../app/shutdown_coordinator.hpp"
-#include "../app/route_runtime.hpp"
+#include "../common/shutdown_coordinator.hpp"
 
 using namespace std::chrono_literals;
 
@@ -41,12 +41,14 @@ struct HttpServerState {
         int client_body_read_timeout_ms = 30000,
         std::shared_ptr<ShutdownCoordinator> shutdown =
             std::make_shared<ShutdownCoordinator>(),
-        std::shared_ptr<RouteRuntime> runtime = nullptr)
+        std::shared_ptr<RouteLifecycle> lifecycle = nullptr,
+        size_t max_client_connections = 8192)
         : upstreams(ioc),
           downstream_write_timeout_ms(downstream_write_timeout_ms),
           client_header_read_timeout_ms(client_header_read_timeout_ms),
           client_body_read_timeout_ms(client_body_read_timeout_ms),
-          shutdown(std::move(shutdown)), runtime(std::move(runtime)) {}
+          shutdown(std::move(shutdown)), lifecycle(std::move(lifecycle)),
+          max_client_connections(max_client_connections) {}
 
     std::unordered_map<std::string, Handler> routes;
     std::vector<std::pair<std::string, Handler>> prefix_routes;
@@ -57,7 +59,8 @@ struct HttpServerState {
     int client_header_read_timeout_ms = 10000;
     int client_body_read_timeout_ms = 30000;
     std::shared_ptr<ShutdownCoordinator> shutdown;
-    std::shared_ptr<RouteRuntime> runtime;
+    std::shared_ptr<RouteLifecycle> lifecycle;
+    size_t max_client_connections = 8192;
 
     void register_session(const std::shared_ptr<asio::ip::tcp::socket>& socket) {
         register_session(socket, socket->get_executor());
@@ -141,15 +144,20 @@ public:
         return m == "GET" || m == "HEAD" || m == "OPTIONS" || m == "TRACE";
     }
 
-    asio::awaitable<void> run(std::shared_ptr<asio::ip::tcp::socket> socket_holder) {
+    asio::awaitable<void> run(
+        std::shared_ptr<asio::ip::tcp::socket> socket_holder,
+        ShutdownCoordinator::SessionLease session_lease = {}) {
         auto& socket = *socket_holder;
         auto executor = co_await asio::this_coro::executor;
-        auto session_lease = state_->shutdown ?
-            state_->shutdown->enter_session() : ShutdownCoordinator::SessionLease{};
-        auto handler_lease = state_->runtime ?
-            state_->runtime->enter_handler() : RouteRuntime::HandlerLease{};
+        if (!session_lease && state_->shutdown) {
+            session_lease = state_->shutdown->try_enter_session(
+                state_->max_client_connections);
+        }
+        if (state_->shutdown && !session_lease) co_return;
+        auto handler_lease = state_->lifecycle ?
+            state_->lifecycle->enter_handler() : RouteLifecycle::HandlerLease{};
         SessionSocketGuard socket_guard(state_, std::move(socket_holder), executor);
-        if (state_->runtime && !handler_lease) co_return;
+        if (state_->lifecycle && !handler_lease) co_return;
         int final_error_status = 0;
         std::string final_error_reason;
         std::string final_error_body;
@@ -621,8 +629,8 @@ public:
                     break;
                 }
                 if (client_conn_tokens.close) break;
-                if (state_->runtime && state_->runtime->draining()) break;
-                if (!state_->runtime && state_->shutdown && state_->shutdown->draining()) break;
+                if (state_->lifecycle && state_->lifecycle->draining()) break;
+                if (!state_->lifecycle && state_->shutdown && state_->shutdown->draining()) break;
             }
         } catch (const std::system_error& e) {
             LOG_WARN("Connection system_error: ", e.what());

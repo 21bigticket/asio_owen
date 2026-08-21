@@ -62,14 +62,37 @@ public:
         }
 
         std::vector<std::filesystem::path> files;
-        for (const auto& entry : std::filesystem::directory_iterator(dir_path, ec)) {
+        std::filesystem::directory_iterator it(dir_path, ec);
+        if (ec) {
+            LOG_ERROR("Failed to scan config directory: ", dir_path.string(),
+                      ", error=", ec.message());
+            return false;
+        }
+        const std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(ec)) {
             if (ec) {
-                LOG_ERROR("Failed to scan config directory: ", dir_path.string());
+                LOG_ERROR("Failed to scan config directory: ", dir_path.string(),
+                          ", error=", ec.message());
                 return false;
             }
-            if (entry.is_regular_file(ec) && entry.path().extension() == ".ini") {
-                files.push_back(entry.path());
+            const bool regular = it->is_regular_file(ec);
+            if (ec) {
+                LOG_ERROR("Failed to inspect config entry: ", it->path().string(),
+                          ", error=", ec.message());
+                return false;
             }
+            if (regular && it->path().extension() == ".ini") {
+                files.push_back(it->path());
+            }
+        }
+        if (ec) {
+            LOG_ERROR("Failed to scan config directory: ", dir_path.string(),
+                      ", error=", ec.message());
+            return false;
+        }
+        if (files.empty()) {
+            LOG_ERROR("Config directory contains no .ini files: ", dir_path.string());
+            return false;
         }
 
         std::sort(files.begin(), files.end(),

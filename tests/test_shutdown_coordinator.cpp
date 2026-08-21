@@ -6,7 +6,7 @@
 #include <chrono>
 #include <memory>
 
-#include "app/shutdown_coordinator.hpp"
+#include "common/shutdown_coordinator.hpp"
 
 TEST(ShutdownCoordinator, TracksSessionsAndTransitionsOnce) {
     auto coordinator = std::make_shared<ShutdownCoordinator>();
@@ -50,3 +50,18 @@ TEST(ShutdownCoordinator, DrainWaitIsBoundedAndCompletesAfterLeaseRelease) {
     EXPECT_TRUE(drained);
 }
 
+TEST(ShutdownCoordinator, EnforcesSessionCapacityAndCountsRejections) {
+    auto coordinator = std::make_shared<ShutdownCoordinator>();
+    auto first = coordinator->try_enter_session(1);
+    auto rejected = coordinator->try_enter_session(1);
+
+    EXPECT_TRUE(first);
+    EXPECT_FALSE(rejected);
+    EXPECT_EQ(coordinator->active_sessions(), 1u);
+    EXPECT_EQ(coordinator->capacity_rejections(), 1u);
+
+    first = {};
+    auto next = coordinator->try_enter_session(1);
+    EXPECT_TRUE(next);
+    EXPECT_EQ(coordinator->active_sessions(), 1u);
+}

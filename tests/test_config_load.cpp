@@ -106,6 +106,58 @@ TEST(ConfigLoad, ParsesDownstreamWriteTimeout) {
     std::filesystem::remove_all(base);
 }
 
+TEST(ConfigLoad, ParsesProcessResourceLimits) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "port = 8081\n"
+        "io_threads = 7\n"
+        "max_client_connections = 1234\n"
+        "fd_reserve = 96\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    const auto app = app_config_from(cfg);
+    EXPECT_EQ(app.io_threads, 7u);
+    EXPECT_EQ(app.max_client_connections, 1234u);
+    EXPECT_EQ(app.fd_reserve, 96u);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsServerPortOutsideTcpRange) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "port = 70000\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    EXPECT_THROW(app_config_from(cfg), std::invalid_argument);
+
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "port = 0\n");
+    Config zero_cfg;
+    ASSERT_TRUE(zero_cfg.load(base));
+    EXPECT_THROW(app_config_from(zero_cfg), std::invalid_argument);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsFdReserveBelowSafetyFloor) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "00-server.ini",
+        "[server]\n"
+        "port = 8080\n"
+        "fd_reserve = 31\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    EXPECT_THROW(app_config_from(cfg), std::invalid_argument);
+    std::filesystem::remove_all(base);
+}
+
 TEST(ConfigLoad, ParsesClientHeaderReadTimeout) {
     auto base = make_temp_config_dir();
     write_file(base / "config.d" / "00-server.ini",
@@ -116,6 +168,22 @@ TEST(ConfigLoad, ParsesClientHeaderReadTimeout) {
     ASSERT_TRUE(cfg.load(base));
     auto app = app_config_from(cfg);
     EXPECT_EQ(app.client_header_read_timeout_ms, 4321);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, ParsesProcessWideUpstreamConnectionLimit) {
+    auto base = make_temp_config_dir();
+    write_file(base / "config.d" / "21-http-pool.ini",
+        "[http_pool]\n"
+        "max_size = 512\n"
+        "max_total_connections = 2048\n");
+
+    Config cfg;
+    ASSERT_TRUE(cfg.load(base));
+    const auto pool = http_pool_config_from(cfg);
+    EXPECT_EQ(pool.max_size, 512u);
+    EXPECT_EQ(pool.max_total_connections, 2048u);
 
     std::filesystem::remove_all(base);
 }
@@ -244,6 +312,29 @@ TEST(ConfigLoad, RejectsUnreadableFileInsteadOfSilentlySkipping) {
 
     std::filesystem::permissions(unreadable, std::filesystem::perms::owner_all,
         std::filesystem::perm_options::replace);
+    std::filesystem::remove_all(base);
+}
+
+TEST(ConfigLoad, RejectsUnreadableOrEmptyConfigDirectory) {
+    auto base = make_temp_config_dir();
+
+    Config empty_cfg;
+    EXPECT_FALSE(empty_cfg.load(base));
+
+    if (geteuid() != 0) {
+        write_file(base / "config.d" / "00-server.ini",
+            "[server]\nport = 8081\n");
+        std::filesystem::permissions(base / "config.d", std::filesystem::perms::none,
+            std::filesystem::perm_options::replace);
+
+        Config unreadable_cfg;
+        EXPECT_FALSE(unreadable_cfg.load(base));
+
+        std::filesystem::permissions(base / "config.d",
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace);
+    }
+
     std::filesystem::remove_all(base);
 }
 

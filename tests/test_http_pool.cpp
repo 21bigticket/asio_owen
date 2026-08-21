@@ -74,6 +74,20 @@ asio::awaitable<void> acquire_twice_expect_second_null(
     HttpPool::release_bad(pool.state(), std::move(first));
 }
 
+asio::awaitable<void> acquire_across_shared_budget(
+    HttpPool& first_pool,
+    HttpPool& second_pool,
+    int port,
+    std::atomic<bool>& second_was_null) {
+    auto first = co_await first_pool.acquire("127.0.0.1", port);
+    if (!first) co_return;
+
+    auto second = co_await second_pool.acquire("127.0.0.1", port);
+    second_was_null.store(second == nullptr, std::memory_order_relaxed);
+    if (second) HttpPool::release_bad(second_pool.state(), std::move(second));
+    HttpPool::release_bad(first_pool.state(), std::move(first));
+}
+
 asio::awaitable<void> acquire_release_then_inject_idle_failure(
     HttpPool& pool,
     int port,
@@ -206,6 +220,34 @@ TEST(HttpPool, MaxConcurrentIsGlobalHardLimit) {
     if (held_socket->has_value()) {
         (*held_socket)->close(ec);
     }
+}
+
+TEST(HttpPool, SharedProcessBudgetLimitsConnectionsAcrossPools) {
+    asio::io_context ioc;
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    auto held_socket = std::make_shared<std::optional<tcp::socket>>();
+    auto budget = std::make_shared<HttpConnectionBudget>(1);
+
+    HttpPool::Config cfg;
+    cfg.max_size = 2;
+    cfg.max_total_connections = 1;
+    cfg.connect_timeout_ms = 1000;
+    HttpPool first_pool(ioc, cfg, budget);
+    HttpPool second_pool(ioc, cfg, budget);
+
+    std::atomic<bool> second_was_null{false};
+    co_spawn(ioc, accept_one_and_hold(acceptor, held_socket), asio::detached);
+    co_spawn(ioc, acquire_across_shared_budget(
+        first_pool, second_pool, acceptor.local_endpoint().port(), second_was_null),
+        asio::detached);
+    ioc.run();
+
+    EXPECT_TRUE(second_was_null.load(std::memory_order_relaxed));
+    EXPECT_EQ(budget->current(), 0u);
+    EXPECT_EQ(budget->limit(), 1u);
+
+    asio::error_code ec;
+    if (held_socket->has_value()) (*held_socket)->close(ec);
 }
 
 TEST(HttpPool, IdleMaterializationFailureRollsBackInFlightReservation) {

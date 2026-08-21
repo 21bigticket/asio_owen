@@ -270,3 +270,46 @@ TEST(ReloadService, InvalidReloadIntervalPublishesNeitherRulesNorRoutes) {
     }
     std::filesystem::remove_all(base);
 }
+
+TEST(ReloadService, FdBudgetFailurePublishesNeitherRulesNorRoutes) {
+    auto base = make_temp_config_dir();
+    auto snapshot_path = base / "rate_limit.bin";
+    write_config(base, make_config(true, false, 10, 30001, snapshot_path));
+
+    Config initial_cfg;
+    ASSERT_TRUE(initial_cfg.load(base));
+    SecurityRules security_rules;
+    security_rules.load_from_config(initial_cfg);
+    asio::io_context ioc;
+    UpstreamManager upstreams(ioc);
+    upstreams.reload(initial_cfg, http_pool_config_from(initial_cfg));
+    const auto security_generation = security_rules.generation();
+    const auto upstream_generation = upstreams.generation();
+
+    ReloadService service(ioc, base, security_rules, upstreams,
+        [](const HttpPool::Config& cfg) {
+            if (cfg.max_total_connections > 15) {
+                throw std::invalid_argument("test FD budget exceeded");
+            }
+        });
+    service.start(1);
+
+    auto over_budget = make_config(true, true, 20, 30002, snapshot_path);
+    const std::string marker = "max_size = 20\n";
+    const auto marker_pos = over_budget.find(marker);
+    ASSERT_NE(marker_pos, std::string::npos);
+    over_budget.insert(marker_pos + marker.size(),
+                       "max_total_connections = 16\n");
+    write_config(base, over_budget);
+    ioc.run_for(std::chrono::milliseconds(2200));
+
+    EXPECT_EQ(security_rules.generation(), security_generation);
+    EXPECT_EQ(upstreams.generation(), upstream_generation);
+    auto route = upstreams.route("/zebra-config/path");
+    ASSERT_TRUE(route.has_value());
+    EXPECT_EQ(route->config.port, 30001);
+    EXPECT_FALSE(security_rules.cors_enabled_fast());
+
+    drain_cancelled_timer(ioc, service);
+    std::filesystem::remove_all(base);
+}

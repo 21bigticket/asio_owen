@@ -215,12 +215,20 @@ asio::awaitable<void> api_metrics(HttpContext& ctx, AppServices services) {
     }
     const auto history_stats = services.config_history_service ?
         services.config_history_service->stats() : ConfigHistoryService::Stats{};
+    const auto active_sessions = services.runtime && services.runtime->shutdown ?
+        services.runtime->shutdown->active_sessions() : 0;
+    const auto rejected_sessions = services.runtime && services.runtime->shutdown ?
+        services.runtime->shutdown->capacity_rejections() : 0;
 
     std::ostringstream data;
     data << "{\"draining\":"
          << (services.draining_state &&
                  services.draining_state->load(std::memory_order_acquire) ?
              "true" : "false")
+         << ",\"connections\":{\"active\":" << active_sessions
+         << ",\"rejected\":" << rejected_sessions
+         << ",\"limit\":" << services.max_client_connections << "}"
+         << ",\"io_threads\":" << services.io_threads
          << ",\"config_sync\":{\"enabled\":"
          << (services.config_sync.enabled ? "true" : "false")
          << ",\"version\":" << sync_state.synced_version

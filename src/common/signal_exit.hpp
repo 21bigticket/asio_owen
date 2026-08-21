@@ -15,7 +15,7 @@ public:
     void on_exit(std::function<void()> cb) {
         exit_cb_ = std::move(cb);
         signals_.async_wait([this](std::error_code, int sig) {
-            LOG_INFO("Received signal ", sig, ", exiting gracefully...");
+            LOG_INFO("Received signal ", sig, ", shutdown requested");
             if (exit_cb_) exit_cb_();
         });
     }

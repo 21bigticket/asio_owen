@@ -14,6 +14,47 @@
 #include <cassert>
 #include "../common/logger.hpp"
 
+class HttpConnectionBudget {
+public:
+    explicit HttpConnectionBudget(size_t limit = 0) : limit_(limit) {}
+
+    bool try_acquire() noexcept {
+        auto current = current_.load(std::memory_order_relaxed);
+        for (;;) {
+            const auto limit = limit_.load(std::memory_order_relaxed);
+            if (limit != 0 && current >= limit) return false;
+            if (current_.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
+    void release() noexcept {
+        auto current = current_.load(std::memory_order_relaxed);
+        while (current != 0 && !current_.compare_exchange_weak(
+                current, current - 1, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+        }
+    }
+
+    void set_limit(size_t limit) noexcept {
+        limit_.store(limit, std::memory_order_release);
+    }
+
+    size_t current() const noexcept {
+        return current_.load(std::memory_order_acquire);
+    }
+    size_t limit() const noexcept {
+        return limit_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<size_t> current_{0};
+    std::atomic<size_t> limit_{0};
+};
+
 // HTTP connection pool: lazy create + idle reclaim + hard limit
 // Uses sharded locking (kShards independent mutexes) to reduce contention.
 class HttpPool {
@@ -21,6 +62,7 @@ public:
     struct Config {
         size_t max_size = 256;                  // pool-level: hard cap on total connections
         size_t max_concurrent = 0;              // pool-level: 0 means unlimited
+        size_t max_total_connections = 4096;    // shared process-level cap across service pools
         size_t max_body_size = static_cast<size_t>(10) * 1024 * 1024;
         int connect_timeout_ms = 1000;          // pool-level: DNS resolve + TCP connect
         int read_timeout_ms = 30000;            // pool-level: upstream read timeout
@@ -29,6 +71,14 @@ public:
         bool send_keep_alive_header = false;    // consumed by proxy layer, not pool
         const Config& ref() const { return *this; }
         bool operator==(const Config&) const = default;
+
+        bool same_pool_settings(const Config& other) const {
+            auto lhs = *this;
+            auto rhs = other;
+            lhs.max_total_connections = 0;
+            rhs.max_total_connections = 0;
+            return lhs == rhs;
+        }
     };
 
     struct HttpConn {
@@ -58,6 +108,7 @@ public:
     struct State {
         asio::io_context& ioc;
         Config cfg;
+        std::shared_ptr<HttpConnectionBudget> connection_budget;
         std::atomic<bool> running{true};
         Shard shards[kShards];
         std::atomic<size_t> total_count{0};
@@ -76,7 +127,9 @@ public:
         std::atomic<int> fail_idle_acquire_stage_for_test{0};
 #endif
 
-        State(asio::io_context& io, Config c) : ioc(io), cfg(c) {}
+        State(asio::io_context& io, Config c,
+              std::shared_ptr<HttpConnectionBudget> budget)
+            : ioc(io), cfg(c), connection_budget(std::move(budget)) {}
 
         ~State() {
             for (auto& shard : shards) {
@@ -103,8 +156,11 @@ public:
         }
     };
 
-    HttpPool(asio::io_context& ioc, Config cfg)
-        : state_(std::make_shared<State>(ioc, cfg)) {}
+    HttpPool(asio::io_context& ioc, Config cfg,
+             std::shared_ptr<HttpConnectionBudget> connection_budget = nullptr)
+        : state_(std::make_shared<State>(
+              ioc, cfg, connection_budget ? std::move(connection_budget) :
+                  std::make_shared<HttpConnectionBudget>(cfg.max_total_connections))) {}
 
     ~HttpPool() { shutdown(); }
 
@@ -120,6 +176,7 @@ public:
                 shard.idle.pop_front();
                 --shard.total;
                 decrement_counter(state->total_count);
+                state->connection_budget->release();
             }
             for (auto* conn : shard.active) {
                 asio::error_code ec;
@@ -204,6 +261,7 @@ public:
                         idle_conn->socket.close(ec);
                         --shard.total;
                         decrement_counter(state->total_count);
+                        state->connection_budget->release();
                         idle_conn.reset();
                         continue;
                     }
@@ -212,6 +270,7 @@ public:
                         idle_conn->socket.close(ec);
                         --shard.total;
                         decrement_counter(state->total_count);
+                        state->connection_budget->release();
                         idle_conn.reset();
                         continue;
                     }
@@ -249,6 +308,7 @@ public:
                     --shard.in_flight;
                 }
                 decrement_counter(state->total_count);
+                state->connection_budget->release();
                 if (reserved_in_flight) decrement_counter(state->in_flight_count);
                 throw;
             }
@@ -264,6 +324,15 @@ public:
             co_return nullptr;
         }
         bool reserved_total = true;
+        if (!state->connection_budget->try_acquire()) {
+            decrement_counter(state->total_count);
+            if (reserved_in_flight) decrement_counter(state->in_flight_count);
+            LOG_WARN("HttpPool: process connection budget reached, current=",
+                     state->connection_budget->current(), ", limit=",
+                     state->connection_budget->limit());
+            co_return nullptr;
+        }
+        bool reserved_budget = true;
 
         std::unique_ptr<HttpConn> new_conn;
         try {
@@ -281,6 +350,7 @@ public:
             ++shard.in_flight;
         } catch (...) {
             if (reserved_total) decrement_counter(state->total_count);
+            if (reserved_budget) state->connection_budget->release();
             if (reserved_in_flight) decrement_counter(state->in_flight_count);
             throw;
         }
@@ -308,6 +378,7 @@ public:
                 --failed_shard.in_flight;
             }
             if (reserved_total) decrement_counter(state->total_count);
+            if (reserved_budget) state->connection_budget->release();
             if (reserved_in_flight) decrement_counter(state->in_flight_count);
             throw;
         }
@@ -327,6 +398,7 @@ public:
                 shard.active.erase(conn.get());
             }
             decrement_counter(state->total_count);
+            state->connection_budget->release();
             release_in_flight(state);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -341,6 +413,7 @@ public:
                 shard.active.erase(conn.get());
             }
             decrement_counter(state->total_count);
+            state->connection_budget->release();
             release_in_flight(state);
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -370,6 +443,7 @@ public:
             asio::error_code ec;
             conn->socket.close(ec);
             decrement_counter(state->total_count);
+            state->connection_budget->release();
             state->released_closed.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -387,6 +461,7 @@ public:
             shard.active.erase(conn.get());
         }
         decrement_counter(state->total_count);
+        state->connection_budget->release();
         release_in_flight(state);
         state->released_bad.fetch_add(1, std::memory_order_relaxed);
     }
@@ -522,6 +597,7 @@ private:
             shard.idle.pop_front();
             --shard.total;
             decrement_counter(state->total_count);
+            state->connection_budget->release();
         }
     }
 

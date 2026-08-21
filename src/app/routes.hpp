@@ -57,6 +57,8 @@ struct AppServices {
     std::shared_ptr<AdminLoginThrottle> admin_login_throttle;
     std::shared_ptr<AdminAuthWorkLimiter> admin_auth_limiter;
     UpstreamManager* upstreams = nullptr;
+    size_t io_threads = 0;
+    size_t max_client_connections = 8192;
 };
 
 std::shared_ptr<ComboBackend> make_pool_combo_backend(MysqlPool* mysql, RedisPool* redis);

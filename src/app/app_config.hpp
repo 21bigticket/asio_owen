@@ -8,6 +8,7 @@
 
 #include "../common/config.hpp"
 #include "../common/logger.hpp"
+#include "../common/process_fd_budget.hpp"
 #include "../db/mysql_pool.hpp"
 #include "../db/redis_pool.hpp"
 #include "../http/http_pool.hpp"
@@ -59,6 +60,9 @@ struct AppConfig {
     LogLevel log_level = INFO;
     std::string log_file = "server.log";
     int server_port = 8080;
+    size_t io_threads = 0;
+    size_t max_client_connections = 8192;
+    size_t fd_reserve = 256;
     int downstream_write_timeout_ms = 30000;
     int client_header_read_timeout_ms = 10000;
     int client_body_read_timeout_ms = 30000;
@@ -174,6 +178,8 @@ inline HttpPool::Config http_pool_config_from(const Config& cfg) {
     return HttpPool::Config{
         .max_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_size", 256))),
         .max_concurrent = static_cast<size_t>(std::max(0, cfg.get_int("http_pool", "max_concurrent", 0))),
+        .max_total_connections = static_cast<size_t>(std::max(
+            1, cfg.get_int("http_pool", "max_total_connections", 4096))),
         .max_body_size = static_cast<size_t>(std::max(1, cfg.get_int("http_pool", "max_body_size", 10 * 1024 * 1024))),
         .connect_timeout_ms = cfg.get_int("http_pool", "connect_timeout_ms", 1000),
         .read_timeout_ms = cfg.get_int("http_pool", "read_timeout_ms", 30000),
@@ -193,6 +199,18 @@ inline AppConfig app_config_from(const Config& cfg) {
 
     app.log_file = cfg.get("server", "log_file", "server.log");
     app.server_port = cfg.get_int("server", "port", 8080);
+    if (app.server_port < 1 || app.server_port > 65535) {
+        throw std::invalid_argument("server.port out of range [1,65535]");
+    }
+    app.io_threads = static_cast<size_t>(std::clamp(
+        cfg.get_int("server", "io_threads", 0), 0, 256));
+    app.max_client_connections = static_cast<size_t>(std::max(
+        1, cfg.get_int("server", "max_client_connections", 8192)));
+    const int fd_reserve = cfg.get_int("server", "fd_reserve", 256);
+    if (fd_reserve < 32) {
+        throw std::invalid_argument("server.fd_reserve must be at least 32");
+    }
+    app.fd_reserve = static_cast<size_t>(fd_reserve);
     app.downstream_write_timeout_ms = cfg.get_int("server", "downstream_write_timeout_ms", 30000);
     app.client_header_read_timeout_ms = cfg.get_int("server", "client_header_read_timeout_ms", 10000);
     app.client_body_read_timeout_ms = cfg.get_int("server", "client_body_read_timeout_ms", 30000);
@@ -255,4 +273,17 @@ inline AppConfig app_config_from(const Config& cfg) {
     app.config_sync.admin = admin_config_from(cfg);
     app.config_sync.history = config_history_from(cfg);
     return app;
+}
+
+inline ProcessFdBudget process_fd_budget_from(
+    const AppConfig& app, size_t effective_io_threads) {
+    const size_t redis_connections = app.redis.mode == RedisPool::Mode::Worker ?
+        app.redis.max_size : effective_io_threads;
+    return ProcessFdBudget{
+        .client_connections = app.max_client_connections,
+        .upstream_connections = app.http_pool.max_total_connections,
+        .mysql_connections = app.mysql.max_size,
+        .redis_connections = redis_connections,
+        .reserve = app.fd_reserve
+    };
 }
