@@ -1,4 +1,4 @@
-name: Redis fault matrix
+name: Service fault matrix
 
 on:
   pull_request:
@@ -10,5 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run wrong-type, nil, CAS and restart cases
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhiredis-dev libmysqlclient-dev pkg-config
+      - name: Build server
+        run: cmake -B build-integration -S . -DBUILD_TESTING=OFF && cmake --build build-integration --target server -j2
+      - name: Run Redis primitive fault checks
         run: bash tests/redis_fault_matrix.sh
+      - name: Run application MySQL/Redis fault and recovery checks
+        run: bash tests/service_integration.sh build-integration/server

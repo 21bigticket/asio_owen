@@ -3,7 +3,7 @@ name: clang-tidy
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   clang-tidy:
@@ -15,4 +15,4 @@ jobs:
       - name: Configure
         run: cmake -B build-tidy -S . -DBUILD_TESTING=OFF -DASIO_OWEN_ENABLE_CLANG_TIDY=ON
       - name: Build with clang-tidy
-        run: cmake --build build-tidy --target asio_owen_app -j2
+        run: cmake --build build-tidy --target server -j2
