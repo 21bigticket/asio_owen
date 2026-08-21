@@ -4,6 +4,7 @@
 # 用法: bash rebuild_deploy.sh
 # 可选：RUN_TESTS=0 bash rebuild_deploy.sh 跳过 ctest。
 # 可选：ADMIN_SECRET_DIR=/安全持久目录 ADMIN_USERNAME=ops bash rebuild_deploy.sh
+# 可选：DEPENDENCY_CACHE_DIR=/持久缓存目录 bash rebuild_deploy.sh
 # ============================================================
 set -euo pipefail
 
@@ -14,6 +15,11 @@ BACKUP_BUILD_DIR="${BUILD_DIR}.previous_$(date -u +%Y%m%dT%H%M%SZ)"
 SERVICE=asio-owen.service
 RUN_TESTS=${RUN_TESTS:-1}
 KEEP_DEBUG_SYMBOLS=${KEEP_DEBUG_SYMBOLS:-1}
+DEPENDENCY_CACHE_DIR=${DEPENDENCY_CACHE_DIR:-$ROOT/.dependency-cache}
+GTEST_VERSION=1.14.0
+GTEST_SHA256=8ad598c73ad796e0d8280b082cebd82a630d73e73cd3c70057938a6501bba5d7
+GTEST_SOURCE_DIR="$DEPENDENCY_CACHE_DIR/googletest-$GTEST_VERSION"
+GTEST_ARCHIVE="$DEPENDENCY_CACHE_DIR/googletest-v$GTEST_VERSION.tar.gz"
 ADMIN_SECRET_DIR=${ADMIN_SECRET_DIR:-/etc/asio-owen/admin}
 ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
 ADMIN_PRIVATE_KEY="$ADMIN_SECRET_DIR/admin-private-key.pem"
@@ -112,15 +118,81 @@ install_admin_credentials() {
         "$ADMIN_PRIVATE_KEY" "$ADMIN_PUBLIC_KEY" >> "$candidate_local"
 }
 
+prepare_googletest_source() {
+    if [[ -f "$ROOT/googletest/CMakeLists.txt" ]]; then
+        GTEST_SOURCE_DIR="$ROOT/googletest"
+        echo "GoogleTest source: $GTEST_SOURCE_DIR (repository local copy)"
+        return
+    fi
+    if [[ -f "$GTEST_SOURCE_DIR/CMakeLists.txt" ]]; then
+        echo "GoogleTest source: $GTEST_SOURCE_DIR (persistent cache)"
+        return
+    fi
+
+    mkdir -p "$DEPENDENCY_CACHE_DIR"
+    local candidate
+    for candidate in \
+        "$BUILD_DIR/_deps/googletest-src" \
+        "$ROOT/build/_deps/googletest-src"; do
+        if [[ ! -f "$candidate/CMakeLists.txt" ]]; then
+            continue
+        fi
+        local copy_tmp
+        copy_tmp=$(mktemp -d "$DEPENDENCY_CACHE_DIR/.googletest-copy.XXXXXX")
+        cp -a "$candidate/." "$copy_tmp/"
+        mv "$copy_tmp" "$GTEST_SOURCE_DIR"
+        echo "GoogleTest source: $GTEST_SOURCE_DIR (seeded from $candidate)"
+        return
+    done
+
+    local actual_sha256
+    if [[ -f "$GTEST_ARCHIVE" ]]; then
+        actual_sha256=$(sha256sum "$GTEST_ARCHIVE" | awk '{print $1}')
+    else
+        actual_sha256=""
+    fi
+    if [[ "$actual_sha256" == "$GTEST_SHA256" ]]; then
+        echo "GoogleTest archive: $GTEST_ARCHIVE (verified cache)"
+    else
+        echo "No reusable GoogleTest source/archive found; downloading v$GTEST_VERSION with retries"
+        local archive_tmp="$GTEST_ARCHIVE.part"
+        curl --fail --location --http1.1 \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            -o "$archive_tmp" \
+            "https://github.com/google/googletest/archive/refs/tags/v$GTEST_VERSION.tar.gz"
+        actual_sha256=$(sha256sum "$archive_tmp" | awk '{print $1}')
+        if [[ "$actual_sha256" != "$GTEST_SHA256" ]]; then
+            echo "ERROR: GoogleTest archive checksum mismatch: $actual_sha256"
+            return 1
+        fi
+        mv "$archive_tmp" "$GTEST_ARCHIVE"
+    fi
+
+    local extract_tmp
+    extract_tmp=$(mktemp -d "$DEPENDENCY_CACHE_DIR/.googletest-extract.XXXXXX")
+    tar -xzf "$GTEST_ARCHIVE" --strip-components=1 -C "$extract_tmp"
+    if [[ ! -f "$extract_tmp/CMakeLists.txt" ]]; then
+        echo "ERROR: downloaded GoogleTest archive has no CMakeLists.txt"
+        return 1
+    fi
+    mv "$extract_tmp" "$GTEST_SOURCE_DIR"
+    echo "GoogleTest source: $GTEST_SOURCE_DIR (downloaded cache)"
+}
+
 echo "=== [1/9] 准备固定 Admin 密钥和账号 ==="
 prepare_admin_credentials
 echo "Admin credentials: $ADMIN_SECRET_DIR (username=$ADMIN_USERNAME)"
 
-echo "=== [2/9] 清理候选构建 ==="
+echo "=== [2/9] 准备依赖缓存并清理候选构建 ==="
+prepare_googletest_source
 rm -rf "$CANDIDATE_BUILD_DIR"
 
 echo "=== [3/9] cmake 配置候选构建 (Release + tests) ==="
-/usr/bin/cmake -B "$CANDIDATE_BUILD_DIR" -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+/usr/bin/cmake -B "$CANDIDATE_BUILD_DIR" -S . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=ON \
+    -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$GTEST_SOURCE_DIR"
 
 echo "=== [4/9] 注入固定 Admin 凭证 ==="
 install_admin_credentials

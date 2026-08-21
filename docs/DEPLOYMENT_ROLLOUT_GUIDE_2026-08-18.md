@@ -80,6 +80,11 @@ auto_migrate_legacy = true
 ./rebuild_deploy.sh
 ```
 
+脚本把 GoogleTest v1.14.0 源码保存在 candidate 目录外的持久构建缓存
+`.dependency-cache/`（已被 Git 忽略）。首次优先复用当前构建中的 `_deps/googletest-src`；
+只有无可复用源码时才通过 HTTP/1.1 重试下载并校验 SHA-256。可用
+`DEPENDENCY_CACHE_DIR=/持久目录` 覆盖默认位置，避免清理 candidate 时重复访问 GitHub。
+
 脚本会提示输入并确认密码。需要自定义固定账号或持久目录时，只能在首次创建凭证前指定，并在后续部署保持相同参数：
 
 ```bash

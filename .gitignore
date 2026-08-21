@@ -5,6 +5,7 @@ build-*/
 build_vg/
 cmake-build-debug/
 build_*/
+.dependency-cache/
 
 # IDE
 .idea/
